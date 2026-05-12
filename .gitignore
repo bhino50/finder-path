@@ -1,0 +1,20 @@
+# Build artifacts
+.build/
+dist/
+
+# macOS
+.DS_Store
+
+# Xcode user-specific state
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Vercel (download-site)
+download-site/.vercel/
+download-site/downloads/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example

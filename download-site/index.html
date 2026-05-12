@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FinderPath for macOS</title>
+    <meta
+      name="description"
+      content="FinderPath is a lightweight macOS menu bar app for copying the current Finder path, opening Terminal, and optionally launching Codex or Claude."
+    >
+    <meta property="og:title" content="FinderPath for macOS">
+    <meta
+      property="og:description"
+      content="A fast menu bar app for copying the current Finder path, cd command, opening Terminal, and optional Codex or Claude launchers."
+    >
+    <meta property="og:image" content="/assets/finderpath-icon.png">
+    <link rel="icon" href="/assets/finderpath-icon.png">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="site-header" aria-label="FinderPath">
+      <a class="brand" href="/">
+        <img src="/assets/finderpath-icon.png" alt="" aria-hidden="true">
+        <span>FinderPath</span>
+      </a>
+      <a class="download-link" href="https://github.com/bhino50/finder-path/releases/latest">Download</a>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <img class="hero-icon" src="/assets/finderpath-icon.png" alt="FinderPath app icon">
+          <p class="eyebrow">macOS menu bar utility</p>
+          <h1 id="hero-title">Your Finder path, one click away.</h1>
+          <p class="lede">
+            FinderPath brings address-bar speed to macOS Finder, with instant copy,
+            <code>cd</code> commands, Terminal launch, and optional one-click Codex or Claude.
+          </p>
+
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/bhino50/finder-path/releases/latest">
+              Download for macOS
+            </a>
+            <span class="release-note">Version 1.0 · macOS 13+ · Apple Silicon and Intel</span>
+          </div>
+        </div>
+
+        <div class="product-shot" aria-label="FinderPath menu preview">
+          <div class="desktop-strip">
+            <span class="traffic"></span>
+            <span class="traffic"></span>
+            <span class="traffic"></span>
+            <span class="spacer"></span>
+            <span class="menu-icon"></span>
+            <span class="menu-icon folder"></span>
+          </div>
+          <div class="menu-preview">
+            <p class="preview-path">~/Projects/your-project</p>
+            <ul>
+              <li><span>Settings...</span><kbd>⌘,</kbd></li>
+              <li><span>Refresh</span><kbd>⌘R</kbd></li>
+              <li><span>Copy Path</span></li>
+              <li><span>Copy cd Command</span></li>
+              <li><span>Open in Terminal</span></li>
+              <li><span>Open with Codex</span></li>
+              <li><span>Open with Claude</span></li>
+              <li class="quit"><span>Quit FinderPath</span><kbd>⌘Q</kbd></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="feature-band" aria-label="FinderPath features">
+        <article>
+          <span class="feature-number">01</span>
+          <h2>Native menu bar workflow</h2>
+          <p>No main window, no clutter. FinderPath stays in the menu bar and opens instantly.</p>
+        </article>
+        <article>
+          <span class="feature-number">02</span>
+          <h2>Developer-ready commands</h2>
+          <p>Copy the raw path, copy a quoted <code>cd</code> command, or open Terminal in place.</p>
+        </article>
+        <article>
+          <span class="feature-number">03</span>
+          <h2>Optional CLI launchers</h2>
+          <p>Start Codex or Claude from the exact Finder folder when those tools are installed.</p>
+        </article>
+      </section>
+
+      <section class="install" aria-labelledby="install-title">
+        <div>
+          <p class="eyebrow">Install</p>
+          <h2 id="install-title">Download the DMG, drag to Applications, approve Finder access.</h2>
+        </div>
+        <p>
+          This build is locally signed. If macOS blocks the first launch, right-click
+          FinderPath and choose Open. The Finder Automation prompt appears the first
+          time the app reads the current Finder path. Terminal permission appears
+          when using Codex or Claude launch actions. Those agent buttons are optional
+          and can be hidden or pointed at a custom executable path in Settings.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>
