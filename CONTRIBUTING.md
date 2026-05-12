@@ -75,18 +75,6 @@ Before submitting a PR, manually verify:
 
 ---
 
-## Using Claude Code
-
-This project includes a `CLAUDE.md` that gives Claude Code full context on the build commands, architecture, and conventions.
-
-```bash
-claude    # Start Claude Code — reads CLAUDE.md automatically
-```
-
-Claude Code is particularly useful for exploring the single-file architecture, understanding the AppleScript bridge, or drafting Settings UI changes.
-
----
-
 ## Code of Conduct
 
 Be respectful and constructive. Harassment of any kind will not be tolerated. If you experience or witness unacceptable behavior, open an issue or email the maintainer directly.
