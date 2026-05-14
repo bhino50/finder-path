@@ -75,6 +75,32 @@ final class FinderPathState {
         ) { _ in }
     }
 
+    func openWithHermes() {
+        guard hasCopyablePath else { return }
+
+        let executable = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
+            .resolvedPath ?? FinderPathPreferences.hermesExecutable
+
+        TerminalBridge.openAgent(
+            displayName: "Hermes",
+            executable: executable,
+            at: currentPath
+        ) { _ in }
+    }
+
+    func checkForUpdates(userInitiated: Bool) {
+        let currentVersion = AppVersion.current
+        UpdateChecker.check(manifestURL: FinderPathPreferences.updateManifestURL) { result in
+            Task { @MainActor in
+                UpdatePrompt.present(
+                    result: result,
+                    currentVersion: currentVersion,
+                    userInitiated: userInitiated
+                )
+            }
+        }
+    }
+
     var hasCopyablePath: Bool {
         !currentPath.isEmpty && !currentPath.hasPrefix("Finder AppleScript error:")
     }
@@ -202,6 +228,29 @@ final class StatusItemController: NSObject {
             }
         }
 
+        if FinderPathPreferences.showOpenWithHermesItem {
+            let availability = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
+            if !hideUnavailableAgents || availability.isInstalled {
+                let title = availability.isInstalled ? "Open with Hermes" : "Hermes Not Installed"
+                let hermesItem = NSMenuItem(title: title, action: #selector(openWithHermesMenuItem), keyEquivalent: "")
+                hermesItem.target = self
+                hermesItem.isEnabled = state.hasCopyablePath && availability.isInstalled
+                menu.addItem(hermesItem)
+            }
+        }
+
+        if FinderPathPreferences.showCheckForUpdatesItem {
+            menu.addItem(.separator())
+
+            let updatesItem = NSMenuItem(
+                title: "Check for Updates...",
+                action: #selector(checkForUpdatesMenuItem),
+                keyEquivalent: ""
+            )
+            updatesItem.target = self
+            menu.addItem(updatesItem)
+        }
+
         if FinderPathPreferences.showQuitItem {
             menu.addItem(.separator())
 
@@ -259,6 +308,14 @@ final class StatusItemController: NSObject {
         state.openWithClaude()
     }
 
+    @objc private func openWithHermesMenuItem() {
+        state.openWithHermes()
+    }
+
+    @objc private func checkForUpdatesMenuItem() {
+        state.checkForUpdates(userInitiated: true)
+    }
+
     @objc private func quitMenuItem() {
         NSApp.terminate(nil)
     }
@@ -295,6 +352,8 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showOpenTerminalItemKey) private var showOpenTerminalItem = true
     @AppStorage(FinderPathPreferences.showOpenWithCodexItemKey) private var showOpenWithCodexItem = true
     @AppStorage(FinderPathPreferences.showOpenWithClaudeItemKey) private var showOpenWithClaudeItem = true
+    @AppStorage(FinderPathPreferences.showOpenWithHermesItemKey) private var showOpenWithHermesItem = true
+    @AppStorage(FinderPathPreferences.showCheckForUpdatesItemKey) private var showCheckForUpdatesItem = true
     @AppStorage(FinderPathPreferences.showQuitItemKey) private var showQuitItem = true
     @AppStorage(FinderPathPreferences.pathDisplayStyleKey) private var pathDisplayStyle = "full"
     @AppStorage(FinderPathPreferences.menuHeaderTitleKey) private var menuHeaderTitle = "Current Finder Path"
@@ -307,9 +366,13 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.cdQuoteStyleKey) private var cdQuoteStyle = "double"
     @AppStorage(FinderPathPreferences.codexExecutableKey) private var codexExecutable = "codex"
     @AppStorage(FinderPathPreferences.claudeExecutableKey) private var claudeExecutable = "claude"
+    @AppStorage(FinderPathPreferences.hermesExecutableKey) private var hermesExecutable = "hermes"
     @AppStorage(FinderPathPreferences.hideUnavailableAgentItemsKey) private var hideUnavailableAgentItems = true
+    @AppStorage(FinderPathPreferences.updateManifestURLKey) private var updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
     @State private var codexAvailability = AgentAvailability.unknown(executable: "codex")
     @State private var claudeAvailability = AgentAvailability.unknown(executable: "claude")
+    @State private var hermesAvailability = AgentAvailability.unknown(executable: "hermes")
+    @State private var isCheckingForUpdates = false
 
     var body: some View {
         Form {
@@ -321,6 +384,8 @@ struct SettingsView: View {
                 Toggle("Show Open in Terminal", isOn: $showOpenTerminalItem)
                 Toggle("Show Open with Codex", isOn: $showOpenWithCodexItem)
                 Toggle("Show Open with Claude", isOn: $showOpenWithClaudeItem)
+                Toggle("Show Open with Hermes", isOn: $showOpenWithHermesItem)
+                Toggle("Show Check for Updates", isOn: $showCheckForUpdatesItem)
                 Toggle("Show Quit", isOn: $showQuitItem)
             }
 
@@ -389,17 +454,36 @@ struct SettingsView: View {
             Section("Agent Launchers") {
                 TextField("Codex command or path", text: $codexExecutable)
                 TextField("Claude command or path", text: $claudeExecutable)
+                TextField("Hermes command or path", text: $hermesExecutable)
                 Toggle("Hide unavailable agent actions", isOn: $hideUnavailableAgentItems)
 
                 AgentStatusRow(name: "Codex", availability: codexAvailability)
                 AgentStatusRow(name: "Claude", availability: claudeAvailability)
+                AgentStatusRow(name: "Hermes", availability: hermesAvailability)
 
                 HStack {
                     Button("Check Again", action: refreshAgentAvailability)
                     Spacer()
                 }
 
-                Text("Codex and Claude are optional. If a CLI is not installed, FinderPath can hide that menu action. Use a full executable path if your command is installed outside the normal shell PATH.")
+                Text("Codex, Claude, and Hermes are optional. If a CLI is not installed, FinderPath can hide that menu action. Use a full executable path if your command is installed outside the normal shell PATH.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Updates") {
+                LabeledContent("Installed version", value: AppVersion.current)
+
+                TextField("Update manifest URL", text: $updateManifestURL)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button(isCheckingForUpdates ? "Checking..." : "Check for Updates Now", action: checkForUpdatesFromSettings)
+                        .disabled(isCheckingForUpdates)
+                    Spacer()
+                }
+
+                Text("FinderPath checks GitHub Releases for the latest tagged version and compares it to the one installed. Defaults to bhino50/finder-path; point this at any GitHub Releases API URL or a plain `{ version, downloadURL, notes }` JSON manifest.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -423,6 +507,9 @@ struct SettingsView: View {
         .onChange(of: claudeExecutable) { _ in
             refreshAgentAvailability()
         }
+        .onChange(of: hermesExecutable) { _ in
+            refreshAgentAvailability()
+        }
     }
 
     private func resetDefaults() {
@@ -433,6 +520,8 @@ struct SettingsView: View {
         showOpenTerminalItem = true
         showOpenWithCodexItem = true
         showOpenWithClaudeItem = true
+        showOpenWithHermesItem = true
+        showCheckForUpdatesItem = true
         showQuitItem = true
         pathDisplayStyle = "full"
         menuHeaderTitle = "Current Finder Path"
@@ -445,13 +534,31 @@ struct SettingsView: View {
         cdQuoteStyle = "double"
         codexExecutable = "codex"
         claudeExecutable = "claude"
+        hermesExecutable = "hermes"
         hideUnavailableAgentItems = true
+        updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
         refreshAgentAvailability()
     }
 
     private func refreshAgentAvailability() {
         codexAvailability = AgentLauncher.availability(for: codexExecutable, defaultExecutable: "codex")
         claudeAvailability = AgentLauncher.availability(for: claudeExecutable, defaultExecutable: "claude")
+        hermesAvailability = AgentLauncher.availability(for: hermesExecutable, defaultExecutable: "hermes")
+    }
+
+    private func checkForUpdatesFromSettings() {
+        isCheckingForUpdates = true
+        let currentVersion = AppVersion.current
+        UpdateChecker.check(manifestURL: FinderPathPreferences.updateManifestURL) { result in
+            Task { @MainActor in
+                isCheckingForUpdates = false
+                UpdatePrompt.present(
+                    result: result,
+                    currentVersion: currentVersion,
+                    userInitiated: true
+                )
+            }
+        }
     }
 }
 
@@ -487,6 +594,8 @@ enum FinderPathPreferences {
     static let showOpenTerminalItemKey = "showOpenTerminalItem"
     static let showOpenWithCodexItemKey = "showOpenWithCodexItem"
     static let showOpenWithClaudeItemKey = "showOpenWithClaudeItem"
+    static let showOpenWithHermesItemKey = "showOpenWithHermesItem"
+    static let showCheckForUpdatesItemKey = "showCheckForUpdatesItem"
     static let showQuitItemKey = "showQuitItem"
     static let pathDisplayStyleKey = "pathDisplayStyle"
     static let menuHeaderTitleKey = "menuHeaderTitle"
@@ -499,7 +608,10 @@ enum FinderPathPreferences {
     static let cdQuoteStyleKey = "cdQuoteStyle"
     static let codexExecutableKey = "codexExecutable"
     static let claudeExecutableKey = "claudeExecutable"
+    static let hermesExecutableKey = "hermesExecutable"
     static let hideUnavailableAgentItemsKey = "hideUnavailableAgentItems"
+    static let updateManifestURLKey = "updateManifestURL"
+    static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
 
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
@@ -510,6 +622,8 @@ enum FinderPathPreferences {
             showOpenTerminalItemKey: true,
             showOpenWithCodexItemKey: true,
             showOpenWithClaudeItemKey: true,
+            showOpenWithHermesItemKey: true,
+            showCheckForUpdatesItemKey: true,
             showQuitItemKey: true,
             pathDisplayStyleKey: "full",
             menuHeaderTitleKey: "Current Finder Path",
@@ -522,7 +636,9 @@ enum FinderPathPreferences {
             cdQuoteStyleKey: "double",
             codexExecutableKey: "codex",
             claudeExecutableKey: "claude",
-            hideUnavailableAgentItemsKey: true
+            hermesExecutableKey: "hermes",
+            hideUnavailableAgentItemsKey: true,
+            updateManifestURLKey: defaultUpdateManifestURL
         ])
     }
 
@@ -552,6 +668,14 @@ enum FinderPathPreferences {
 
     static var showOpenWithClaudeItem: Bool {
         bool(for: showOpenWithClaudeItemKey, defaultValue: true)
+    }
+
+    static var showOpenWithHermesItem: Bool {
+        bool(for: showOpenWithHermesItemKey, defaultValue: true)
+    }
+
+    static var showCheckForUpdatesItem: Bool {
+        bool(for: showCheckForUpdatesItemKey, defaultValue: true)
     }
 
     static var showQuitItem: Bool {
@@ -619,8 +743,18 @@ enum FinderPathPreferences {
         sanitizedExecutable(for: claudeExecutableKey, defaultValue: "claude")
     }
 
+    static var hermesExecutable: String {
+        sanitizedExecutable(for: hermesExecutableKey, defaultValue: "hermes")
+    }
+
     static var hideUnavailableAgentItems: Bool {
         bool(for: hideUnavailableAgentItemsKey, defaultValue: true)
+    }
+
+    static var updateManifestURL: String {
+        let value = string(for: updateManifestURLKey, defaultValue: defaultUpdateManifestURL)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? defaultUpdateManifestURL : value
     }
 
     static func displayPath(for path: String) -> String {
@@ -921,5 +1055,217 @@ enum TerminalBridge {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
+    }
+}
+
+enum AppVersion {
+    static var current: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String
+        let build = info?["CFBundleVersion"] as? String
+        switch (short, build) {
+        case let (short?, build?) where short != build:
+            return "\(short) (\(build))"
+        case let (short?, _):
+            return short
+        case let (_, build?):
+            return build
+        default:
+            return "unknown"
+        }
+    }
+
+    static var shortVersionString: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+}
+
+struct UpdateManifest: Equatable {
+    let latestVersion: String
+    let downloadURL: URL?
+    let releaseNotes: String?
+}
+
+enum UpdateCheckResult {
+    case upToDate(latest: String)
+    case updateAvailable(manifest: UpdateManifest)
+    case failed(message: String)
+}
+
+enum UpdateChecker {
+    static func check(manifestURL: String, completion: @escaping (UpdateCheckResult) -> Void) {
+        let trimmed = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
+            completion(.failed(message: "The update manifest URL is not a valid web URL."))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 15
+        if url.host?.contains("api.github.com") == true {
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+            request.setValue("FinderPath/\(AppVersion.shortVersionString)", forHTTPHeaderField: "User-Agent")
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failed(message: "Could not reach the update server: \(error.localizedDescription)"))
+                return
+            }
+
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                completion(.failed(message: "Update server returned HTTP \(http.statusCode)."))
+                return
+            }
+
+            guard let data else {
+                completion(.failed(message: "Update server returned no data."))
+                return
+            }
+
+            guard let manifest = parseManifest(data) else {
+                completion(.failed(message: "Could not parse the update manifest. Expected JSON with a version field."))
+                return
+            }
+
+            let current = AppVersion.shortVersionString
+            if compare(manifest.latestVersion, isNewerThan: current) {
+                completion(.updateAvailable(manifest: manifest))
+            } else {
+                completion(.upToDate(latest: manifest.latestVersion))
+            }
+        }.resume()
+    }
+
+    private static func parseManifest(_ data: Data) -> UpdateManifest? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        if let tag = json["tag_name"] as? String {
+            return parseGitHubRelease(json: json, tag: tag)
+        }
+
+        let versionString = (json["version"] as? String)
+            ?? (json["latest"] as? String)
+            ?? (json["latestVersion"] as? String)
+
+        guard let version = versionString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !version.isEmpty else {
+            return nil
+        }
+
+        let downloadString = (json["downloadURL"] as? String)
+            ?? (json["url"] as? String)
+            ?? (json["download_url"] as? String)
+        let downloadURL = downloadString.flatMap { URL(string: $0) }
+
+        let notes = (json["notes"] as? String)
+            ?? (json["releaseNotes"] as? String)
+            ?? (json["release_notes"] as? String)
+
+        return UpdateManifest(
+            latestVersion: version,
+            downloadURL: downloadURL,
+            releaseNotes: notes
+        )
+    }
+
+    private static func parseGitHubRelease(json: [String: Any], tag: String) -> UpdateManifest? {
+        let version = tag
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
+
+        guard !version.isEmpty else { return nil }
+
+        let assets = (json["assets"] as? [[String: Any]]) ?? []
+        let dmgURL = assets
+            .first { (($0["name"] as? String) ?? "").hasSuffix(".dmg") }
+            .flatMap { $0["browser_download_url"] as? String }
+            .flatMap(URL.init(string:))
+        let zipURL = assets
+            .first { (($0["name"] as? String) ?? "").hasSuffix(".zip") }
+            .flatMap { $0["browser_download_url"] as? String }
+            .flatMap(URL.init(string:))
+        let pageURL = (json["html_url"] as? String).flatMap(URL.init(string:))
+
+        let notes = (json["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return UpdateManifest(
+            latestVersion: version,
+            downloadURL: dmgURL ?? zipURL ?? pageURL,
+            releaseNotes: notes?.isEmpty == false ? notes : nil
+        )
+    }
+
+    static func compare(_ candidate: String, isNewerThan installed: String) -> Bool {
+        let lhs = numericComponents(candidate)
+        let rhs = numericComponents(installed)
+        let length = max(lhs.count, rhs.count)
+
+        for index in 0..<length {
+            let l = index < lhs.count ? lhs[index] : 0
+            let r = index < rhs.count ? rhs[index] : 0
+            if l != r { return l > r }
+        }
+
+        return false
+    }
+
+    private static func numericComponents(_ version: String) -> [Int] {
+        let cleaned = version
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "v", with: "", options: .caseInsensitive)
+
+        return cleaned
+            .split(separator: ".")
+            .map { component -> Int in
+                let digits = component.prefix { $0.isNumber }
+                return Int(digits) ?? 0
+            }
+    }
+}
+
+@MainActor
+enum UpdatePrompt {
+    static func present(result: UpdateCheckResult, currentVersion: String, userInitiated: Bool) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+
+        switch result {
+        case .upToDate(let latest):
+            alert.messageText = "FinderPath is up to date."
+            alert.informativeText = "You are running version \(currentVersion). Latest available is \(latest)."
+            alert.addButton(withTitle: "OK")
+
+        case .updateAvailable(let manifest):
+            alert.messageText = "A new version of FinderPath is available."
+            var detail = "Installed: \(currentVersion)\nLatest: \(manifest.latestVersion)"
+            if let notes = manifest.releaseNotes, !notes.isEmpty {
+                detail += "\n\n\(notes)"
+            }
+            alert.informativeText = detail
+            alert.addButton(withTitle: manifest.downloadURL == nil ? "OK" : "Download")
+            alert.addButton(withTitle: "Later")
+
+        case .failed(let message):
+            guard userInitiated else { return }
+            alert.alertStyle = .warning
+            alert.messageText = "Could not check for updates."
+            alert.informativeText = message
+            alert.addButton(withTitle: "OK")
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        if case .updateAvailable(let manifest) = result,
+           response == .alertFirstButtonReturn,
+           let url = manifest.downloadURL {
+            NSWorkspace.shared.open(url)
+        }
     }
 }

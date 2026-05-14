@@ -18,3 +18,6 @@ download-site/downloads/
 .env
 .env.*
 !.env.example
+
+# Codex local tooling
+.codex/

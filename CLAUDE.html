@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FinderPath — CLAUDE.md</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --surface: #161a22;
+      --surface-2: #1d2230;
+      --border: #2a3142;
+      --text: #e6e8ec;
+      --muted: #9aa3b2;
+      --accent: #7aa2ff;
+      --accent-soft: #2a3a66;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fafbfc;
+        --surface: #ffffff;
+        --surface-2: #f2f4f8;
+        --border: #e3e7ee;
+        --text: #1a1f2b;
+        --muted: #5a6473;
+        --accent: #2b54c5;
+        --accent-soft: #dde6ff;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+    body {
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 48px 28px 96px;
+    }
+    header {
+      margin-bottom: 32px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 8px;
+    }
+    h1 {
+      font-size: 32px;
+      line-height: 1.15;
+      margin: 0 0 8px;
+      letter-spacing: -0.01em;
+    }
+    .lede {
+      color: var(--muted);
+      margin: 0;
+      max-width: 64ch;
+    }
+    h2 {
+      font-size: 22px;
+      margin: 48px 0 12px;
+      letter-spacing: -0.01em;
+    }
+    h3 {
+      font-size: 16px;
+      margin: 24px 0 8px;
+      color: var(--text);
+    }
+    p { margin: 12px 0; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, kbd {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+    pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    pre code {
+      background: transparent;
+      border: 0;
+      padding: 0;
+    }
+    ul { padding-left: 20px; }
+    li { margin: 6px 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      font-size: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: 0; }
+    th {
+      background: var(--surface-2);
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+    }
+    td code { white-space: nowrap; }
+    .note {
+      background: var(--surface);
+      border-left: 3px solid var(--accent);
+      border-radius: 4px;
+      padding: 12px 16px;
+      margin: 16px 0;
+      color: var(--muted);
+    }
+    .layer {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin: 14px 0;
+    }
+    .layer h3 {
+      margin-top: 0;
+      color: var(--accent);
+    }
+    footer {
+      margin-top: 64px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="eyebrow">CLAUDE.md</p>
+    <h1>FinderPath</h1>
+    <p class="lede">Guidance for Claude Code (claude.ai/code) when working with code in this repository.</p>
+  </header>
+
+  <h2>Project Overview</h2>
+  <p>
+    FinderPath is a macOS menu bar utility (<code>LSUIElement</code> agent app, no Dock icon, no main window)
+    that shows the POSIX path of the frontmost Finder window. It targets macOS 13+, is written in Swift, and
+    is structured as an Xcode project (not SwiftPM).
+  </p>
+  <p>
+    The entire app lives in one file: <code>FinderPath/FinderPathApp.swift</code> (~925 lines). When changing
+    behavior, expect to edit that single file rather than navigating a multi-module layout.
+  </p>
+
+  <h2>Commands</h2>
+  <p>All commands run from the <code>FinderPath/</code> directory (the inner one that contains <code>FinderPath.xcodeproj</code>).</p>
+
+  <table>
+    <thead><tr><th>Action</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Build + launch (Debug)</td><td><code>./script/build_and_run.sh</code></td></tr>
+      <tr><td>Build + launch in lldb</td><td><code>./script/build_and_run.sh debug</code></td></tr>
+      <tr><td>Build + stream <code>log</code> for the process</td><td><code>./script/build_and_run.sh logs</code></td></tr>
+      <tr><td>Build + stream telemetry for the bundle ID</td><td><code>./script/build_and_run.sh telemetry</code></td></tr>
+      <tr><td>Build + verify the app is actually running</td><td><code>./script/build_and_run.sh verify</code></td></tr>
+      <tr><td>Local-test Release ZIP + DMG</td><td><code>./script/package_release.sh</code></td></tr>
+      <tr><td>Signed + notarized Release</td><td><code>DEVELOPER_ID="Developer ID Application: ..." NOTARY_PROFILE="FinderPathNotary" ./script/package_release.sh</code></td></tr>
+      <tr><td>Direct Xcode build</td><td><code>xcodebuild -project FinderPath.xcodeproj -scheme FinderPath -configuration Debug build</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>build_and_run.sh</code> does <code>pkill -x FinderPath</code> before launching, so re-running it cleanly
+    replaces a running instance. Derived data lives under <code>.build/</code>, releases under <code>dist/</code> —
+    both are gitignored.
+  </p>
+
+  <div class="note">
+    There is no test target. Do not invent test commands; if you add one, wire it into the Xcode project and a script
+    before referencing it.
+  </div>
+
+  <h2>Architecture</h2>
+  <p>
+    The app is one Swift file with cleanly separated layers — when adding a feature, identify which layer it belongs
+    in rather than threading it through <code>AppDelegate</code>.
+  </p>
+
+  <div class="layer">
+    <h3>Lifecycle</h3>
+    <ul>
+      <li><code>FinderPathApp</code> (SwiftUI <code>App</code>) only exists to host the <code>Settings</code> scene. It does <strong>not</strong> drive UI — <code>NSApplicationDelegateAdaptor</code> hands off to <code>AppDelegate</code>.</li>
+      <li><code>AppDelegate.applicationDidFinishLaunching</code> registers defaults, sets <code>NSApp.setActivationPolicy(.accessory)</code>, and creates the <code>StatusItemController</code>. This is the real entry point.</li>
+    </ul>
+  </div>
+
+  <div class="layer">
+    <h3>Menu bar UI (AppKit, not SwiftUI)</h3>
+    <ul>
+      <li><code>StatusItemController</code> owns the <code>NSStatusItem</code>, builds the <code>NSMenu</code> on every click in <code>rebuildMenu(_:)</code>, and routes <code>@objc</code> actions to <code>FinderPathState</code>. Menu items are conditionally added based on <code>FinderPathPreferences</code> toggles, so menu changes happen here.</li>
+      <li><code>PathMenuHeaderView</code> is a custom <code>NSView</code> used as <code>menuItem.view</code> to render the path header with width/font/truncation from preferences.</li>
+      <li>The status item handles both left- and right-click via <code>sendAction(on: [.leftMouseUp, .rightMouseUp])</code> and pops the menu manually with <code>menu.popUp(...)</code> — do not switch it to <code>statusItem.menu = menu</code> or the click-and-drag UX breaks.</li>
+    </ul>
+  </div>
+
+  <div class="layer">
+    <h3>Settings UI (SwiftUI)</h3>
+    <ul>
+      <li><code>SettingsView</code> is a <code>Form</code> bound to <code>@AppStorage</code> keys. The same keys are read back through <code>FinderPathPreferences</code> static getters.</li>
+      <li><strong>Always add new preferences in both places:</strong> a <code>static let xxxKey</code>, a default in <code>registerDefaults()</code>, a typed getter in <code>FinderPathPreferences</code>, and a matching <code>@AppStorage</code> + UI control in <code>SettingsView</code>. Also reset it in <code>resetDefaults()</code>.</li>
+      <li><code>SettingsWindowController</code> is an <code>NSWindowController</code> so the Settings window can be re-opened after closing (<code>isReleasedWhenClosed = false</code>).</li>
+    </ul>
+  </div>
+
+  <div class="layer">
+    <h3>State and side effects</h3>
+    <ul>
+      <li><code>FinderPathState</code> is <code>@MainActor</code> and holds the current path string. All copy/open actions live here and short-circuit on <code>hasCopyablePath</code> (path is non-empty and not an AppleScript error string).</li>
+    </ul>
+  </div>
+
+  <div class="layer">
+    <h3>Bridges to the system</h3>
+    <p>These are the only places that talk to the outside world; keep them pure and side-effect-focused.</p>
+    <ul>
+      <li><code>FinderBridge.currentPath()</code> uses <code>NSAppleScript</code> to ask Finder for the front window's target as a POSIX path, with a desktop fallback when no Finder windows are open. Errors are returned as <code>"Finder AppleScript error: ..."</code> strings, not thrown — downstream code detects them with <code>hasPrefix("Finder AppleScript error:")</code>.</li>
+      <li><code>TerminalBridge.open(at:)</code> uses <code>NSWorkspace</code> to open a folder in Terminal. <code>TerminalBridge.openAgent(...)</code> uses Terminal's AppleScript <code>do script</code> because running a command in a new Terminal session can't be done through <code>NSWorkspace</code>. Both escape shell and AppleScript carefully — use <code>ShellCommand.argument(_:quoteStyle:)</code> and the local <code>appleScriptString(_:)</code> helper rather than building strings ad hoc.</li>
+      <li><code>AgentLauncher.availability(for:)</code> spawns <code>/bin/zsh -lc</code> with an augmented <code>PATH</code> (<code>/opt/homebrew/bin:/usr/local/bin:~/.local/bin:...</code>) because GUI apps don't inherit the user's interactive PATH. This is how Codex/Claude CLIs are discovered. The shell snippet handles both bare command names (via <code>command -v</code>) and absolute executable paths.</li>
+      <li><code>ShellCommand.argument(_:quoteStyle:)</code> is the single source of shell-quoting truth. <code>"single"</code> uses the standard <code>'…'\''…'</code> trick; <code>"double"</code> escapes <code>\ " $ `</code>. Always route user-supplied paths through this before interpolating into a command.</li>
+    </ul>
+  </div>
+
+  <div class="layer">
+    <h3>Permissions and entitlements</h3>
+    <ul>
+      <li><code>Info.plist</code> declares <code>LSUIElement=YES</code>, <code>LSMinimumSystemVersion=13.0</code>, and <code>NSAppleEventsUsageDescription</code>. The first AppleScript call to Finder (and later Terminal) triggers macOS Automation prompts; if denied, errors surface as strings in the path header rather than crashing.</li>
+      <li>App Sandbox is <strong>off</strong> in this build (intentional, per <code>README.md</code>). Hardened Runtime is on for Release because Developer ID notarization requires it. If you re-enable sandboxing, Apple Events entitlements for <code>com.apple.finder</code> and <code>com.apple.Terminal</code> must be added back.</li>
+    </ul>
+  </div>
+
+  <h2>Conventions</h2>
+  <ul>
+    <li>Single-file source is intentional for now. If you split the file, keep the layer boundaries above (<code>StatusItemController</code> / <code>FinderPathState</code> / <code>FinderPathPreferences</code> / bridges) and update both scripts and the Xcode project file references.</li>
+    <li>All UI-touching types are annotated <code>@MainActor</code>. Keep new types in that isolation unless they're pure value types.</li>
+    <li>Pasteboard, AppleScript, and <code>Process</code> are the three "outside world" surfaces — keep new I/O of that kind inside the existing bridge enums (<code>FinderBridge</code>, <code>TerminalBridge</code>, <code>AgentLauncher</code>) rather than scattered through controllers.</li>
+    <li>Bundle identifier <code>io.github.bhino50.FinderPath</code> is used as the telemetry subsystem in <code>build_and_run.sh telemetry</code>. Keep them in sync if the bundle ID changes.</li>
+  </ul>
+
+  <h2>Related directories</h2>
+  <ul>
+    <li><code>download-site/</code> — separate static landing page (HTML/CSS, <code>vercel.json</code>). Independent from the app build; do not assume changes here affect the macOS target.</li>
+    <li><code>.codex/environments/</code> — Codex CLI environment config, not consumed by the app at runtime.</li>
+  </ul>
+
+  <footer>
+    Generated by <code>/init</code> from <code>FinderPath/FinderPathApp.swift</code>, <code>README.md</code>, <code>Info.plist</code>, and the build scripts.
+  </footer>
+</body>
+</html>

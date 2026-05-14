@@ -8,7 +8,7 @@
 
 ## What it does
 
-FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, jump to Terminal, or launch a CLI agent (Codex, Claude) directly in that folder — no more hunting through Finder or typing paths by hand.
+FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, jump to Terminal, or launch a CLI agent (Codex, Claude, Hermes) directly in that folder — no more hunting through Finder or typing paths by hand.
 
 ---
 
@@ -18,8 +18,9 @@ FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finde
 - **Copy Path** — copies the full POSIX path to the clipboard
 - **Copy cd Command** — copies a shell-safe `cd "/path/to/folder"` command, ready to paste
 - **Open in Terminal** — opens Terminal.app in the current Finder folder
-- **Open with Codex / Open with Claude** — launches optional CLI agents in a new Terminal session at the current folder
-- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; configure agent executable paths
+- **Open with Codex / Claude / Hermes** — launches optional CLI agents in a new Terminal session at the current folder
+- **Check for Updates** — pulls the latest GitHub Release and offers a one-click download if a newer version is available
+- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; configure agent executable paths and the update source URL
 
 ---
 
@@ -63,7 +64,8 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 | Path Header | Header title, display style, truncation, width, font size |
 | Menu Bar Icon | SF Symbol choice, optional short title |
 | Terminal | `cd` quoting style (double or single quotes) |
-| Agent Launchers | Codex and Claude executable paths, hide-if-unavailable toggle |
+| Agent Launchers | Codex, Claude, and Hermes executable paths, hide-if-unavailable toggle |
+| Updates | Installed version, update manifest URL (GitHub Releases by default), manual Check Now |
 
 ---
 
@@ -72,11 +74,40 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 FinderPath requires two Automation permissions, granted via a macOS prompt on first use:
 
 - **Finder** — reads the path of the frontmost Finder window via AppleScript
-- **Terminal** — opens Terminal sessions for the "Open with Codex/Claude" actions
+- **Terminal** — opens Terminal sessions for the "Open with Codex / Claude / Hermes" actions
 
 To review or re-grant permissions: System Settings > Privacy & Security > Automation > FinderPath.
 
 If access is denied, FinderPath shows the AppleScript error in the path field instead of crashing.
+
+---
+
+## Updates
+
+`Check for Updates...` reads the latest GitHub Release from `https://api.github.com/repos/bhino50/finder-path/releases/latest`, strips the leading `v` from the tag (`v1.1` → `1.1`), and compares it to the installed `CFBundleShortVersionString`. If a newer release is found, FinderPath shows an alert with the release notes and a `Download` button that opens the first `.dmg` asset (falling back to the first `.zip`, or the release page) in your browser. The source URL is editable under Settings > Updates.
+
+The parser also accepts a plain JSON manifest if you point the URL elsewhere:
+
+```json
+{
+  "version": "1.1",
+  "downloadURL": "https://example.com/FinderPath-1.1.dmg",
+  "notes": "Release notes."
+}
+```
+
+To ship a new version:
+
+1. Bump `MARKETING_VERSION` (and `CURRENT_PROJECT_VERSION`) in the Xcode project, plus `VERSION` in `script/package_release.sh`.
+2. `./script/package_release.sh` (set `DEVELOPER_ID` + `NOTARY_PROFILE` for a notarized DMG).
+3. Tag the commit and publish a GitHub Release with the `.dmg` attached:
+
+   ```bash
+   gh release create v1.1 dist/FinderPath-1.1.dmg \
+     --title "1.1" --notes "Adds Hermes launcher and Check for Updates."
+   ```
+
+   Existing installs hit `Check for Updates...` and get the new DMG.
 
 ---
 
