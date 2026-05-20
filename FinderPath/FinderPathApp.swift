@@ -49,6 +49,12 @@ final class FinderPathState {
         TerminalBridge.open(at: currentPath) { _ in }
     }
 
+    func openInGhostty() {
+        guard hasCopyablePath else { return }
+
+        TerminalBridge.openGhostty(at: currentPath) { _ in }
+    }
+
     func openWithCodex() {
         guard hasCopyablePath else { return }
 
@@ -206,6 +212,17 @@ final class StatusItemController: NSObject {
 
         let hideUnavailableAgents = FinderPathPreferences.hideUnavailableAgentItems
 
+        if FinderPathPreferences.showOpenGhosttyItem {
+            let isInstalled = TerminalBridge.isGhosttyInstalled
+            if !hideUnavailableAgents || isInstalled {
+                let title = isInstalled ? "Open in Ghostty" : "Ghostty Not Installed"
+                let ghosttyItem = NSMenuItem(title: title, action: #selector(openGhosttyMenuItem), keyEquivalent: "")
+                ghosttyItem.target = self
+                ghosttyItem.isEnabled = state.hasCopyablePath && isInstalled
+                menu.addItem(ghosttyItem)
+            }
+        }
+
         if FinderPathPreferences.showOpenWithCodexItem {
             let availability = AgentLauncher.availability(for: FinderPathPreferences.codexExecutable)
             if !hideUnavailableAgents || availability.isInstalled {
@@ -300,6 +317,10 @@ final class StatusItemController: NSObject {
         state.openInTerminal()
     }
 
+    @objc private func openGhosttyMenuItem() {
+        state.openInGhostty()
+    }
+
     @objc private func openWithCodexMenuItem() {
         state.openWithCodex()
     }
@@ -350,6 +371,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showCopyPathItemKey) private var showCopyPathItem = true
     @AppStorage(FinderPathPreferences.showCopyCDItemKey) private var showCopyCDItem = true
     @AppStorage(FinderPathPreferences.showOpenTerminalItemKey) private var showOpenTerminalItem = true
+    @AppStorage(FinderPathPreferences.showOpenGhosttyItemKey) private var showOpenGhosttyItem = true
     @AppStorage(FinderPathPreferences.showOpenWithCodexItemKey) private var showOpenWithCodexItem = true
     @AppStorage(FinderPathPreferences.showOpenWithClaudeItemKey) private var showOpenWithClaudeItem = true
     @AppStorage(FinderPathPreferences.showOpenWithHermesItemKey) private var showOpenWithHermesItem = true
@@ -382,6 +404,7 @@ struct SettingsView: View {
                 Toggle("Show Copy Path", isOn: $showCopyPathItem)
                 Toggle("Show Copy cd Command", isOn: $showCopyCDItem)
                 Toggle("Show Open in Terminal", isOn: $showOpenTerminalItem)
+                Toggle("Show Open in Ghostty", isOn: $showOpenGhosttyItem)
                 Toggle("Show Open with Codex", isOn: $showOpenWithCodexItem)
                 Toggle("Show Open with Claude", isOn: $showOpenWithClaudeItem)
                 Toggle("Show Open with Hermes", isOn: $showOpenWithHermesItem)
@@ -518,6 +541,7 @@ struct SettingsView: View {
         showCopyPathItem = true
         showCopyCDItem = true
         showOpenTerminalItem = true
+        showOpenGhosttyItem = true
         showOpenWithCodexItem = true
         showOpenWithClaudeItem = true
         showOpenWithHermesItem = true
@@ -592,6 +616,7 @@ enum FinderPathPreferences {
     static let showCopyPathItemKey = "showCopyPathItem"
     static let showCopyCDItemKey = "showCopyCDItem"
     static let showOpenTerminalItemKey = "showOpenTerminalItem"
+    static let showOpenGhosttyItemKey = "showOpenGhosttyItem"
     static let showOpenWithCodexItemKey = "showOpenWithCodexItem"
     static let showOpenWithClaudeItemKey = "showOpenWithClaudeItem"
     static let showOpenWithHermesItemKey = "showOpenWithHermesItem"
@@ -620,6 +645,7 @@ enum FinderPathPreferences {
             showCopyPathItemKey: true,
             showCopyCDItemKey: true,
             showOpenTerminalItemKey: true,
+            showOpenGhosttyItemKey: true,
             showOpenWithCodexItemKey: true,
             showOpenWithClaudeItemKey: true,
             showOpenWithHermesItemKey: true,
@@ -660,6 +686,10 @@ enum FinderPathPreferences {
 
     static var showOpenTerminalItem: Bool {
         bool(for: showOpenTerminalItemKey, defaultValue: true)
+    }
+
+    static var showOpenGhosttyItem: Bool {
+        bool(for: showOpenGhosttyItemKey, defaultValue: true)
     }
 
     static var showOpenWithCodexItem: Bool {
@@ -980,6 +1010,12 @@ enum AgentLauncher {
 }
 
 enum TerminalBridge {
+    static let ghosttyBundleIdentifier = "com.mitchellh.ghostty"
+
+    static var isGhosttyInstalled: Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: ghosttyBundleIdentifier) != nil
+    }
+
     static func open(at path: String, completion: @escaping (String?) -> Void) {
         let directoryURL = resolvedDirectoryURL(for: path)
 
@@ -994,6 +1030,28 @@ enum TerminalBridge {
         NSWorkspace.shared.open([directoryURL], withApplicationAt: terminalURL, configuration: configuration) { _, error in
             if let error {
                 completion("Could not open Terminal: \(error.localizedDescription)")
+            } else {
+                completion(nil)
+            }
+        }
+    }
+
+    static func openGhostty(at path: String, completion: @escaping (String?) -> Void) {
+        let directoryURL = resolvedDirectoryURL(for: path)
+
+        guard let ghosttyURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: ghosttyBundleIdentifier) else {
+            completion("Ghostty.app was not found.")
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+
+        // Ghostty accepts the working directory via an opened folder URL,
+        // matching how we hand a path off to Terminal.app.
+        NSWorkspace.shared.open([directoryURL], withApplicationAt: ghosttyURL, configuration: configuration) { _, error in
+            if let error {
+                completion("Could not open Ghostty: \(error.localizedDescription)")
             } else {
                 completion(nil)
             }
