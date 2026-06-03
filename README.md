@@ -41,6 +41,15 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 
 Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/finder-path/releases), open it, move `FinderPath.app` to `/Applications`, and launch it. The app is menu bar-only — no Dock icon will appear.
 
+### First launch (Gatekeeper)
+
+FinderPath is open source and **ad-hoc signed, not Apple-notarized** — notarization requires a paid Apple Developer ID, which this project doesn't have. Because of that, macOS Gatekeeper blocks the app the first time you open it, with a message like *"FinderPath can't be opened because Apple cannot check it for malicious software."* This is expected for an unnotarized open-source app, not a sign that anything is wrong. Here's how to open it (you only need to do this once):
+
+- **macOS 13–14 (Ventura / Sonoma):** right-click (or Control-click) `FinderPath.app` → **Open**, then click **Open** in the dialog.
+- **macOS 15+ (Sequoia):** double-click `FinderPath.app` once (it gets blocked), then open **System Settings → Privacy & Security**, scroll to the *"FinderPath was blocked…"* message, click **Open Anyway**, and confirm with **Open**.
+
+Prefer not to bypass Gatekeeper? Build it yourself from source (below) — a local build launches with no warning. The source is a single Swift file you can read end to end.
+
 ### Build from Source
 
 Requirements: macOS 13+, Xcode with Swift 5.9+ (or just the Command Line Tools for the no-Xcode script below)
