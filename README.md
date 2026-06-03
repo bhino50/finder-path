@@ -8,7 +8,7 @@
 
 ## What it does
 
-FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, jump to Terminal, or launch a CLI agent (Codex, Claude, Hermes) directly in that folder — no more hunting through Finder or typing paths by hand.
+FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, open the folder in cmux, Ghostty, or Terminal, launch a CLI agent (Codex, Claude, Hermes) right there, or pop open a clean **Connect to Server** window to SSH into your machines — including your Tailscale devices — no more hunting through Finder or typing paths by hand.
 
 ---
 
@@ -17,10 +17,13 @@ FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finde
 - **Menu bar path display** — always-visible path header at the top of the menu
 - **Copy Path** — copies the full POSIX path to the clipboard
 - **Copy cd Command** — copies a shell-safe `cd "/path/to/folder"` command, ready to paste
+- **Open in cmux / Ghostty** — your primary launchers, at the top of the menu; open the current Finder folder in cmux or a new Ghostty window
 - **Open in Terminal** — opens Terminal.app in the current Finder folder
 - **Open with Codex / Claude / Hermes** — launches optional CLI agents in a new Terminal session at the current folder
+- **Connect to Server** — a clean window (modeled on macOS Terminal's New Remote Connection) for SSH-ing to your machines. Lists your **Tailscale** devices live — Linux-only by default with a "Show all" toggle — shows VPN status with a Connect/Disconnect button, and keeps a curated list of your own servers you manage with +/−. Runs the session in Ghostty or Terminal.
+- **Shortcut action URLs** — `finderpath://open-ghostty`, `finderpath://open-cmux`, and `finderpath://connect` trigger those actions from keyboard tools like Karabiner
 - **Check for Updates** — pulls the latest GitHub Release and offers a one-click download if a newer version is available
-- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; configure agent executable paths and the update source URL
+- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; choose the SSH terminal; configure agent executable paths and the update source URL
 
 ---
 
@@ -38,7 +41,7 @@ Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/
 
 ### Build from Source
 
-Requirements: macOS 13+, Xcode with Swift 5.9+
+Requirements: macOS 13+, Xcode with Swift 5.9+ (or just the Command Line Tools for the no-Xcode script below)
 
 ```bash
 git clone https://github.com/bhino50/finder-path.git
@@ -50,6 +53,13 @@ Or build and launch from the terminal:
 
 ```bash
 ./script/build_and_run.sh
+```
+
+No Xcode IDE? Build and run with only the Command Line Tools (`xcode-select --install`) — no `.xcodeproj`, no `xcodebuild`. This compiles the single Swift source with `swiftc` and assembles the `.app` by hand:
+
+```bash
+./script/run_no_xcode.sh          # build + launch
+./script/run_no_xcode.sh build    # build only
 ```
 
 ---
@@ -64,6 +74,7 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 | Path Header | Header title, display style, truncation, width, font size |
 | Menu Bar Icon | SF Symbol choice, optional short title |
 | Terminal | `cd` quoting style (double or single quotes) |
+| Remote Connections | SSH terminal (Ghostty or macOS Terminal); servers and Tailscale devices are managed in the Connect to Server window |
 | Agent Launchers | Codex, Claude, and Hermes executable paths, hide-if-unavailable toggle |
 | Updates | Installed version, update manifest URL (GitHub Releases by default), manual Check Now |
 
@@ -74,7 +85,7 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 FinderPath requires two Automation permissions, granted via a macOS prompt on first use:
 
 - **Finder** — reads the path of the frontmost Finder window via AppleScript
-- **Terminal** — opens Terminal sessions for the "Open with Codex / Claude / Hermes" actions
+- **Terminal / Ghostty** — opens terminal sessions for the terminal and agent launch actions
 
 To review or re-grant permissions: System Settings > Privacy & Security > Automation > FinderPath.
 

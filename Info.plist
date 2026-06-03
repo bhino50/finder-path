@@ -18,6 +18,17 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>FinderPath Actions</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>finderpath</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
@@ -25,7 +36,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>FinderPath needs permission to read the current Finder path and to open Terminal, Ghostty, or optional CLI agent launch actions.</string>
+	<string>FinderPath needs permission to read the current Finder path and to open Terminal, Ghostty, cmux, CLI agents, or SSH connections you launch.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
