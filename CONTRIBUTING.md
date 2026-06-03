@@ -75,6 +75,10 @@ Before submitting a PR, manually verify:
 
 ---
 
+## Security
+
+Please do not post security details publicly. See [SECURITY.md](SECURITY.md) for private reporting guidance.
+
 ## Code of Conduct
 
-Be respectful and constructive. Harassment of any kind will not be tolerated. If you experience or witness unacceptable behavior, open an issue or email the maintainer directly.
+Be respectful and constructive. Harassment of any kind will not be tolerated. If you experience or witness unacceptable behavior, open an issue with enough context for the maintainer to review it.

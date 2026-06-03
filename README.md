@@ -34,7 +34,7 @@ FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finde
 
 ### Download (recommended)
 
-Download the latest `.dmg` from [Releases](https://github.com/bhino50/finder-path/releases), open it, drag `FinderPath.app` to `/Applications`, and launch it. The app is menu bar-only — no Dock icon will appear.
+Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/finder-path/releases), open it, move `FinderPath.app` to `/Applications`, and launch it. The app is menu bar-only — no Dock icon will appear.
 
 ### Build from Source
 
@@ -84,27 +84,27 @@ If access is denied, FinderPath shows the AppleScript error in the path field in
 
 ## Updates
 
-`Check for Updates...` reads the latest GitHub Release from `https://api.github.com/repos/bhino50/finder-path/releases/latest`, strips the leading `v` from the tag (`v1.1` → `1.1`), and compares it to the installed `CFBundleShortVersionString`. If a newer release is found, FinderPath shows an alert with the release notes and a `Download` button that opens the first `.dmg` asset (falling back to the first `.zip`, or the release page) in your browser. The source URL is editable under Settings > Updates.
+`Check for Updates...` reads the latest GitHub Release from `https://api.github.com/repos/bhino50/finder-path/releases/latest`, strips the leading `v` from the tag (`v1.2` → `1.2`), and compares it to the installed `CFBundleShortVersionString`. If a newer release is found, FinderPath shows an alert with the release notes and a `Download` button that opens the first `.dmg` asset (falling back to the first `.zip`, or the release page) in your browser. The source URL is editable under Settings > Updates.
 
 The parser also accepts a plain JSON manifest if you point the URL elsewhere:
 
 ```json
 {
-  "version": "1.1",
-  "downloadURL": "https://example.com/FinderPath-1.1.dmg",
+  "version": "1.2",
+  "downloadURL": "https://example.com/FinderPath-1.2.dmg",
   "notes": "Release notes."
 }
 ```
 
 To ship a new version:
 
-1. Bump `MARKETING_VERSION` (and `CURRENT_PROJECT_VERSION`) in the Xcode project, plus `VERSION` in `script/package_release.sh`.
+1. Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the Xcode project, plus `VERSION` in `script/package_release.sh`.
 2. `./script/package_release.sh` (set `DEVELOPER_ID` + `NOTARY_PROFILE` for a notarized DMG).
 3. Tag the commit and publish a GitHub Release with the `.dmg` attached:
 
    ```bash
-   gh release create v1.1 dist/FinderPath-1.1.dmg \
-     --title "1.1" --notes "Adds Hermes launcher and Check for Updates."
+   gh release create v1.2 dist/FinderPath-1.2.dmg \
+     --title "1.2" --notes "Release notes for this version."
    ```
 
    Existing installs hit `Check for Updates...` and get the new DMG.
