@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  macos:
-    name: Build FinderPath macOS
+  build:
+    name: Build FinderPath
     runs-on: macos-latest
 
     steps:
