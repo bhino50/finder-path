@@ -1,14 +1,16 @@
 # FinderPath
 
-**See and copy your current Finder folder path from the macOS menu bar.**
+**See and copy your current Finder folder path from the macOS menu bar. A separate Linux sibling is available at [finderpath-linux](https://github.com/bhino50/finderpath-linux).**
 
-![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple) ![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple) ![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift) ![Linux sibling](https://img.shields.io/badge/Linux-sibling-2ea44f?logo=linux) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
 ## What it does
 
 FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, open the folder in cmux, Ghostty, or Terminal, launch a CLI agent (Codex, Claude, Hermes) right there, or pop open a clean **Connect to Server** window to SSH into your machines — including your Tailscale devices — no more hunting through Finder or typing paths by hand.
+
+For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino50/finderpath-linux) repo. It provides copy path, copy `cd`, terminal/Ghostty/cmux launchers, Codex/Claude/Hermes launchers, SSH, Tailscale parsing, file-manager hooks, and an optional tray app.
 
 ---
 
@@ -39,6 +41,15 @@ FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finde
 
 Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/finder-path/releases), open it, move `FinderPath.app` to `/Applications`, and launch it. The app is menu bar-only — no Dock icon will appear.
 
+### First launch (Gatekeeper)
+
+FinderPath is open source and **ad-hoc signed, not Apple-notarized** — notarization requires a paid Apple Developer ID, which this project doesn't have. Because of that, macOS Gatekeeper blocks the app the first time you open it, with a message like *"FinderPath can't be opened because Apple cannot check it for malicious software."* This is expected for an unnotarized open-source app, not a sign that anything is wrong. Here's how to open it (you only need to do this once):
+
+- **macOS 13–14 (Ventura / Sonoma):** right-click (or Control-click) `FinderPath.app` → **Open**, then click **Open** in the dialog.
+- **macOS 15+ (Sequoia):** double-click `FinderPath.app` once (it gets blocked), then open **System Settings → Privacy & Security**, scroll to the *"FinderPath was blocked…"* message, click **Open Anyway**, and confirm with **Open**.
+
+Prefer not to bypass Gatekeeper? Build it yourself from source (below) — a local build launches with no warning. The source is a single Swift file you can read end to end.
+
 ### Build from Source
 
 Requirements: macOS 13+, Xcode with Swift 5.9+ (or just the Command Line Tools for the no-Xcode script below)
@@ -61,6 +72,18 @@ No Xcode IDE? Build and run with only the Command Line Tools (`xcode-select --in
 ./script/run_no_xcode.sh          # build + launch
 ./script/run_no_xcode.sh build    # build only
 ```
+
+### Linux sibling
+
+The Linux version lives in its own repository:
+
+```bash
+git clone https://github.com/bhino50/finderpath-linux.git
+cd finderpath-linux
+./install.sh
+```
+
+See [bhino50/finderpath-linux](https://github.com/bhino50/finderpath-linux) for Linux-specific install notes, file-manager integrations, and validation commands.
 
 ---
 
