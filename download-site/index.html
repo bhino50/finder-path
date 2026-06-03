@@ -6,12 +6,12 @@
     <title>FinderPath for macOS</title>
     <meta
       name="description"
-      content="FinderPath is a lightweight macOS menu bar app for copying the current Finder path, opening Terminal or Ghostty, and optionally launching Codex, Claude, or Hermes."
+      content="FinderPath is a lightweight macOS menu bar app for copying Finder paths, opening terminals, and launching CLI agents. A separate Linux sibling is available."
     >
     <meta property="og:title" content="FinderPath for macOS">
     <meta
       property="og:description"
-      content="A fast menu bar app for copying the current Finder path, cd command, opening Terminal or Ghostty, and optional Codex, Claude, or Hermes launchers."
+      content="A fast macOS menu bar app for copying the current Finder path, cd command, opening terminals, and optional Codex, Claude, or Hermes launchers."
     >
     <meta property="og:image" content="/assets/finderpath-icon.png">
     <link rel="icon" href="/assets/finderpath-icon.png">
@@ -34,14 +34,18 @@
           <h1 id="hero-title">Your Finder path, one click away.</h1>
           <p class="lede">
             FinderPath brings address-bar speed to macOS Finder, with instant copy,
-            <code>cd</code> commands, Terminal or Ghostty launch, and optional one-click Codex, Claude, or Hermes.
+            <code>cd</code> commands, terminal launch, Ghostty, cmux, and optional one-click Codex, Claude, or Hermes.
+            Linux users can install the separate finderpath-linux sibling.
           </p>
 
           <div class="hero-actions">
             <a class="button primary" href="https://github.com/bhino50/finder-path/releases/latest">
               Download for macOS
             </a>
-            <span class="release-note">Version 1.2 · macOS 13+ · Apple Silicon and Intel</span>
+            <a class="button" href="https://github.com/bhino50/finderpath-linux">
+              Install on Linux
+            </a>
+            <span class="release-note">Version 1.3 · macOS 13+ · Linux sibling</span>
           </div>
         </div>
 
@@ -75,32 +79,34 @@
       <section class="feature-band" aria-label="FinderPath features">
         <article>
           <span class="feature-number">01</span>
-          <h2>Native menu bar workflow</h2>
-          <p>No main window, no clutter. FinderPath stays in the menu bar and opens instantly.</p>
+          <h2>Native path workflow</h2>
+          <p>On macOS it stays in the menu bar. The Linux sibling installs CLI actions, file-manager hooks, and an optional tray app.</p>
         </article>
         <article>
           <span class="feature-number">02</span>
           <h2>Developer-ready commands</h2>
-          <p>Copy the raw path, copy a quoted <code>cd</code> command, or open Terminal in place.</p>
+          <p>Copy the raw path, copy a quoted <code>cd</code> command, or open your terminal in place.</p>
         </article>
         <article>
           <span class="feature-number">03</span>
           <h2>Optional CLI launchers</h2>
-          <p>Start Codex, Claude, or Hermes from the exact Finder folder when those tools are installed.</p>
+          <p>Start Codex, Claude, or Hermes from the exact current folder when those tools are installed.</p>
         </article>
       </section>
 
       <section class="install" aria-labelledby="install-title">
         <div>
           <p class="eyebrow">Install</p>
-          <h2 id="install-title">Download the DMG, drag to Applications, approve Finder access.</h2>
+          <h2 id="install-title">Install the macOS app or use the Linux sibling repo.</h2>
         </div>
         <p>
+          On macOS, download the DMG, drag to Applications, and approve Finder access.
           This build is locally signed. If macOS blocks the first launch, right-click
           FinderPath and choose Open. The Finder Automation prompt appears the first
           time the app reads the current Finder path. Terminal permission appears
-          when using Terminal-backed agent launch actions. Ghostty and agent buttons
-          are optional and can be hidden or pointed at a custom executable path in Settings.
+          when using Terminal-backed agent launch actions. On Linux, use the separate
+          finderpath-linux repository to add the finderpath-linux command, Nautilus scripts,
+          a Dolphin service menu, and an optional GTK/AppIndicator tray launcher.
         </p>
       </section>
     </main>

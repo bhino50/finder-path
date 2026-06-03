@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build FinderPath
+  macos:
+    name: Build FinderPath macOS
     runs-on: macos-latest
 
     steps:
@@ -27,6 +27,7 @@ jobs:
             FinderPath/Assets.xcassets/AccentColor.colorset/Contents.json \
             download-site/version.json
           bash -n script/build_and_run.sh
+          bash -n script/run_no_xcode.sh
           bash -n script/package_release.sh
 
       - name: Build Debug app
