@@ -958,7 +958,7 @@ struct RemoteConnectionView: View {
             }
 
             if servers.isEmpty {
-                Text("No servers yet. Click + to add one (e.g. My Server = myserver).")
+                Text("No servers yet. Click + to add one (e.g. Dev Server = dev.example.com).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -1041,9 +1041,9 @@ struct RemoteConnectionView: View {
     private var addServerSheet: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Add Server").font(.headline)
-            TextField("Name (e.g. Linux Tower)", text: $newServerName)
+            TextField("Name (e.g. Dev Server)", text: $newServerName)
                 .textFieldStyle(.roundedBorder)
-            TextField("ssh target (e.g. myserver or user@host)", text: $newServerTarget)
+            TextField("SSH target (e.g. dev.example.com or user@host)", text: $newServerTarget)
                 .textFieldStyle(.roundedBorder)
             HStack {
                 Spacer()
@@ -1070,7 +1070,7 @@ struct RemoteConnectionView: View {
 
     private func commitAddServer() {
         let name = newServerName.trimmingCharacters(in: .whitespaces)
-        let target = newServerTarget.trimmingCharacters(in: .whitespaces)
+        let target = RemoteServers.normalizedTarget(newServerTarget)
         guard !target.isEmpty else { return }
 
         var current = servers
@@ -1092,10 +1092,13 @@ struct RemoteConnectionView: View {
     private func connect() {
         guard !selectedTarget.isEmpty else { return }
 
-        let trimmedUser = user.trimmingCharacters(in: .whitespaces)
-        let host = (!trimmedUser.isEmpty && !selectedTarget.contains("@"))
-            ? "\(trimmedUser)@\(selectedTarget)"
-            : selectedTarget
+        let target = RemoteServers.normalizedTarget(selectedTarget)
+        guard !target.isEmpty else { return }
+
+        let trimmedUser = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = (!trimmedUser.isEmpty && !target.contains("@"))
+            ? "\(trimmedUser)@\(target)"
+            : target
 
         let terminal = TerminalBridge.RemoteTerminal(rawValue: remoteConnectionTerminal) ?? .ghostty
         TerminalBridge.openSSH(host: host, using: terminal) { error in
@@ -1482,10 +1485,11 @@ struct RemoteServer: Equatable {
 enum RemoteServers {
     // Parses the user's curated server list (stored as plain text in preferences).
     // One server per line, in the form `Name = ssh-target`, for example:
-    //   My Server = myserver
+    //   Dev Server = dev.example.com
     // The target can be a ~/.ssh/config alias or a `user@host` string. A line with
-    // no `=` is used as both the display name and the target. Blank lines and lines
-    // starting with `#` are ignored.
+    // no `=` is used as both the display name and the target. Pasted commands like
+    // `ssh user@host` are normalized to `user@host`. Blank lines and lines starting
+    // with `#` are ignored.
     static func parse(_ text: String) -> [RemoteServer] {
         var servers: [RemoteServer] = []
 
@@ -1494,12 +1498,14 @@ enum RemoteServers {
             guard !line.isEmpty, !line.hasPrefix("#") else { continue }
 
             guard let separatorIndex = line.firstIndex(of: "=") else {
-                servers.append(RemoteServer(name: line, target: line))
+                let target = normalizedTarget(line)
+                guard !target.isEmpty else { continue }
+                servers.append(RemoteServer(name: target, target: target))
                 continue
             }
 
             let name = line[..<separatorIndex].trimmingCharacters(in: .whitespaces)
-            let target = line[line.index(after: separatorIndex)...].trimmingCharacters(in: .whitespaces)
+            let target = normalizedTarget(String(line[line.index(after: separatorIndex)...]))
             guard !target.isEmpty else { continue }
 
             servers.append(RemoteServer(name: name.isEmpty ? target : name, target: target))
@@ -1509,7 +1515,43 @@ enum RemoteServers {
     }
 
     static func serialize(_ servers: [RemoteServer]) -> String {
-        servers.map { "\($0.name) = \($0.target)" }.joined(separator: "\n")
+        servers.compactMap { server in
+            let target = normalizedTarget(server.target)
+            guard !target.isEmpty else { return nil }
+
+            let name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(name.isEmpty ? target : name) = \(target)"
+        }.joined(separator: "\n")
+    }
+
+    static func normalizedTarget(_ rawTarget: String) -> String {
+        let trimmedTarget = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmedTarget.split(whereSeparator: { $0 == " " || $0 == "\t" })
+
+        guard parts.first?.lowercased() == "ssh" else {
+            return strippedMatchingQuotes(trimmedTarget)
+        }
+
+        let argumentParts = Array(parts.dropFirst())
+        let hostParts = argumentParts.first == "--" ? Array(argumentParts.dropFirst()) : argumentParts
+
+        guard hostParts.count == 1 else {
+            return trimmedTarget
+        }
+
+        return strippedMatchingQuotes(String(hostParts[0]))
+    }
+
+    private static func strippedMatchingQuotes(_ value: String) -> String {
+        guard value.count >= 2,
+              let first = value.first,
+              let last = value.last,
+              first == last,
+              first == "\"" || first == "'" else {
+            return value
+        }
+
+        return String(value.dropFirst().dropLast())
     }
 }
 
@@ -1854,6 +1896,11 @@ enum TerminalBridge {
         // injection / remote command execution). Both backends also pass `--`.
         guard !trimmedHost.hasPrefix("-") else {
             completion("Refusing to connect to a host that starts with '-' (possible SSH flag injection).")
+            return
+        }
+
+        guard trimmedHost.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else {
+            completion("Enter just the SSH host or user@host, without the ssh command or extra options.")
             return
         }
 
