@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build FinderPath
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate project files
+        run: |
+          plutil -lint Info.plist
+          ruby -rjson -e 'ARGV.each { |path| JSON.parse(File.read(path)) }' \
+            FinderPath/Assets.xcassets/Contents.json \
+            FinderPath/Assets.xcassets/AppIcon.appiconset/Contents.json \
+            FinderPath/Assets.xcassets/AccentColor.colorset/Contents.json \
+            download-site/version.json
+          bash -n script/build_and_run.sh
+          bash -n script/package_release.sh
+
+      - name: Build Debug app
+        run: |
+          xcodebuild \
+            -project FinderPath.xcodeproj \
+            -scheme FinderPath \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -derivedDataPath .build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build

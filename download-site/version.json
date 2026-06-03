@@ -1,5 +1,5 @@
 {
-  "version": "1.1",
-  "downloadURL": "https://finder-path.vercel.app/downloads/FinderPath-1.1.dmg",
-  "notes": "Adds Open with Hermes launcher and Check for Updates."
+  "version": "1.2",
+  "downloadURL": "https://finder-path.vercel.app/downloads/FinderPath-1.2.dmg",
+  "notes": "Adds Ghostty launcher support and current open-source readiness updates."
 }

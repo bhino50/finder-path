@@ -25,7 +25,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>FinderPath needs permission to read the current Finder path and to open Terminal commands when you choose Codex or Claude launch actions.</string>
+	<string>FinderPath needs permission to read the current Finder path and to open Terminal, Ghostty, or optional CLI agent launch actions.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
