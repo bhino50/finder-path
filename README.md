@@ -10,7 +10,7 @@
 
 FinderPath sits in your menu bar and shows the POSIX path of the frontmost Finder window. Click the icon to copy the path, open the folder in cmux, Ghostty, or Terminal, launch a CLI agent (Codex, Claude, Hermes) right there, or pop open a clean **Connect to Server** window to SSH into your machines — including your Tailscale devices — no more hunting through Finder or typing paths by hand.
 
-For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino50/finderpath-linux) repo. It provides copy path, copy `cd`, terminal/Ghostty/cmux launchers, Codex/Claude/Hermes launchers, SSH, Tailscale parsing, file-manager hooks, and an optional tray app.
+For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino50/finderpath-linux) sibling. Its one-file installer provides copy path, copy `cd`, terminal/Ghostty/cmux launchers, Codex/Claude/Hermes launchers, SSH, Tailscale parsing, file-manager hooks, dependency bootstrap, and an optional tray app.
 
 ---
 
@@ -75,15 +75,16 @@ No Xcode IDE? Build and run with only the Command Line Tools (`xcode-select --in
 
 ### Linux sibling
 
-The Linux version lives in its own repository:
+Download and run the one-file Linux installer:
 
 ```bash
-git clone https://github.com/bhino50/finderpath-linux.git
-cd finderpath-linux
-./install.sh
+curl -fL -o finderpath-linux-installer.sh \
+  https://github.com/bhino50/finderpath-linux/releases/latest/download/finderpath-linux-installer.sh
+chmod +x finderpath-linux-installer.sh
+./finderpath-linux-installer.sh --yes
 ```
 
-See [bhino50/finderpath-linux](https://github.com/bhino50/finderpath-linux) for Linux-specific install notes, file-manager integrations, and validation commands.
+See [bhino50/finderpath-linux](https://github.com/bhino50/finderpath-linux) for Linux-specific source install notes, file-manager integrations, and validation commands.
 
 ---
 
