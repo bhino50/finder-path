@@ -45,7 +45,7 @@
             <a class="button" href="https://github.com/bhino50/finderpath-linux/releases/latest/download/finderpath-linux-installer.sh">
               Download Linux installer
             </a>
-            <span class="release-note">Version 1.3 · macOS 13+ · Linux installer</span>
+            <span class="release-note">Version 1.3.1 · macOS 13+ · Linux installer</span>
           </div>
         </div>
 
@@ -99,16 +99,30 @@
           <p class="eyebrow">Install</p>
           <h2 id="install-title">Install the macOS app or the Linux sibling.</h2>
         </div>
+        <div class="install-copy">
         <p>
-          On macOS, download the DMG, drag to Applications, and approve Finder access.
-          This build is locally signed. If macOS blocks the first launch, right-click
-          FinderPath and choose Open. The Finder Automation prompt appears the first
-          time the app reads the current Finder path. Terminal permission appears
-          when using Terminal-backed agent launch actions. On Linux, download the separate
-          finderpath-linux installer to add the finderpath-linux command, Nautilus scripts,
-          a Dolphin service menu, supported desktop dependencies, and an optional
-          GTK/AppIndicator tray launcher.
+          On macOS, download the DMG and drag FinderPath to Applications. FinderPath is
+          open source and not Apple-notarized, so macOS blocks the very first launch —
+          this is expected and you only need to bypass it once:
         </p>
+        <ul class="install-steps">
+          <li><strong>macOS 13–14 (Ventura / Sonoma):</strong> right-click (or Control-click)
+            FinderPath in Applications, choose <strong>Open</strong>, then click
+            <strong>Open</strong> in the dialog.</li>
+          <li><strong>macOS 15+ (Sequoia / Tahoe):</strong> double-click FinderPath once (it gets
+            blocked), then open <strong>System Settings → Privacy &amp; Security</strong>, scroll
+            to the <em>"FinderPath was blocked…"</em> message, click <strong>Open Anyway</strong>,
+            and confirm with <strong>Open</strong>.</li>
+        </ul>
+        <p>
+          After that, the Finder Automation prompt appears the first time the app reads the
+          current Finder path, and Terminal permission appears when using Terminal-backed
+          agent launch actions. Prefer not to bypass Gatekeeper? Build it from source — it is
+          a single Swift file. On Linux, download the separate finderpath-linux installer to
+          add the finderpath-linux command, Nautilus scripts, a Dolphin service menu, supported
+          desktop dependencies, and an optional GTK/AppIndicator tray launcher.
+        </p>
+        </div>
       </section>
     </main>
   </body>
