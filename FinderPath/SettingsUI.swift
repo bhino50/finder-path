@@ -521,7 +521,11 @@ enum UpdatePrompt {
                 detail += "\n\n\(notes)"
             }
             alert.informativeText = detail
-            alert.addButton(withTitle: manifest.downloadURL == nil ? "OK" : "Download")
+            if manifest.archiveURL != nil {
+                alert.addButton(withTitle: "Install and Relaunch")
+            } else {
+                alert.addButton(withTitle: manifest.downloadURL == nil ? "OK" : "Download")
+            }
             alert.addButton(withTitle: "Later")
 
         case .failed(let message):
@@ -535,9 +539,45 @@ enum UpdatePrompt {
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
 
-        if case .updateAvailable(let manifest) = result,
-           response == .alertFirstButtonReturn,
-           let url = manifest.downloadURL {
+        guard case .updateAvailable(let manifest) = result,
+              response == .alertFirstButtonReturn else { return }
+
+        if manifest.archiveURL != nil {
+            beginInstall(manifest: manifest)
+        } else if let url = manifest.downloadURL {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private static func beginInstall(manifest: UpdateManifest) {
+        UpdateInstaller.install(manifest: manifest) { result in
+            switch result {
+            case .success:
+                // The relaunch helper waits for this process to exit, then
+                // reopens the freshly installed copy.
+                NSApp.terminate(nil)
+            case .failure(let error):
+                presentInstallFailure(error, manifest: manifest)
+            }
+        }
+    }
+
+    private static func presentInstallFailure(_ error: UpdateInstaller.InstallError, manifest: UpdateManifest) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "The update could not be installed."
+        alert.informativeText = error.localizedDescription
+        if manifest.downloadURL != nil {
+            alert.addButton(withTitle: "Download in Browser")
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.addButton(withTitle: "OK")
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        if response == .alertFirstButtonReturn, let url = manifest.downloadURL {
             NSWorkspace.shared.open(url)
         }
     }

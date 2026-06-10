@@ -3,18 +3,13 @@ FinderPath — Install & First Launch
 
 1. Drag FinderPath.app into the Applications folder.
 
-2. FIRST OPEN (macOS Gatekeeper)
-   FinderPath is open source and not Apple-notarized yet, so macOS blocks
-   the first launch. This is expected — not a virus warning.
+2. FIRST OPEN
+   FinderPath is signed with an Apple Developer ID and notarized by Apple,
+   so it opens like any other Mac app — just double-click it. No security
+   warnings, no extra steps.
 
-   macOS 13–14 (Ventura / Sonoma):
-     • Right-click (or Control-click) FinderPath in Applications
-     • Choose Open, then click Open in the dialog
-
-   macOS 15+ (Sequoia / Tahoe):
-     • Double-click FinderPath once (it will be blocked)
-     • Open System Settings → Privacy & Security
-     • Scroll to “FinderPath was blocked…” and click Open Anyway
+   If you downloaded an older copy before June 2026 and macOS blocks it,
+   delete that copy and download the current version instead.
 
 3. IN-APP SETUP
    A short welcome window walks you through Finder access. You can reopen it

@@ -25,6 +25,9 @@ enum AppVersion {
 struct UpdateManifest: Equatable {
     let latestVersion: String
     let downloadURL: URL?
+    // Direct .zip or .dmg asset suitable for in-app install; nil falls back
+    // to opening downloadURL in the browser.
+    let archiveURL: URL?
     let releaseNotes: String?
 }
 
@@ -104,6 +107,7 @@ enum UpdateChecker {
             ?? (json["url"] as? String)
             ?? (json["download_url"] as? String)
         let downloadURL = downloadString.flatMap { URL(string: $0) }
+        let isDirectArchive = ["zip", "dmg"].contains(downloadURL?.pathExtension.lowercased() ?? "")
 
         let notes = (json["notes"] as? String)
             ?? (json["releaseNotes"] as? String)
@@ -112,6 +116,7 @@ enum UpdateChecker {
         return UpdateManifest(
             latestVersion: version,
             downloadURL: downloadURL,
+            archiveURL: isDirectArchive ? downloadURL : nil,
             releaseNotes: notes
         )
     }
@@ -139,6 +144,7 @@ enum UpdateChecker {
         return UpdateManifest(
             latestVersion: version,
             downloadURL: dmgURL ?? zipURL ?? pageURL,
+            archiveURL: zipURL ?? dmgURL,
             releaseNotes: notes?.isEmpty == false ? notes : nil
         )
     }

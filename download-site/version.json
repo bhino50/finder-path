@@ -1,5 +1,5 @@
 {
-  "version": "1.3.1",
-  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.3.1/FinderPath-1.3.1.dmg",
+  "version": "1.4",
+  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.4/FinderPath-1.4.dmg",
   "notes": "Patch release: Connect to Server now normalizes pasted SSH commands and option strings into a clean host target before saving or connecting, so Ghostty/Terminal launch the intended server instead of passing invalid SSH arguments."
 }
