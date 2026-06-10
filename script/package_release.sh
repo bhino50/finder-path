@@ -10,6 +10,7 @@ VERSION="1.3.1"
 DERIVED_DATA_PATH="$ROOT_DIR/.build/PackageDerivedData"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$APP_NAME.app"
 DIST_DIR="$ROOT_DIR/dist"
+README_SRC="$ROOT_DIR/script/dmg-install-readme.txt"
 
 if [[ -d /Applications/Xcode.app/Contents/Developer && -z "${DEVELOPER_DIR:-}" ]]; then
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
@@ -62,7 +63,7 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
     echo "Set NOTARY_PROFILE to create the public-friendly notarized ZIP."
   fi
 else
-  echo "No DEVELOPER_ID set; building local-test ZIP only."
+  echo "No DEVELOPER_ID set; building ad-hoc signed release..."
   /usr/bin/xcodebuild \
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME" \
@@ -70,8 +71,11 @@ else
     -destination "generic/platform=macOS" \
     -derivedDataPath "$DERIVED_DATA_PATH" \
     ONLY_ACTIVE_ARCH=NO \
+    CODE_SIGN_IDENTITY="-" \
+    CODE_SIGNING_REQUIRED=YES \
     build
 
+  /usr/bin/codesign --force --sign - --options runtime "$APP_PATH"
   FINAL_ZIP="$DIST_DIR/$APP_NAME-$VERSION-local-test.zip"
   /usr/bin/ditto -c -k --norsrc --keepParent "$APP_PATH" "$FINAL_ZIP"
   echo "Created local-test ZIP: $FINAL_ZIP"
@@ -84,6 +88,9 @@ rm -rf "$DMG_STAGING_DIR" "$DMG_PATH"
 mkdir -p "$DMG_STAGING_DIR"
 /usr/bin/ditto "$APP_PATH" "$DMG_STAGING_DIR/$APP_NAME.app"
 ln -s /Applications "$DMG_STAGING_DIR/Applications"
+if [[ -f "$README_SRC" ]]; then
+  cp "$README_SRC" "$DMG_STAGING_DIR/Install First — Read Me.txt"
+fi
 /usr/bin/hdiutil create \
   -volname "$APP_NAME" \
   -srcfolder "$DMG_STAGING_DIR" \

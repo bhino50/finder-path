@@ -15,12 +15,19 @@ struct FinderPathApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
+    private var welcomeWindowController: WelcomeWindowController?
     private let actionRouter = FinderPathActionRouter()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FinderPathPreferences.registerDefaults()
         NSApp.setActivationPolicy(.accessory)
         statusItemController = StatusItemController()
+        statusItemController?.onOpenWelcomeGuide = { [weak self] in
+            self?.showWelcomeGuide()
+        }
+        if !FinderPathPreferences.completedWelcome {
+            showWelcomeGuide()
+        }
         actionRouter.onOpenConnectWindow = { [weak self] in
             self?.statusItemController?.openRemoteConnectionWindow()
         }
@@ -49,6 +56,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         actionRouter.handle(url: url)
+    }
+
+    func showWelcomeGuide() {
+        if welcomeWindowController == nil {
+            welcomeWindowController = WelcomeWindowController()
+        }
+        welcomeWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -216,6 +231,8 @@ final class FinderPathState {
 
 @MainActor
 final class StatusItemController: NSObject {
+    var onOpenWelcomeGuide: (() -> Void)?
+
     private let state = FinderPathState()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
@@ -278,6 +295,10 @@ final class StatusItemController: NSObject {
         let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettingsMenuItem), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let welcomeItem = NSMenuItem(title: "Setup Guide...", action: #selector(openWelcomeGuideMenuItem), keyEquivalent: "")
+        welcomeItem.target = self
+        menu.addItem(welcomeItem)
 
         menu.addItem(.separator())
 
@@ -442,6 +463,10 @@ final class StatusItemController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func openWelcomeGuideMenuItem() {
+        onOpenWelcomeGuide?()
+    }
+
     @objc private func openSettingsMenuItem() {
         openSettings()
     }
@@ -492,6 +517,140 @@ final class StatusItemController: NSObject {
 
     @objc private func quitMenuItem() {
         NSApp.terminate(nil)
+    }
+}
+
+
+@MainActor
+final class WelcomeWindowController: NSWindowController {
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.title = "Welcome to FinderPath"
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.contentViewController = NSHostingController(rootView: WelcomeView())
+
+        super.init(window: window)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+struct WelcomeView: View {
+    @AppStorage(FinderPathPreferences.completedWelcomeKey) private var completedWelcome = false
+    @State private var finderPath = ""
+    @State private var isCheckingFinder = false
+
+    private var finderAccessGranted: Bool {
+        !finderPath.isEmpty && !finderPath.hasPrefix("Finder AppleScript error:")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 16) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Welcome to FinderPath").font(.title).bold()
+                    Text("Your Finder path in the menu bar.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            stepRow(
+                index: 1,
+                title: "Look for the menu bar icon",
+                detail: "FinderPath has no Dock icon. Click the folder icon near the clock to open the menu.")
+
+            stepRow(
+                index: 2,
+                title: "Allow Finder access",
+                detail: "FinderPath needs permission to read the frontmost Finder folder path.")
+
+            HStack {
+                Button {
+                    requestFinderAccess()
+                } label: {
+                    Label("Grant Finder Access", systemImage: "hand.raised")
+                }
+                .controlSize(.large)
+                .disabled(isCheckingFinder)
+
+                Spacer()
+                statusBadge
+            }
+
+            if !finderPath.isEmpty && !finderAccessGranted {
+                Text(finderPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Text("If macOS blocked the first launch, see Install First — Read Me.txt in the download DMG for the one-time Gatekeeper steps.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button(finderAccessGranted ? "Get Started" : "Skip for Now") {
+                    completedWelcome = true
+                    NSApp.keyWindow?.close()
+                }
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear {
+            refreshFinderAccess()
+        }
+    }
+
+    private func stepRow(index: Int, title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle().fill(.tint.opacity(0.15)).frame(width: 28, height: 28)
+                Text("\(index)").font(.headline).foregroundStyle(.tint)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(detail).font(.subheadline).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusBadge: some View {
+        if finderAccessGranted {
+            Label("Finder access on", systemImage: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+        } else {
+            Label("Waiting for permission…", systemImage: "ellipsis.circle")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func requestFinderAccess() {
+        isCheckingFinder = true
+        refreshFinderAccess()
+        isCheckingFinder = false
+    }
+
+    private func refreshFinderAccess() {
+        finderPath = FinderBridge.currentPath()
     }
 }
 
@@ -1111,7 +1270,7 @@ struct RemoteConnectionView: View {
         isTogglingVPN = true
         let goingUp = !tailscale.isRunning
         Task {
-            let error = await Task.detached { goingUp ? TailscaleBridge.up() : TailscaleBridge.down() }.value
+            let error = await Task.detached { await goingUp ? TailscaleBridge.up() : TailscaleBridge.down() }.value
             isTogglingVPN = false
             if let error { errorMessage = error }
             await refreshTailscale()
@@ -1120,7 +1279,7 @@ struct RemoteConnectionView: View {
 
     private func refreshTailscale() async {
         isLoadingTailscale = true
-        tailscale = await Task.detached { TailscaleBridge.status() }.value
+        tailscale = await Task.detached { await TailscaleBridge.status() }.value
         isLoadingTailscale = false
     }
 }
@@ -1154,8 +1313,13 @@ enum FinderPathPreferences {
     static let claudeExecutableKey = "claudeExecutable"
     static let hermesExecutableKey = "hermesExecutable"
     static let hideUnavailableAgentItemsKey = "hideUnavailableAgentItems"
+    static let completedWelcomeKey = "completedWelcome"
     static let updateManifestURLKey = "updateManifestURL"
     static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
+
+    static var completedWelcome: Bool {
+        bool(for: completedWelcomeKey, defaultValue: false)
+    }
 
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
@@ -1187,7 +1351,8 @@ enum FinderPathPreferences {
             claudeExecutableKey: "claude",
             hermesExecutableKey: "hermes",
             hideUnavailableAgentItemsKey: true,
-            updateManifestURLKey: defaultUpdateManifestURL
+            updateManifestURLKey: defaultUpdateManifestURL,
+            completedWelcomeKey: false
         ])
     }
 
@@ -1565,7 +1730,7 @@ struct TailscaleDevice: Identifiable, Hashable, Sendable {
     var isLinux: Bool { os.lowercased() == "linux" }
 }
 
-struct TailscaleStatus: Sendable {
+nonisolated struct TailscaleStatus: Sendable {
     enum Backend: Sendable { case running, stopped, needsLogin, unavailable }
 
     let backend: Backend
@@ -1577,7 +1742,7 @@ struct TailscaleStatus: Sendable {
     var isRunning: Bool { backend == .running }
 }
 
-enum TailscaleBridge {
+nonisolated enum TailscaleBridge {
     static let appExecutablePath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
     static func executablePath() -> String? {
@@ -1692,7 +1857,7 @@ enum TailscaleBridge {
     }
 }
 
-enum ShellCommand {
+nonisolated enum ShellCommand {
     static func argument(_ value: String, quoteStyle: String = "single") -> String {
         switch quoteStyle {
         case "double":
@@ -1722,7 +1887,7 @@ struct AgentAvailability: Equatable {
     }
 }
 
-enum AgentLauncher {
+nonisolated enum AgentLauncher {
     static func availability(for executable: String, defaultExecutable: String? = nil) -> AgentAvailability {
         let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
