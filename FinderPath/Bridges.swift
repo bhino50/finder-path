@@ -1,6 +1,24 @@
 import AppKit
 
 enum FinderBridge {
+    // AppleScript error -1743 (errAEEventNotPermitted): the user declined the
+    // Automation prompt, or FinderPath was switched off later under
+    // System Settings > Privacy & Security > Automation.
+    private static let automationDeniedErrorNumber = -1743
+
+    static let permissionDeniedMessage = "Finder AppleScript error: FinderPath is not allowed to control Finder."
+
+    static let automationSettingsURLString = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+
+    static func isPermissionDenied(_ path: String) -> Bool {
+        path == permissionDeniedMessage
+    }
+
+    static func openAutomationSettings() {
+        guard let url = URL(string: automationSettingsURLString) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     static func currentPath() -> String {
         // Some Finder windows, such as the Computer view, report a target that
         // cannot be coerced to a file alias. Treat those like no-window cases.
@@ -32,6 +50,11 @@ enum FinderBridge {
         let result = script.executeAndReturnError(&error)
 
         if let error {
+            if let errorNumber = error[NSAppleScript.errorNumber] as? Int,
+               errorNumber == automationDeniedErrorNumber {
+                return permissionDeniedMessage
+            }
+
             let message = error[NSAppleScript.errorMessage] as? String
                 ?? error.description
             return "Finder AppleScript error: \(message)"

@@ -47,6 +47,15 @@ enum RemoteServers {
         }.joined(separator: "\n")
     }
 
+    // Saved SSH targets are limited to hostname / user@host / ssh-config alias
+    // shapes so an entry can never smuggle whitespace, shell syntax, or ssh
+    // option flags into the connect command.
+    private static let validTargetPattern = "^[A-Za-z0-9._@:-]+$"
+
+    static func isValidTarget(_ target: String) -> Bool {
+        target.range(of: validTargetPattern, options: .regularExpression) != nil
+    }
+
     static func normalizedTarget(_ rawTarget: String) -> String {
         let trimmedTarget = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmedTarget.split(whereSeparator: { $0 == " " || $0 == "\t" })

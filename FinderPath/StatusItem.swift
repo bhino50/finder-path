@@ -53,13 +53,28 @@ final class StatusItemController: NSObject {
         menu.removeAllItems()
         menu.autoenablesItems = false
 
+        let isPermissionDenied = FinderBridge.isPermissionDenied(state.currentPath)
+
         if FinderPathPreferences.showPathHeader {
             let pathItem = NSMenuItem()
             pathItem.view = PathMenuHeaderView(
-                path: FinderPathPreferences.displayPath(for: state.currentPath),
+                path: isPermissionDenied
+                    ? "Finder access needed"
+                    : FinderPathPreferences.displayPath(for: state.currentPath),
                 isError: !state.hasCopyablePath
             )
             menu.addItem(pathItem)
+            menu.addItem(.separator())
+        }
+
+        if isPermissionDenied {
+            let permissionItem = NSMenuItem(
+                title: "Allow Finder Access in System Settings…",
+                action: #selector(openAutomationSettingsMenuItem),
+                keyEquivalent: ""
+            )
+            permissionItem.target = self
+            menu.addItem(permissionItem)
             menu.addItem(.separator())
         }
 
@@ -236,6 +251,10 @@ final class StatusItemController: NSObject {
 
     @objc private func openWelcomeGuideMenuItem() {
         onOpenWelcomeGuide?()
+    }
+
+    @objc private func openAutomationSettingsMenuItem() {
+        FinderBridge.openAutomationSettings()
     }
 
     @objc private func openSettingsMenuItem() {

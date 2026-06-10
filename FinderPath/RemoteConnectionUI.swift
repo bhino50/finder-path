@@ -38,6 +38,7 @@ struct RemoteConnectionView: View {
     @State private var isAddingServer = false
     @State private var newServerName = ""
     @State private var newServerTarget = ""
+    @State private var addServerError: String?
     @State private var errorMessage: String?
 
     private var servers: [RemoteServer] {
@@ -268,6 +269,11 @@ struct RemoteConnectionView: View {
                 .textFieldStyle(.roundedBorder)
             TextField("SSH target (e.g. dev.example.com or user@host)", text: $newServerTarget)
                 .textFieldStyle(.roundedBorder)
+            if let addServerError {
+                Text(addServerError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { isAddingServer = false }
@@ -288,6 +294,7 @@ struct RemoteConnectionView: View {
     private func beginAddServer() {
         newServerName = ""
         newServerTarget = ""
+        addServerError = nil
         isAddingServer = true
     }
 
@@ -296,6 +303,12 @@ struct RemoteConnectionView: View {
         let target = RemoteServers.normalizedTarget(newServerTarget)
         guard !target.isEmpty else { return }
 
+        guard RemoteServers.isValidTarget(target) else {
+            addServerError = "Enter just a host, alias, or user@host. Only letters, digits, and . _ @ : - are allowed."
+            return
+        }
+
+        addServerError = nil
         var current = servers
         current.append(RemoteServer(name: name.isEmpty ? target : name, target: target))
         remoteServersText = RemoteServers.serialize(current)

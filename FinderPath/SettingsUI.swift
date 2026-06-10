@@ -347,6 +347,10 @@ struct WelcomeView: View {
         !finderPath.isEmpty && !finderPath.hasPrefix("Finder AppleScript error:")
     }
 
+    private var finderAccessDenied: Bool {
+        FinderBridge.isPermissionDenied(finderPath)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 16) {
@@ -385,7 +389,16 @@ struct WelcomeView: View {
                 statusBadge
             }
 
-            if !finderPath.isEmpty && !finderAccessGranted {
+            if finderAccessDenied {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("macOS is blocking FinderPath from reading the Finder path. Turn on Finder for FinderPath under Automation, then try again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Automation Settings…") {
+                        FinderBridge.openAutomationSettings()
+                    }
+                }
+            } else if !finderPath.isEmpty && !finderAccessGranted {
                 Text(finderPath)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -431,6 +444,9 @@ struct WelcomeView: View {
         if finderAccessGranted {
             Label("Finder access on", systemImage: "checkmark.seal.fill")
                 .foregroundStyle(.green)
+        } else if finderAccessDenied {
+            Label("Finder access denied", systemImage: "xmark.octagon.fill")
+                .foregroundStyle(.red)
         } else {
             Label("Waiting for permission…", systemImage: "ellipsis.circle")
                 .foregroundStyle(.secondary)
