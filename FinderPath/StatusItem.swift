@@ -10,6 +10,9 @@ final class StatusItemController: NSObject {
     private var defaultsObserver: NSObjectProtocol?
     private var settingsWindowController: SettingsWindowController?
     private var remoteConnectionWindowController: RemoteConnectionWindowController?
+    private var copyConfirmationTask: Task<Void, Never>?
+
+    private static let copyConfirmationNanoseconds: UInt64 = 1_000_000_000
 
     override init() {
         super.init()
@@ -220,6 +223,9 @@ final class StatusItemController: NSObject {
     }
 
     private func updateStatusItemAppearance() {
+        // Leave the temporary copy confirmation on screen; it restores the
+        // configured appearance itself once it expires.
+        guard copyConfirmationTask == nil else { return }
         guard let button = statusItem.button else { return }
 
         let symbolName = FinderPathPreferences.statusIconSymbolName
@@ -266,11 +272,38 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func copyPathMenuItem() {
+        guard state.hasCopyablePath else { return }
+
         state.copyCurrentPath()
+        showCopyConfirmation()
     }
 
     @objc private func copyCDMenuItem() {
+        guard state.hasCopyablePath else { return }
+
         state.copyChangeDirectoryCommand()
+        showCopyConfirmation()
+    }
+
+    // Briefly swaps the status icon for a checkmark so copy actions give
+    // visible feedback, then restores the configured appearance.
+    private func showCopyConfirmation() {
+        guard let button = statusItem.button else { return }
+
+        copyConfirmationTask?.cancel()
+
+        if let checkmark = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: "Copied") {
+            checkmark.isTemplate = true
+            button.image = checkmark
+        }
+
+        copyConfirmationTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.copyConfirmationNanoseconds)
+            guard !Task.isCancelled else { return }
+
+            self?.copyConfirmationTask = nil
+            self?.updateStatusItemAppearance()
+        }
     }
 
     @objc private func openTerminalMenuItem() {
