@@ -3,10 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_PATH="$ROOT_DIR/FinderPath.xcodeproj"
+PBXPROJ="$PROJECT_PATH/project.pbxproj"
 SCHEME="FinderPath"
 CONFIGURATION="Release"
 APP_NAME="FinderPath"
-VERSION="1.3.1"
+
+# Single source of truth: the release version is the project's MARKETING_VERSION.
+VERSION="$(sed -nE 's/.*MARKETING_VERSION = ([^;]+);.*/\1/p' "$PBXPROJ" | head -n1 | tr -d ' ')"
+if [[ -z "$VERSION" ]]; then
+  echo "Could not read MARKETING_VERSION from $PBXPROJ" >&2
+  exit 1
+fi
+echo "Packaging $APP_NAME version $VERSION (from MARKETING_VERSION)"
+
 DERIVED_DATA_PATH="$ROOT_DIR/.build/PackageDerivedData"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$APP_NAME.app"
 DIST_DIR="$ROOT_DIR/dist"
@@ -98,6 +107,34 @@ fi
   -format UDZO \
   "$DMG_PATH" >/dev/null
 echo "Created DMG: $DMG_PATH"
+
+# Regenerate the download-site manifest so its version always matches the
+# packaged release. Existing release notes are preserved; only the version
+# and download URL are derived from MARKETING_VERSION.
+VERSION_JSON="$ROOT_DIR/download-site/version.json"
+/usr/bin/python3 - "$VERSION" "$VERSION_JSON" <<'PY'
+import json
+import sys
+
+version, path = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        manifest = json.load(f)
+except (OSError, ValueError):
+    manifest = {}
+
+manifest["version"] = version
+manifest["downloadURL"] = (
+    "https://github.com/bhino50/finder-path/releases/download/"
+    f"v{version}/FinderPath-{version}.dmg"
+)
+manifest.setdefault("notes", f"FinderPath {version}.")
+
+with open(path, "w") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+PY
+echo "Updated $VERSION_JSON to version $VERSION"
 
 echo
 echo "Signature:"
