@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and run FinderPath WITHOUT the Xcode IDE, the .xcodeproj, or xcodebuild.
 #
-# It compiles the single Swift source directly with `swiftc` and assembles the
+# It compiles the Swift sources directly with `swiftc` and assembles the
 # .app bundle by hand. This still needs the Swift toolchain, which ships with the
 # lightweight "Command Line Tools for Xcode" (`xcode-select --install`) — you do
 # NOT need the full Xcode app open or installed for this path.
@@ -13,7 +13,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$ROOT_DIR/FinderPath/FinderPathApp.swift"
+SRC_DIR="$ROOT_DIR/FinderPath"
+SRCS=("$SRC_DIR"/*.swift)
 PLIST_TEMPLATE="$ROOT_DIR/Info.plist"
 PBXPROJ="$ROOT_DIR/FinderPath.xcodeproj/project.pbxproj"
 
@@ -33,15 +34,31 @@ CURRENT_PROJECT_VERSION="$(read_setting CURRENT_PROJECT_VERSION || echo 1)"
 ARCH="$(uname -m)"
 TARGET="$ARCH-apple-macos$DEPLOYMENT_TARGET"
 
+# Newer SDKs implement SwiftUI property wrappers (@State, @AppStorage, ...) as
+# compiler macros, but the Command Line Tools toolchain does not ship
+# libSwiftUIMacros.dylib. Borrow the macro plugin directory from a full Xcode
+# install when one is available; older toolchains ignore the extra search path.
+SWIFTUI_PLUGIN_FLAGS=()
+for DEV_DIR in "${DEVELOPER_DIR:-}" \
+  /Applications/Xcode.app/Contents/Developer \
+  /Applications/Xcode-beta.app/Contents/Developer; do
+  PLUGIN_DIR="$DEV_DIR/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
+  if [[ -n "$DEV_DIR" && -f "$PLUGIN_DIR/libSwiftUIMacros.dylib" ]]; then
+    SWIFTUI_PLUGIN_FLAGS=(-plugin-path "$PLUGIN_DIR")
+    break
+  fi
+done
+
 echo "==> Compiling $APP_NAME with swiftc (target $TARGET, no xcodebuild)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# -parse-as-library lets a single non-main.swift file use the @main attribute.
+# -parse-as-library lets the sources use the @main attribute without a main.swift.
 swiftc -parse-as-library -O \
-  "$SRC" \
+  "${SRCS[@]}" \
   -o "$APP/Contents/MacOS/$APP_NAME" \
   -framework SwiftUI -framework AppKit \
-  -target "$TARGET"
+  -target "$TARGET" \
+  ${SWIFTUI_PLUGIN_FLAGS[@]+"${SWIFTUI_PLUGIN_FLAGS[@]}"}
 
 echo "==> Writing Info.plist (substituting build variables)"
 sed \
