@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and run FinderPath WITHOUT the Xcode IDE, the .xcodeproj, or xcodebuild.
 #
-# It compiles the single Swift source directly with `swiftc` and assembles the
+# It compiles the Swift sources directly with `swiftc` and assembles the
 # .app bundle by hand. This still needs the Swift toolchain, which ships with the
 # lightweight "Command Line Tools for Xcode" (`xcode-select --install`) — you do
 # NOT need the full Xcode app open or installed for this path.
@@ -13,7 +13,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$ROOT_DIR/FinderPath/FinderPathApp.swift"
+SRC_DIR="$ROOT_DIR/FinderPath"
+SRCS=("$SRC_DIR"/*.swift)
 PLIST_TEMPLATE="$ROOT_DIR/Info.plist"
 PBXPROJ="$ROOT_DIR/FinderPath.xcodeproj/project.pbxproj"
 
@@ -51,9 +52,9 @@ done
 echo "==> Compiling $APP_NAME with swiftc (target $TARGET, no xcodebuild)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# -parse-as-library lets a single non-main.swift file use the @main attribute.
+# -parse-as-library lets the sources use the @main attribute without a main.swift.
 swiftc -parse-as-library -O \
-  "$SRC" \
+  "${SRCS[@]}" \
   -o "$APP/Contents/MacOS/$APP_NAME" \
   -framework SwiftUI -framework AppKit \
   -target "$TARGET" \
