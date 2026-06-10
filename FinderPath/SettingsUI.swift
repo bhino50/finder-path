@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
@@ -58,6 +59,8 @@ struct SettingsView: View {
     @State private var hermesAvailability = AgentAvailability.unknown(executable: "hermes")
     @State private var isCheckingForUpdates = false
     @State private var agentAvailabilityCheckTask: Task<Void, Never>?
+    @State private var launchAtLogin = false
+    @State private var launchAtLoginError: String?
 
     // Wait for a pause in typing before probing the shell so editing the
     // executable fields does not spawn a zsh process per keystroke.
@@ -65,6 +68,16 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("General") {
+                Toggle("Launch FinderPath at login", isOn: $launchAtLogin)
+
+                if let launchAtLoginError {
+                    Text(launchAtLoginError)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+
             Section("Menu Items") {
                 Toggle("Show current path header", isOn: $showPathHeader)
                 Toggle("Show Refresh", isOn: $showRefreshItem)
@@ -204,7 +217,13 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(width: 560, height: 700)
-        .onAppear { scheduleAgentAvailabilityCheck() }
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            scheduleAgentAvailabilityCheck()
+        }
+        .onChange(of: launchAtLogin) { isEnabled in
+            setLaunchAtLogin(isEnabled)
+        }
         .onChange(of: codexExecutable) { _ in
             scheduleAgentAvailabilityCheck(debounce: true)
         }
@@ -213,6 +232,25 @@ struct SettingsView: View {
         }
         .onChange(of: hermesExecutable) { _ in
             scheduleAgentAvailabilityCheck(debounce: true)
+        }
+    }
+
+    // Registers or unregisters the app as a login item, keeping the toggle in
+    // sync with the real SMAppService status when the system rejects a change.
+    private func setLaunchAtLogin(_ isEnabled: Bool) {
+        let service = SMAppService.mainApp
+        guard isEnabled != (service.status == .enabled) else { return }
+
+        do {
+            if isEnabled {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+            launchAtLoginError = nil
+        } catch {
+            launchAtLoginError = "Could not \(isEnabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
+            launchAtLogin = service.status == .enabled
         }
     }
 
