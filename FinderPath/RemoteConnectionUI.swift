@@ -102,7 +102,12 @@ struct RemoteConnectionView: View {
 
             Spacer()
 
-            if tailscale.backend == .unavailable {
+            if isLoadingTailscale && tailscale.backend == .unavailable {
+                // First load: the window paints right away while the CLI check
+                // runs in the background.
+                ProgressView()
+                    .controlSize(.small)
+            } else if tailscale.backend == .unavailable {
                 Text("Not installed").font(.caption).foregroundStyle(.secondary)
             } else {
                 Button(tailscale.isRunning ? "Disconnect" : "Connect") { toggleVPN() }
@@ -120,7 +125,7 @@ struct RemoteConnectionView: View {
         case .needsLogin:
             return "Needs login — open the Tailscale app"
         case .unavailable:
-            return "Tailscale CLI not found"
+            return isLoadingTailscale ? "Checking Tailscale status…" : "Tailscale CLI not found"
         }
     }
 
@@ -133,7 +138,7 @@ struct RemoteConnectionView: View {
                     .toggleStyle(.checkbox)
                     .font(.caption)
                 Button {
-                    Task { await refreshTailscale() }
+                    Task { await refreshTailscale(forceRefresh: true) }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -329,16 +334,16 @@ struct RemoteConnectionView: View {
         isTogglingVPN = true
         let goingUp = !tailscale.isRunning
         Task {
-            let error = await Task.detached { await goingUp ? TailscaleBridge.up() : TailscaleBridge.down() }.value
+            let error = goingUp ? await TailscaleBridge.up() : await TailscaleBridge.down()
             isTogglingVPN = false
             if let error { errorMessage = error }
-            await refreshTailscale()
+            await refreshTailscale(forceRefresh: true)
         }
     }
 
-    private func refreshTailscale() async {
+    private func refreshTailscale(forceRefresh: Bool = false) async {
         isLoadingTailscale = true
-        tailscale = await Task.detached { await TailscaleBridge.status() }.value
+        tailscale = await TailscaleBridge.status(forceRefresh: forceRefresh)
         isLoadingTailscale = false
     }
 }

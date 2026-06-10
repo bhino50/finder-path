@@ -48,7 +48,7 @@ enum FinderBridge {
     }
 }
 
-struct AgentAvailability: Equatable {
+struct AgentAvailability: Equatable, Sendable {
     let executable: String
     let resolvedPath: String?
 
@@ -76,6 +76,15 @@ nonisolated enum AgentLauncher {
             executable: commandName,
             resolvedPath: shellOutput(for: command)
         )
+    }
+
+    // Async variant for UI-driven checks (Settings, in particular): the zsh
+    // probe blocks on waitUntilExit, so run it on a background thread instead
+    // of the caller's thread.
+    static func checkAvailability(for executable: String, defaultExecutable: String? = nil) async -> AgentAvailability {
+        await Task.detached {
+            availability(for: executable, defaultExecutable: defaultExecutable)
+        }.value
     }
 
     private static func shellOutput(for command: String) -> String? {
@@ -176,21 +185,26 @@ enum TerminalBridge {
         task.standardOutput = Pipe()
         task.standardError = errorPipe
 
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            completion("Could not open Ghostty: \(error.localizedDescription)")
-            return
-        }
+        // waitUntilExit blocks, so launch on a background task and report the
+        // result asynchronously instead of stalling the caller's thread. The
+        // completion may run off the main actor; callers hop back for UI work.
+        Task.detached {
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                completion("Could not open Ghostty: \(error.localizedDescription)")
+                return
+            }
 
-        if task.terminationStatus == 0 {
-            completion(nil)
-        } else {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            completion(message?.isEmpty == false ? message : "Could not open Ghostty.")
+            if task.terminationStatus == 0 {
+                completion(nil)
+            } else {
+                let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                completion(message?.isEmpty == false ? message : "Could not open Ghostty.")
+            }
         }
     }
 
@@ -268,21 +282,24 @@ enum TerminalBridge {
         task.standardOutput = Pipe()
         task.standardError = errorPipe
 
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            completion("Could not open Ghostty: \(error.localizedDescription)")
-            return
-        }
+        // Same pattern as openGhostty: never block the caller on waitUntilExit.
+        Task.detached {
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                completion("Could not open Ghostty: \(error.localizedDescription)")
+                return
+            }
 
-        if task.terminationStatus == 0 {
-            completion(nil)
-        } else {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            completion(message?.isEmpty == false ? message : "Could not start the SSH session in Ghostty.")
+            if task.terminationStatus == 0 {
+                completion(nil)
+            } else {
+                let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                completion(message?.isEmpty == false ? message : "Could not start the SSH session in Ghostty.")
+            }
         }
     }
 

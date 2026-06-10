@@ -103,6 +103,13 @@ nonisolated struct TailscaleStatus: Sendable {
 nonisolated enum TailscaleBridge {
     static let appExecutablePath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
+    // How long a fetched status stays fresh. Reopening the Connect to Server
+    // window within this interval reuses the cached result instead of
+    // respawning the tailscale CLI.
+    private static let statusCacheMaxAge: TimeInterval = 8
+
+    private static let statusCache = TailscaleStatusCache()
+
     static func executablePath() -> String? {
         if let resolved = AgentLauncher.availability(for: "tailscale", defaultExecutable: "tailscale").resolvedPath {
             return resolved
@@ -119,7 +126,24 @@ nonisolated enum TailscaleBridge {
 
     static var isInstalled: Bool { executablePath() != nil }
 
-    static func status() -> TailscaleStatus {
+    // Async API for UI code. The blocking CLI work runs on a background
+    // thread, and recent results are cached so the Connect to Server window
+    // paints immediately. Pass forceRefresh for the manual refresh control.
+    static func status(forceRefresh: Bool = false) async -> TailscaleStatus {
+        await statusCache.status(forceRefresh: forceRefresh, maxAge: statusCacheMaxAge)
+    }
+
+    static func up() async -> String? {
+        await Task.detached { runVoid(arguments: ["up"]) }.value
+    }
+
+    static func down() async -> String? {
+        await Task.detached { runVoid(arguments: ["down"]) }.value
+    }
+
+    // Blocking status fetch. Spawns the tailscale CLI and waits for it to
+    // exit, so only call this off the main thread (the cache actor does).
+    fileprivate static func fetchStatus() -> TailscaleStatus {
         guard let path = executablePath(),
               let data = run(path, arguments: ["status", "--json"]),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -162,13 +186,9 @@ nonisolated enum TailscaleBridge {
         return TailscaleStatus(backend: backend, selfAddress: selfAddress, devices: devices)
     }
 
-    @discardableResult
-    static func up() -> String? { runVoid(arguments: ["up"]) }
-
-    @discardableResult
-    static func down() -> String? { runVoid(arguments: ["down"]) }
-
-    // Runs a tailscale subcommand for its side effect. Returns an error message on failure, nil on success.
+    // Runs a tailscale subcommand for its side effect and waits for it to
+    // exit, so only call this off the main thread (the async wrappers do).
+    // Returns an error message on failure, nil on success.
     private static func runVoid(arguments: [String]) -> String? {
         guard let path = executablePath() else {
             return "Tailscale CLI was not found."
@@ -212,6 +232,26 @@ nonisolated enum TailscaleBridge {
 
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
         return data.isEmpty ? nil : data
+    }
+}
+
+// Serializes Tailscale status fetches and briefly caches the latest result so
+// repeated lookups within a few seconds do not respawn the CLI.
+private actor TailscaleStatusCache {
+    private var cachedStatus: TailscaleStatus?
+    private var fetchedAt = Date.distantPast
+
+    func status(forceRefresh: Bool, maxAge: TimeInterval) async -> TailscaleStatus {
+        if !forceRefresh,
+           let cachedStatus,
+           Date().timeIntervalSince(fetchedAt) < maxAge {
+            return cachedStatus
+        }
+
+        let fresh = await Task.detached { TailscaleBridge.fetchStatus() }.value
+        cachedStatus = fresh
+        fetchedAt = Date()
+        return fresh
     }
 }
 

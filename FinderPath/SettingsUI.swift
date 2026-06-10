@@ -57,6 +57,11 @@ struct SettingsView: View {
     @State private var claudeAvailability = AgentAvailability.unknown(executable: "claude")
     @State private var hermesAvailability = AgentAvailability.unknown(executable: "hermes")
     @State private var isCheckingForUpdates = false
+    @State private var agentAvailabilityCheckTask: Task<Void, Never>?
+
+    // Wait for a pause in typing before probing the shell so editing the
+    // executable fields does not spawn a zsh process per keystroke.
+    private static let agentCheckDebounceNanoseconds: UInt64 = 300_000_000
 
     var body: some View {
         Form {
@@ -161,7 +166,7 @@ struct SettingsView: View {
                 AgentStatusRow(name: "Hermes", availability: hermesAvailability)
 
                 HStack {
-                    Button("Check Again", action: refreshAgentAvailability)
+                    Button("Check Again") { scheduleAgentAvailabilityCheck() }
                     Spacer()
                 }
 
@@ -199,15 +204,15 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(width: 560, height: 700)
-        .onAppear(perform: refreshAgentAvailability)
+        .onAppear { scheduleAgentAvailabilityCheck() }
         .onChange(of: codexExecutable) { _ in
-            refreshAgentAvailability()
+            scheduleAgentAvailabilityCheck(debounce: true)
         }
         .onChange(of: claudeExecutable) { _ in
-            refreshAgentAvailability()
+            scheduleAgentAvailabilityCheck(debounce: true)
         }
         .onChange(of: hermesExecutable) { _ in
-            refreshAgentAvailability()
+            scheduleAgentAvailabilityCheck(debounce: true)
         }
     }
 
@@ -240,13 +245,34 @@ struct SettingsView: View {
         hermesExecutable = "hermes"
         hideUnavailableAgentItems = true
         updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
-        refreshAgentAvailability()
+        scheduleAgentAvailabilityCheck()
     }
 
-    private func refreshAgentAvailability() {
-        codexAvailability = AgentLauncher.availability(for: codexExecutable, defaultExecutable: "codex")
-        claudeAvailability = AgentLauncher.availability(for: claudeExecutable, defaultExecutable: "claude")
-        hermesAvailability = AgentLauncher.availability(for: hermesExecutable, defaultExecutable: "hermes")
+    // Probes the configured executables off the main thread, replacing any
+    // check that is still pending. With debounce, waits for typing to pause
+    // first so text-field edits do not spawn a process per keystroke.
+    private func scheduleAgentAvailabilityCheck(debounce: Bool = false) {
+        agentAvailabilityCheckTask?.cancel()
+        let codexCommand = codexExecutable
+        let claudeCommand = claudeExecutable
+        let hermesCommand = hermesExecutable
+
+        agentAvailabilityCheckTask = Task {
+            if debounce {
+                try? await Task.sleep(nanoseconds: Self.agentCheckDebounceNanoseconds)
+                guard !Task.isCancelled else { return }
+            }
+
+            async let codex = AgentLauncher.checkAvailability(for: codexCommand, defaultExecutable: "codex")
+            async let claude = AgentLauncher.checkAvailability(for: claudeCommand, defaultExecutable: "claude")
+            async let hermes = AgentLauncher.checkAvailability(for: hermesCommand, defaultExecutable: "hermes")
+            let (codexResult, claudeResult, hermesResult) = await (codex, claude, hermes)
+
+            guard !Task.isCancelled else { return }
+            codexAvailability = codexResult
+            claudeAvailability = claudeResult
+            hermesAvailability = hermesResult
+        }
     }
 
     private func checkForUpdatesFromSettings() {
