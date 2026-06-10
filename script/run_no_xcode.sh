@@ -33,6 +33,21 @@ CURRENT_PROJECT_VERSION="$(read_setting CURRENT_PROJECT_VERSION || echo 1)"
 ARCH="$(uname -m)"
 TARGET="$ARCH-apple-macos$DEPLOYMENT_TARGET"
 
+# Newer SDKs implement SwiftUI property wrappers (@State, @AppStorage, ...) as
+# compiler macros, but the Command Line Tools toolchain does not ship
+# libSwiftUIMacros.dylib. Borrow the macro plugin directory from a full Xcode
+# install when one is available; older toolchains ignore the extra search path.
+SWIFTUI_PLUGIN_FLAGS=()
+for DEV_DIR in "${DEVELOPER_DIR:-}" \
+  /Applications/Xcode.app/Contents/Developer \
+  /Applications/Xcode-beta.app/Contents/Developer; do
+  PLUGIN_DIR="$DEV_DIR/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
+  if [[ -n "$DEV_DIR" && -f "$PLUGIN_DIR/libSwiftUIMacros.dylib" ]]; then
+    SWIFTUI_PLUGIN_FLAGS=(-plugin-path "$PLUGIN_DIR")
+    break
+  fi
+done
+
 echo "==> Compiling $APP_NAME with swiftc (target $TARGET, no xcodebuild)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -41,7 +56,8 @@ swiftc -parse-as-library -O \
   "$SRC" \
   -o "$APP/Contents/MacOS/$APP_NAME" \
   -framework SwiftUI -framework AppKit \
-  -target "$TARGET"
+  -target "$TARGET" \
+  ${SWIFTUI_PLUGIN_FLAGS[@]+"${SWIFTUI_PLUGIN_FLAGS[@]}"}
 
 echo "==> Writing Info.plist (substituting build variables)"
 sed \
