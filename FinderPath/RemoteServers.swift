@@ -22,14 +22,14 @@ enum RemoteServers {
 
             guard let separatorIndex = line.firstIndex(of: "=") else {
                 let target = normalizedTarget(line)
-                guard !target.isEmpty else { continue }
+                guard !target.isEmpty, isValidTarget(target) else { continue }
                 servers.append(RemoteServer(name: target, target: target))
                 continue
             }
 
             let name = line[..<separatorIndex].trimmingCharacters(in: .whitespaces)
             let target = normalizedTarget(String(line[line.index(after: separatorIndex)...]))
-            guard !target.isEmpty else { continue }
+            guard !target.isEmpty, isValidTarget(target) else { continue }
 
             servers.append(RemoteServer(name: name.isEmpty ? target : name, target: target))
         }
@@ -40,7 +40,7 @@ enum RemoteServers {
     static func serialize(_ servers: [RemoteServer]) -> String {
         servers.compactMap { server in
             let target = normalizedTarget(server.target)
-            guard !target.isEmpty else { return nil }
+            guard !target.isEmpty, isValidTarget(target) else { return nil }
 
             let name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
             return "\(name.isEmpty ? target : name) = \(target)"

@@ -40,9 +40,8 @@ enum UpdateCheckResult {
 enum UpdateChecker {
     static func check(manifestURL: String, completion: @escaping (UpdateCheckResult) -> Void) {
         let trimmed = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-              scheme == "https" || scheme == "http" else {
-            completion(.failed(message: "The update manifest URL is not a valid web URL."))
+        guard let url = URL(string: trimmed), isHTTPSWebURL(url) else {
+            completion(.failed(message: "The update manifest URL must be an HTTPS URL."))
             return
         }
 
@@ -106,7 +105,7 @@ enum UpdateChecker {
         let downloadString = (json["downloadURL"] as? String)
             ?? (json["url"] as? String)
             ?? (json["download_url"] as? String)
-        let downloadURL = downloadString.flatMap { URL(string: $0) }
+        let downloadURL = httpsURL(from: downloadString)
         let isDirectArchive = ["zip", "dmg"].contains(downloadURL?.pathExtension.lowercased() ?? "")
 
         let notes = (json["notes"] as? String)
@@ -132,12 +131,12 @@ enum UpdateChecker {
         let dmgURL = assets
             .first { (($0["name"] as? String) ?? "").hasSuffix(".dmg") }
             .flatMap { $0["browser_download_url"] as? String }
-            .flatMap(URL.init(string:))
+            .flatMap { httpsURL(from: $0) }
         let zipURL = assets
             .first { (($0["name"] as? String) ?? "").hasSuffix(".zip") }
             .flatMap { $0["browser_download_url"] as? String }
-            .flatMap(URL.init(string:))
-        let pageURL = (json["html_url"] as? String).flatMap(URL.init(string:))
+            .flatMap { httpsURL(from: $0) }
+        let pageURL = httpsURL(from: json["html_url"] as? String)
 
         let notes = (json["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -161,6 +160,20 @@ enum UpdateChecker {
         }
 
         return false
+    }
+
+    private static func httpsURL(from string: String?) -> URL? {
+        guard let string,
+              let url = URL(string: string),
+              isHTTPSWebURL(url) else {
+            return nil
+        }
+
+        return url
+    }
+
+    private static func isHTTPSWebURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" && url.host?.isEmpty == false
     }
 
     private static func numericComponents(_ version: String) -> [Int] {

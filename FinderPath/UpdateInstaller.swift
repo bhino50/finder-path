@@ -7,6 +7,8 @@ import AppKit
 // Gatekeeper assessment, before it replaces anything on disk. The
 // download URL is never trusted on its own.
 enum UpdateInstaller {
+    static let appBundleName = "FinderPath.app"
+    static let expectedBundleID = "io.github.bhino50.FinderPath"
     static let expectedTeamID = "VJPMCBH6NX"
 
     enum InstallError: LocalizedError {
@@ -41,6 +43,12 @@ enum UpdateInstaller {
     ) {
         guard let archiveURL = manifest.archiveURL else {
             Task { @MainActor in completion(.failure(.noArchiveURL)) }
+            return
+        }
+        guard isHTTPSWebURL(archiveURL) else {
+            Task { @MainActor in
+                completion(.failure(.downloadFailed("Update packages must be served over HTTPS.")))
+            }
             return
         }
 
@@ -139,10 +147,20 @@ enum UpdateInstaller {
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
-        return contents.first { $0.pathExtension == "app" }
+        return contents.first { $0.lastPathComponent == appBundleName }
     }
 
     private static func verify(appAt app: URL) throws {
+        let values = try app.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw InstallError.verificationFailed("The package did not contain a real FinderPath app bundle.")
+        }
+
+        guard let bundle = Bundle(url: app),
+              bundle.bundleIdentifier == expectedBundleID else {
+            throw InstallError.verificationFailed("The package did not contain FinderPath with the expected bundle identifier.")
+        }
+
         // Pin the signature to Apple's chain and the FinderPath team so a
         // compromised download location cannot ship a substitute binary.
         let requirement = "anchor apple generic and certificate leaf[subject.OU] = \"\(expectedTeamID)\""
@@ -203,6 +221,10 @@ enum UpdateInstaller {
     }
 
     // MARK: - Process helper
+
+    private static func isHTTPSWebURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" && url.host?.isEmpty == false
+    }
 
     private struct CommandResult {
         let status: Int32

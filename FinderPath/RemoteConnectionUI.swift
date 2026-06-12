@@ -335,6 +335,10 @@ struct RemoteConnectionView: View {
         let host = (!trimmedUser.isEmpty && !target.contains("@"))
             ? "\(trimmedUser)@\(target)"
             : target
+        guard RemoteServers.isValidTarget(host) else {
+            errorMessage = "Enter just a host, alias, or user@host. Only letters, digits, and . _ @ : - are allowed."
+            return
+        }
 
         let terminal = TerminalBridge.RemoteTerminal(rawValue: remoteConnectionTerminal) ?? .ghostty
         TerminalBridge.openSSH(host: host, using: terminal) { error in
