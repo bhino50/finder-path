@@ -41,8 +41,8 @@ Before opening an issue, search existing ones to avoid duplicates.
 
 ## Code Style
 
-- Match the existing Swift style in `FinderPathApp.swift`: `@MainActor` classes, early returns, named constants for `UserDefaults` keys
-- All logic belongs in `FinderPath/FinderPathApp.swift` unless the file would exceed a manageable size — at that point, discuss extraction in an issue first
+- Match the existing Swift style: `@MainActor` UI types, early returns, named constants for `UserDefaults` keys
+- Keep app logic in the focused source files under `FinderPath/`; discuss larger architectural splits in an issue first
 - No external Swift packages — keep the project dependency-free
 - Prefer `let` over `var`; avoid force-unwrapping
 - Keep functions focused and short

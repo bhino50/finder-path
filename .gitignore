@@ -21,3 +21,8 @@ download-site/downloads/
 
 # Codex local tooling
 .codex/
+
+# Local AI assistant notes
+.claude/
+CLAUDE.md
+CLAUDE.html

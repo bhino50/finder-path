@@ -48,7 +48,7 @@ FinderPath is open source and **ad-hoc signed, not Apple-notarized** — notariz
 - **macOS 13–14 (Ventura / Sonoma):** right-click (or Control-click) `FinderPath.app` → **Open**, then click **Open** in the dialog.
 - **macOS 15+ (Sequoia):** double-click `FinderPath.app` once (it gets blocked), then open **System Settings → Privacy & Security**, scroll to the *"FinderPath was blocked…"* message, click **Open Anyway**, and confirm with **Open**.
 
-Prefer not to bypass Gatekeeper? Build it yourself from source (below) — a local build launches with no warning. The source is a single Swift file you can read end to end.
+Prefer not to bypass Gatekeeper? Build it yourself from source (below) — a local build launches with no warning. The native Swift source is intentionally small enough to read end to end.
 
 ### Build from Source
 
