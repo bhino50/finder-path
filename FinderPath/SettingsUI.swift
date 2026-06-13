@@ -355,9 +355,11 @@ struct AgentStatusRow: View {
 
 @MainActor
 final class WelcomeWindowController: NSWindowController {
+    private static let contentSize = NSSize(width: 560, height: 560)
+
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+            contentRect: NSRect(origin: .zero, size: Self.contentSize),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -365,8 +367,10 @@ final class WelcomeWindowController: NSWindowController {
 
         window.title = "Welcome to FinderPath"
         window.isReleasedWhenClosed = false
-        window.center()
+        window.minSize = Self.contentSize
         window.contentViewController = NSHostingController(rootView: WelcomeView())
+        window.setContentSize(Self.contentSize)
+        window.center()
 
         super.init(window: window)
     }
@@ -426,6 +430,7 @@ struct WelcomeView: View {
                 Spacer()
                 statusBadge
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if finderAccessDenied {
                 VStack(alignment: .leading, spacing: 6) {
@@ -458,7 +463,7 @@ struct WelcomeView: View {
             }
         }
         .padding(28)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: 560, height: 560, alignment: .leading)
         .onAppear {
             refreshFinderAccess()
         }
@@ -470,10 +475,13 @@ struct WelcomeView: View {
                 Circle().fill(.tint.opacity(0.15)).frame(width: 28, height: 28)
                 Text("\(index)").font(.headline).foregroundStyle(.tint)
             }
+            .fixedSize()
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.headline)
                 Text(detail).font(.subheadline).foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
