@@ -39,16 +39,18 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 
 ### Download (recommended)
 
-Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/finder-path/releases), open it, move `FinderPath.app` to `/Applications`, and launch it. The app is menu bar-only — no Dock icon will appear.
+Download the latest `.dmg` or `.zip` from [Releases](https://github.com/bhino50/finder-path/releases), open it, move `FinderPath.app` to `/Applications`, and launch it. The current public release is signed with a Developer ID and notarized by Apple. The app is menu bar-only — no Dock icon will appear.
 
 ### First launch (Gatekeeper)
 
-FinderPath is open source and **ad-hoc signed, not Apple-notarized** — notarization requires a paid Apple Developer ID, which this project doesn't have. Because of that, macOS Gatekeeper blocks the app the first time you open it, with a message like *"FinderPath can't be opened because Apple cannot check it for malicious software."* This is expected for an unnotarized open-source app, not a sign that anything is wrong. Here's how to open it (you only need to do this once):
+The current GitHub release is Developer ID signed and Apple-notarized, so it should open normally after you drag it to Applications. If macOS still blocks launch, delete the app and download the latest release again.
+
+Older downloads and local source builds may be ad-hoc signed. If macOS blocks one of those copies, you can allow it once:
 
 - **macOS 13–14 (Ventura / Sonoma):** right-click (or Control-click) `FinderPath.app` → **Open**, then click **Open** in the dialog.
 - **macOS 15+ (Sequoia):** double-click `FinderPath.app` once (it gets blocked), then open **System Settings → Privacy & Security**, scroll to the *"FinderPath was blocked…"* message, click **Open Anyway**, and confirm with **Open**.
 
-Prefer not to bypass Gatekeeper? Build it yourself from source (below) — a local build launches with no warning. The native Swift source is intentionally small enough to read end to end.
+Prefer not to bypass Gatekeeper for a local build? Review the native Swift source, then sign it with your own Apple Developer identity.
 
 ### Build from Source
 
@@ -125,21 +127,21 @@ The parser also accepts a plain JSON manifest if you point the URL elsewhere:
 
 ```json
 {
-  "version": "1.2",
-  "downloadURL": "https://example.com/FinderPath-1.2.dmg",
+  "version": "1.4",
+  "downloadURL": "https://example.com/FinderPath-1.4.dmg",
   "notes": "Release notes."
 }
 ```
 
 To ship a new version:
 
-1. Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the Xcode project, plus `VERSION` in `script/package_release.sh`.
+1. Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the Xcode project. The package script reads `MARKETING_VERSION` from the project file.
 2. `./script/package_release.sh` (set `DEVELOPER_ID` + `NOTARY_PROFILE` for a notarized DMG).
 3. Tag the commit and publish a GitHub Release with the `.dmg` attached:
 
    ```bash
-   gh release create v1.2 dist/FinderPath-1.2.dmg \
-     --title "1.2" --notes "Release notes for this version."
+   gh release create v1.4 dist/FinderPath-1.4.dmg \
+     --title "FinderPath 1.4" --notes "Release notes for this version."
    ```
 
    Existing installs hit `Check for Updates...` and get the new DMG.
@@ -152,7 +154,7 @@ To ship a new version:
 # Debug build + run
 ./script/build_and_run.sh
 
-# Local-test DMG (unsigned, for personal use)
+# Local-test DMG (ad-hoc signed, for personal use)
 ./script/package_release.sh
 
 # Signed + notarized release (requires Apple Developer account)

@@ -1,5 +1,5 @@
 {
   "version": "1.4",
   "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.4/FinderPath-1.4.dmg",
-  "notes": "Patch release: Connect to Server now normalizes pasted SSH commands and option strings into a clean host target before saving or connecting, so Ghostty/Terminal launch the intended server instead of passing invalid SSH arguments."
+  "notes": "FinderPath 1.4 is signed with a Developer ID and notarized by Apple. It adds one-click in-app updates with verified install and relaunch, so future releases can update in place instead of requiring manual DMG downloads."
 }
