@@ -70,8 +70,8 @@ sed \
   -e "s/\$(CURRENT_PROJECT_VERSION)/$CURRENT_PROJECT_VERSION/g" \
   "$PLIST_TEMPLATE" > "$APP/Contents/Info.plist"
 
-echo "==> Ad-hoc code signing"
-codesign --force --sign - "$APP" >/dev/null
+echo "==> Ad-hoc code signing (with Apple Events entitlement)"
+codesign --force --entitlements "$ROOT_DIR/FinderPath.entitlements" --sign - "$APP" >/dev/null
 
 if [[ "$MODE" == "build" ]]; then
   echo "Built $APP (version $MARKETING_VERSION). Launch it with: open -n \"$APP\""
