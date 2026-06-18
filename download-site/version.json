@@ -1,5 +1,5 @@
 {
-  "version": "1.4",
-  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.4/FinderPath-1.4.dmg",
-  "notes": "FinderPath 1.4 is signed with a Developer ID and notarized by Apple. It adds one-click in-app updates with verified install and relaunch, so future releases can update in place instead of requiring manual DMG downloads."
+  "version": "1.5",
+  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.5/FinderPath-1.5.dmg",
+  "notes": "FinderPath 1.5 fixes the first-launch setup window, which could open off-screen on Macs with more than one display. It now opens centered on the screen you are using. Signed with a Developer ID and notarized by Apple."
 }
