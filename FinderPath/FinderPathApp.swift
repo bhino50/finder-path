@@ -62,8 +62,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if welcomeWindowController == nil {
             welcomeWindowController = WelcomeWindowController()
         }
-        welcomeWindowController?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+        welcomeWindowController?.presentOnActiveScreen()
     }
 }
 

@@ -368,19 +368,52 @@ final class WelcomeWindowController: NSWindowController {
         window.title = "Welcome to FinderPath"
         window.isReleasedWhenClosed = false
         window.minSize = Self.contentSize
-        window.contentViewController = NSHostingController(rootView: WelcomeView())
-        window.setContentSize(Self.contentSize)
-        window.center()
 
         super.init(window: window)
+
+        window.contentViewController = NSHostingController(
+            rootView: WelcomeView(onFinish: { [weak window] in window?.close() })
+        )
+        window.setContentSize(Self.contentSize)
     }
 
     required init?(coder: NSCoder) {
         nil
     }
+
+    // Show the window centered on the screen the user is actually looking at and
+    // guaranteed fully on-screen, then bring it to the front. NSWindow.center()
+    // picks an arbitrary screen on multi-display setups, which flung the setup
+    // window onto a monitor the user wasn't looking at — the window opened, but
+    // appeared "broken" because it was nowhere in sight.
+    func presentOnActiveScreen() {
+        guard let window else { return }
+
+        let visible = Self.activeScreen().visibleFrame
+        var origin = NSPoint(
+            x: visible.midX - window.frame.width / 2,
+            y: visible.midY - window.frame.height / 2
+        )
+        origin.x = min(max(origin.x, visible.minX), visible.maxX - window.frame.width)
+        origin.y = min(max(origin.y, visible.minY), visible.maxY - window.frame.height)
+        window.setFrameOrigin(origin)
+
+        showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    private static func activeScreen() -> NSScreen {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first!
+    }
 }
 
 struct WelcomeView: View {
+    var onFinish: () -> Void = {}
+
     @AppStorage(FinderPathPreferences.completedWelcomeKey) private var completedWelcome = false
     @State private var finderPath = ""
     @State private var isCheckingFinder = false
@@ -456,7 +489,7 @@ struct WelcomeView: View {
                 Spacer()
                 Button(finderAccessGranted ? "Get Started" : "Skip for Now") {
                     completedWelcome = true
-                    NSApp.keyWindow?.close()
+                    onFinish()
                 }
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
