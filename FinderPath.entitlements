@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required so the Hardened Runtime allows FinderPath to send Apple Events
+	     to control Finder (read the frontmost window path) and to launch
+	     Terminal/Ghostty/cmux/agents. Without this, a notarized hardened-runtime
+	     build is blocked from sending Apple Events before TCC can even prompt,
+	     so the Automation permission can never be granted. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

@@ -20,6 +20,7 @@ DERIVED_DATA_PATH="$ROOT_DIR/.build/PackageDerivedData"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$APP_NAME.app"
 DIST_DIR="$ROOT_DIR/dist"
 README_SRC="$ROOT_DIR/script/dmg-install-readme.txt"
+ENTITLEMENTS="$ROOT_DIR/FinderPath.entitlements"
 
 if [[ -d /Applications/Xcode.app/Contents/Developer && -z "${DEVELOPER_DIR:-}" ]]; then
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
@@ -45,6 +46,7 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
     --force \
     --options runtime \
     --timestamp \
+    --entitlements "$ENTITLEMENTS" \
     --sign "$DEVELOPER_ID" \
     "$APP_PATH"
 
@@ -84,7 +86,7 @@ else
     CODE_SIGNING_REQUIRED=YES \
     build
 
-  /usr/bin/codesign --force --sign - --options runtime "$APP_PATH"
+  /usr/bin/codesign --force --sign - --options runtime --entitlements "$ENTITLEMENTS" "$APP_PATH"
   FINAL_ZIP="$DIST_DIR/$APP_NAME-$VERSION-local-test.zip"
   /usr/bin/ditto -c -k --norsrc --keepParent "$APP_PATH" "$FINAL_ZIP"
   echo "Created local-test ZIP: $FINAL_ZIP"

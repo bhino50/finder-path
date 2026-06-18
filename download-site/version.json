@@ -1,5 +1,5 @@
 {
-  "version": "1.5",
-  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.5/FinderPath-1.5.dmg",
-  "notes": "FinderPath 1.5 fixes the first-launch setup window, which could open off-screen on Macs with more than one display. It now opens centered on the screen you are using. Signed with a Developer ID and notarized by Apple."
+  "version": "1.6",
+  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.6/FinderPath-1.6.dmg",
+  "notes": "FinderPath 1.6 fixes Finder access. Earlier notarized builds were blocked by the Hardened Runtime from asking for Automation permission, so Grant Finder Access never prompted. The app now includes the Apple Events entitlement, so the permission prompt appears and FinderPath shows up under Privacy & Security > Automation."
 }
