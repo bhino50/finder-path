@@ -240,8 +240,7 @@ final class StatusItemController: NSObject {
             settingsWindowController = SettingsWindowController()
         }
 
-        settingsWindowController?.showWindow(nil)
-        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        settingsWindowController?.presentOnActiveScreen()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -250,8 +249,7 @@ final class StatusItemController: NSObject {
             remoteConnectionWindowController = RemoteConnectionWindowController()
         }
 
-        remoteConnectionWindowController?.showWindow(nil)
-        remoteConnectionWindowController?.window?.makeKeyAndOrderFront(nil)
+        remoteConnectionWindowController?.presentOnActiveScreen()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -357,6 +355,9 @@ final class PathMenuHeaderView: NSView {
         pathLabel.textColor = isError ? .systemRed : .labelColor
         pathLabel.lineBreakMode = FinderPathPreferences.pathLineBreakMode
         pathLabel.maximumNumberOfLines = 1
+        pathLabel.toolTip = path
+        pathLabel.setAccessibilityLabel(FinderPathPreferences.menuHeaderTitle)
+        pathLabel.setAccessibilityValue(path)
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(titleLabel)

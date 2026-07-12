@@ -22,6 +22,10 @@ final class RemoteConnectionWindowController: NSWindowController {
     required init?(coder: NSCoder) {
         nil
     }
+
+    func presentOnActiveScreen() {
+        WindowPresentation.present(self)
+    }
 }
 
 struct RemoteConnectionView: View {
@@ -35,6 +39,7 @@ struct RemoteConnectionView: View {
     @State private var showAllDevices = false
     @State private var isLoadingTailscale = false
     @State private var isTogglingVPN = false
+    @State private var isConfirmingVPNDisconnect = false
     @State private var isAddingServer = false
     @State private var newServerName = ""
     @State private var newServerTarget = ""
@@ -87,6 +92,16 @@ struct RemoteConnectionView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+        .confirmationDialog(
+            "Disconnect Tailscale?",
+            isPresented: $isConfirmingVPNDisconnect,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect", role: .destructive) { toggleVPN() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("FinderPath will run `tailscale down`, which disconnects this Mac from your tailnet.")
+        }
         .sheet(isPresented: $isAddingServer) { addServerSheet }
     }
 
@@ -111,7 +126,13 @@ struct RemoteConnectionView: View {
             } else if tailscale.backend == .unavailable {
                 Text("Not installed").font(.caption).foregroundStyle(.secondary)
             } else {
-                Button(tailscale.isRunning ? "Disconnect" : "Connect") { toggleVPN() }
+                Button(tailscale.isRunning ? "Disconnect" : "Connect") {
+                    if tailscale.isRunning {
+                        isConfirmingVPNDisconnect = true
+                    } else {
+                        toggleVPN()
+                    }
+                }
                     .disabled(isTogglingVPN || tailscale.backend == .needsLogin)
             }
         }
@@ -144,6 +165,8 @@ struct RemoteConnectionView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
+                .accessibilityLabel("Refresh Tailscale devices")
+                .help("Refresh Tailscale devices")
                 .disabled(isLoadingTailscale)
             }
 
@@ -176,8 +199,12 @@ struct RemoteConnectionView: View {
                 Spacer()
                 Button { beginAddServer() } label: { Image(systemName: "plus") }
                     .buttonStyle(.borderless)
+                    .accessibilityLabel("Add server")
+                    .help("Add server")
                 Button { removeSelectedServer() } label: { Image(systemName: "minus") }
                     .buttonStyle(.borderless)
+                    .accessibilityLabel("Remove selected server")
+                    .help("Remove selected server")
                     .disabled(selectedServerIndex == nil)
             }
 
@@ -200,39 +227,46 @@ struct RemoteConnectionView: View {
     }
 
     private func connectionRow(id: String, title: String, subtitle: String, online: Bool?, target: String) -> some View {
-        HStack(spacing: 8) {
-            if let online {
-                Circle()
-                    .fill(online ? Color.green : Color.secondary.opacity(0.4))
-                    .frame(width: 8, height: 8)
-            } else {
-                Image(systemName: "server.rack")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 8)
-            }
+        Button {
+            select(id: id, target: target)
+        } label: {
+            HStack(spacing: 8) {
+                if let online {
+                    Circle()
+                        .fill(online ? Color.green : Color.secondary.opacity(0.4))
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "server.rack")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 8)
+                        .accessibilityHidden(true)
+                }
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.body)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-            }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.body)
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                }
 
-            Spacer()
+                Spacer()
+            }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .padding(.vertical, 5)
         .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(selection == id ? Color.accentColor.opacity(0.18) : Color.clear)
         )
-        .contentShape(Rectangle())
         .onTapGesture(count: 2) {
             select(id: id, target: target)
             connect()
         }
-        .onTapGesture {
-            select(id: id, target: target)
-        }
+        .accessibilityLabel(title)
+        .accessibilityValue(accessibilityValue(subtitle: subtitle, online: online))
+        .accessibilityHint("Select this server, then use Connect. Double-click to connect immediately.")
     }
 
     private var footer: some View {
@@ -245,7 +279,7 @@ struct RemoteConnectionView: View {
 
             HStack {
                 Text("Open in").frame(width: 48, alignment: .leading)
-                Picker("", selection: $remoteConnectionTerminal) {
+                Picker("Terminal", selection: $remoteConnectionTerminal) {
                     Text("Ghostty").tag("ghostty")
                     Text("macOS Terminal").tag("terminal")
                 }
@@ -260,6 +294,11 @@ struct RemoteConnectionView: View {
                     .disabled(selection == nil)
             }
         }
+    }
+
+    private func accessibilityValue(subtitle: String, online: Bool?) -> String {
+        guard let online else { return subtitle }
+        return "\(online ? "Online" : "Offline"), \(subtitle)"
     }
 
     private var addServerSheet: some View {

@@ -23,6 +23,10 @@ final class SettingsWindowController: NSWindowController {
     required init?(coder: NSCoder) {
         nil
     }
+
+    func presentOnActiveScreen() {
+        WindowPresentation.present(self)
+    }
 }
 
 struct SettingsView: View {
@@ -387,27 +391,7 @@ final class WelcomeWindowController: NSWindowController {
     // window onto a monitor the user wasn't looking at — the window opened, but
     // appeared "broken" because it was nowhere in sight.
     func presentOnActiveScreen() {
-        guard let window else { return }
-
-        let visible = Self.activeScreen().visibleFrame
-        var origin = NSPoint(
-            x: visible.midX - window.frame.width / 2,
-            y: visible.midY - window.frame.height / 2
-        )
-        origin.x = min(max(origin.x, visible.minX), visible.maxX - window.frame.width)
-        origin.y = min(max(origin.y, visible.minY), visible.maxY - window.frame.height)
-        window.setFrameOrigin(origin)
-
-        showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
-    }
-
-    private static func activeScreen() -> NSScreen {
-        let mouseLocation = NSEvent.mouseLocation
-        return NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first!
+        WindowPresentation.present(self)
     }
 }
 
