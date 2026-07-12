@@ -518,21 +518,25 @@ struct WelcomeView: View {
 
     private func requestFinderAccess() {
         // Be the frontmost app so macOS will present the Automation consent
-        // prompt (it is suppressed for background apps). currentPath() triggers
-        // the prompt the first time; if access is already determined as denied,
-        // macOS will not prompt again, so send the user straight to the
-        // Automation pane where they can turn FinderPath on for Finder.
+        // prompt (it is suppressed for background apps). The path fetch
+        // triggers the prompt the first time; if access is already determined
+        // as denied, macOS will not prompt again, so send the user straight to
+        // the Automation pane where they can turn FinderPath on for Finder.
         NSApp.activate(ignoringOtherApps: true)
         isCheckingFinder = true
-        refreshFinderAccess()
-        isCheckingFinder = false
-        if !finderAccessGranted {
-            FinderBridge.openAutomationSettings()
+        Task { @MainActor in
+            finderPath = await FinderBridge.fetchCurrentPath()
+            isCheckingFinder = false
+            if !finderAccessGranted {
+                FinderBridge.openAutomationSettings()
+            }
         }
     }
 
     private func refreshFinderAccess() {
-        finderPath = FinderBridge.currentPath()
+        Task { @MainActor in
+            finderPath = await FinderBridge.fetchCurrentPath()
+        }
     }
 }
 

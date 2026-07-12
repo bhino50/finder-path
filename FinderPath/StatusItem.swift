@@ -45,7 +45,14 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        state.refresh()
+        // The Finder query runs off the main thread; the menu opens instantly
+        // with the last-known path (or a fetching placeholder) and updates in
+        // place when the result lands — NSMenu supports mutation while open.
+        // A beachballed Finder can no longer freeze the click.
+        state.refresh { [weak self] in
+            guard let self else { return }
+            self.rebuildMenu(self.menu)
+        }
         rebuildMenu(menu)
         sender.highlight(true)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
@@ -64,7 +71,9 @@ final class StatusItemController: NSObject {
                 path: isPermissionDenied
                     ? "Finder access needed"
                     : FinderPathPreferences.displayPath(for: state.currentPath),
-                isError: !state.hasCopyablePath
+                // An empty path means the fetch is still in flight — show the
+                // placeholder in the normal color, not as an error.
+                isError: !state.currentPath.isEmpty && !state.hasCopyablePath
             )
             menu.addItem(pathItem)
             menu.addItem(.separator())
