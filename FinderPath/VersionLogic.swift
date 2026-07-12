@@ -162,6 +162,33 @@ enum UpdateChecker {
         return false
     }
 
+    static func versionsAreEquivalent(_ lhs: String, _ rhs: String) -> Bool {
+        guard isRecognizableVersion(lhs), isRecognizableVersion(rhs) else {
+            return false
+        }
+
+        let left = numericComponents(lhs)
+        let right = numericComponents(rhs)
+        let length = max(left.count, right.count)
+
+        return (0..<length).allSatisfy { index in
+            let leftComponent = index < left.count ? left[index] : 0
+            let rightComponent = index < right.count ? right[index] : 0
+            return leftComponent == rightComponent
+        }
+    }
+
+    private static func isRecognizableVersion(_ version: String) -> Bool {
+        let cleaned = version
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
+        guard !cleaned.isEmpty else { return false }
+
+        return cleaned.split(separator: ".").allSatisfy { component in
+            component.first?.isNumber == true
+        }
+    }
+
     private static func httpsURL(from string: String?) -> URL? {
         guard let string,
               let url = URL(string: string),
