@@ -57,7 +57,12 @@ enum UpdateInstaller {
             Task { @MainActor in completion(result) }
         }
 
-        URLSession.shared.downloadTask(with: archiveURL) { location, response, error in
+        // Ephemeral session for the same reason as UpdateChecker.check: no
+        // persisted HTTP/3 mappings, so the download cannot stall on networks
+        // that silently drop UDP 443 (QUIC).
+        let session = URLSession(configuration: .ephemeral)
+        session.downloadTask(with: archiveURL) { location, response, error in
+            defer { session.finishTasksAndInvalidate() }
             if let error {
                 finish(.failure(.downloadFailed(error.localizedDescription)))
                 return
