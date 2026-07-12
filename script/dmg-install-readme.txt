@@ -4,9 +4,12 @@ FinderPath — Install & First Launch
 1. Drag FinderPath.app into the Applications folder.
 
 2. FIRST OPEN
-   FinderPath is signed with an Apple Developer ID and notarized by Apple,
-   so it opens like any other Mac app — just double-click it. No security
-   warnings, no extra steps.
+   The public FinderPath-<version>.dmg is signed with an Apple Developer ID
+   and notarized by Apple, so it opens like any other Mac app — just
+   double-click it. No security warnings, no extra steps.
+
+   Development artifacts whose filenames include NOT-FOR-PUBLIC-RELEASE are
+   not notarized. They are for local testing only and macOS may block them.
 
    If you downloaded an older copy before June 2026 and macOS blocks it,
    delete that copy and download the current version instead.
