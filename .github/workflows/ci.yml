@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Validate project files
         run: |
@@ -28,7 +28,11 @@ jobs:
             download-site/version.json
           bash -n script/build_and_run.sh
           bash -n script/run_no_xcode.sh
+          bash -n script/test_logic.sh
           bash -n script/package_release.sh
+
+      - name: Run logic tests
+        run: ./script/test_logic.sh
 
       - name: Build Debug app
         run: |
