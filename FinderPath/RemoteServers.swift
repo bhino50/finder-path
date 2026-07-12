@@ -51,9 +51,20 @@ enum RemoteServers {
     // shapes so an entry can never smuggle whitespace, shell syntax, or ssh
     // option flags into the connect command.
     private static let validTargetPattern = "^[A-Za-z0-9._@:-]+$"
+    private static let alphanumericPattern = "[A-Za-z0-9]"
 
     static func isValidTarget(_ target: String) -> Bool {
-        target.range(of: validTargetPattern, options: .regularExpression) != nil
+        let atSignCount = target.reduce(into: 0) { count, character in
+            if character == "@" { count += 1 }
+        }
+
+        return !target.isEmpty
+            && !target.hasPrefix("-")
+            && !target.hasPrefix("@")
+            && !target.hasSuffix("@")
+            && atSignCount <= 1
+            && target.range(of: validTargetPattern, options: .regularExpression) != nil
+            && target.range(of: alphanumericPattern, options: .regularExpression) != nil
     }
 
     static func normalizedTarget(_ rawTarget: String) -> String {
@@ -207,19 +218,20 @@ nonisolated enum TailscaleBridge {
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = arguments
         let errorPipe = Pipe()
-        task.standardOutput = Pipe()
+        task.standardOutput = FileHandle.nullDevice
         task.standardError = errorPipe
 
         do {
             try task.run()
-            task.waitUntilExit()
         } catch {
             return "Could not run tailscale: \(error.localizedDescription)"
         }
 
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
         if task.terminationStatus == 0 { return nil }
 
-        let message = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        let message = String(data: errorData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return message?.isEmpty == false ? message : "tailscale \(arguments.joined(separator: " ")) failed."
     }
@@ -230,16 +242,17 @@ nonisolated enum TailscaleBridge {
         task.arguments = arguments
         let outputPipe = Pipe()
         task.standardOutput = outputPipe
-        task.standardError = Pipe()
+        task.standardError = FileHandle.nullDevice
 
         do {
             try task.run()
-            task.waitUntilExit()
         } catch {
             return nil
         }
 
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return nil }
         return data.isEmpty ? nil : data
     }
 }

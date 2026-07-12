@@ -23,23 +23,25 @@ enum FinderBridge {
         // Some Finder windows, such as the Computer view, report a target that
         // cannot be coerced to a file alias. Treat those like no-window cases.
         let source = """
-        tell application "Finder"
-            set finderPath to missing value
-            if (count of Finder windows) > 0 then
-                try
-                    set finderPath to POSIX path of (target of front Finder window as alias)
-                end try
-            end if
-            if finderPath is missing value then
-                try
-                    set finderPath to POSIX path of (insertion location as alias)
-                end try
-            end if
-            if finderPath is missing value then
-                return POSIX path of (path to desktop folder as alias)
-            end if
-            return finderPath
-        end tell
+        with timeout of 3 seconds
+            tell application "Finder"
+                set finderPath to missing value
+                if (count of Finder windows) > 0 then
+                    try
+                        set finderPath to POSIX path of (target of front Finder window as alias)
+                    end try
+                end if
+                if finderPath is missing value then
+                    try
+                        set finderPath to POSIX path of (insertion location as alias)
+                    end try
+                end if
+                if finderPath is missing value then
+                    return POSIX path of (path to desktop folder as alias)
+                end if
+                return finderPath
+            end tell
+        end timeout
         """
 
         guard let script = NSAppleScript(source: source) else {
@@ -92,54 +94,49 @@ nonisolated enum AgentLauncher {
             return AgentAvailability(executable: executable, resolvedPath: nil)
         }
 
-        let quotedExecutable = ShellCommand.argument(commandName)
-        let command = "if [[ -x \(quotedExecutable) ]]; then print -r -- \(quotedExecutable); else command -v -- \(quotedExecutable); fi"
+        let expandedCommand = NSString(string: commandName).expandingTildeInPath
+        if expandedCommand.contains("/") {
+            let path = URL(fileURLWithPath: expandedCommand).standardizedFileURL.path
+            return AgentAvailability(
+                executable: commandName,
+                resolvedPath: FileManager.default.isExecutableFile(atPath: path) ? path : nil
+            )
+        }
+
+        let resolvedPath = executableSearchDirectories()
+            .lazy
+            .map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(commandName).path }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
 
         return AgentAvailability(
             executable: commandName,
-            resolvedPath: shellOutput(for: command)
+            resolvedPath: resolvedPath
         )
     }
 
-    // Async variant for UI-driven checks (Settings, in particular): the zsh
-    // probe blocks on waitUntilExit, so run it on a background thread instead
-    // of the caller's thread.
+    // Retain an async API for UI call sites. Resolution is now a fast filesystem
+    // lookup rather than a login-shell subprocess, so opening the menu cannot be
+    // delayed by shell startup files or a stuck command probe.
     static func checkAvailability(for executable: String, defaultExecutable: String? = nil) async -> AgentAvailability {
-        await Task.detached {
-            availability(for: executable, defaultExecutable: defaultExecutable)
-        }.value
+        availability(for: executable, defaultExecutable: defaultExecutable)
     }
 
-    private static func shellOutput(for command: String) -> String? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-lc", command]
+    private static func executableSearchDirectories() -> [String] {
+        let commonDirectories = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "\(NSHomeDirectory())/.local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+        let inheritedDirectories = ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map(String.init) ?? []
 
-        // GUI apps do not always inherit the user's interactive shell PATH, so
-        // include the common Homebrew and local-bin locations used by CLI tools.
-        var environment = ProcessInfo.processInfo.environment
-        let commonPath = "/opt/homebrew/bin:/usr/local/bin:\(NSHomeDirectory())/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["PATH"] = "\(commonPath):\(environment["PATH"] ?? "")"
-        task.environment = environment
-
-        let outputPipe = Pipe()
-        task.standardOutput = outputPipe
-        task.standardError = Pipe()
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        guard task.terminationStatus == 0 else { return nil }
-
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return output?.isEmpty == false ? output : nil
+        var seen = Set<String>()
+        return (commonDirectories + inheritedDirectories).filter { seen.insert($0).inserted }
     }
 }
 
@@ -205,7 +202,7 @@ enum TerminalBridge {
         ]
 
         let errorPipe = Pipe()
-        task.standardOutput = Pipe()
+        task.standardOutput = FileHandle.nullDevice
         task.standardError = errorPipe
 
         // waitUntilExit blocks, so launch on a background task and report the
@@ -214,16 +211,16 @@ enum TerminalBridge {
         Task.detached {
             do {
                 try task.run()
-                task.waitUntilExit()
             } catch {
                 completion("Could not open Ghostty: \(error.localizedDescription)")
                 return
             }
 
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
             if task.terminationStatus == 0 {
                 completion(nil)
             } else {
-                let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
                 let message = String(data: data, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 completion(message?.isEmpty == false ? message : "Could not open Ghostty.")
@@ -242,8 +239,8 @@ enum TerminalBridge {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: cmuxPath)
         task.arguments = [directoryPath]
-        task.standardOutput = Pipe()
-        task.standardError = Pipe()
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
 
         do {
             try task.run()
@@ -302,23 +299,23 @@ enum TerminalBridge {
         task.arguments = ["-n", ghosttyURL.path, "--args", "-e", "ssh", "--", host]
 
         let errorPipe = Pipe()
-        task.standardOutput = Pipe()
+        task.standardOutput = FileHandle.nullDevice
         task.standardError = errorPipe
 
         // Same pattern as openGhostty: never block the caller on waitUntilExit.
         Task.detached {
             do {
                 try task.run()
-                task.waitUntilExit()
             } catch {
                 completion("Could not open Ghostty: \(error.localizedDescription)")
                 return
             }
 
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
             if task.terminationStatus == 0 {
                 completion(nil)
             } else {
-                let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
                 let message = String(data: data, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 completion(message?.isEmpty == false ? message : "Could not start the SSH session in Ghostty.")
@@ -331,10 +328,12 @@ enum TerminalBridge {
         // `--` ends ssh option parsing so a leading-dash host can't act as a flag.
         let command = "ssh -- \(ShellCommand.argument(host))"
         let source = """
-        tell application "Terminal"
-            activate
-            do script "\(appleScriptString(command))"
-        end tell
+        with timeout of 3 seconds
+            tell application "Terminal"
+                activate
+                do script "\(appleScriptString(command))"
+            end tell
+        end timeout
         """
 
         guard let script = NSAppleScript(source: source) else {
@@ -370,10 +369,12 @@ enum TerminalBridge {
         // Terminal can open a folder through NSWorkspace, but running a CLI
         // command in a new tab/window requires Terminal's AppleScript interface.
         let source = """
-        tell application "Terminal"
-            activate
-            do script "\(appleScriptString(command))"
-        end tell
+        with timeout of 3 seconds
+            tell application "Terminal"
+                activate
+                do script "\(appleScriptString(command))"
+            end tell
+        end timeout
         """
 
         guard let script = NSAppleScript(source: source) else {
