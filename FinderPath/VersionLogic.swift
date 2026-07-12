@@ -54,7 +54,13 @@ enum UpdateChecker {
             request.setValue("FinderPath/\(AppVersion.shortVersionString)", forHTTPHeaderField: "User-Agent")
         }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        // A fresh ephemeral session starts with no persisted Alt-Svc state, so
+        // the request negotiates over TCP. The shared session's cached HTTP/3
+        // mappings make it attempt QUIC, which stalls for the full timeout on
+        // networks that silently drop UDP 443.
+        let session = URLSession(configuration: .ephemeral)
+        session.dataTask(with: request) { data, response, error in
+            defer { session.finishTasksAndInvalidate() }
             if let error {
                 completion(.failed(message: "Could not reach the update server: \(error.localizedDescription)"))
                 return
