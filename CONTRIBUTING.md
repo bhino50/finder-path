@@ -51,9 +51,12 @@ Before opening an issue, search existing ones to avoid duplicates.
 
 ## Building and Testing
 
-There is no automated test suite. Testing is manual:
+Run the dependency-free logic tests and then launch the app for manual checks:
 
 ```bash
+# Test version comparison, shell quoting, and SSH target parsing
+./script/test_logic.sh
+
 # Build and launch the debug app
 ./script/build_and_run.sh
 
