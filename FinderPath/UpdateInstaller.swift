@@ -10,6 +10,7 @@ enum UpdateInstaller {
     static let appBundleName = "FinderPath.app"
     static let expectedBundleID = "io.github.bhino50.FinderPath"
     static let expectedTeamID = "VJPMCBH6NX"
+    private static let maximumArchiveSize: Int64 = 256 * 1_024 * 1_024
 
     enum InstallError: LocalizedError {
         case noArchiveURL
@@ -56,13 +57,36 @@ enum UpdateInstaller {
             Task { @MainActor in completion(result) }
         }
 
-        URLSession.shared.downloadTask(with: archiveURL) { location, _, error in
+        URLSession.shared.downloadTask(with: archiveURL) { location, response, error in
             if let error {
                 finish(.failure(.downloadFailed(error.localizedDescription)))
                 return
             }
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                let status = (response as? HTTPURLResponse)?.statusCode
+                let detail = status.map { "Update server returned HTTP \($0)." }
+                    ?? "The update server returned an invalid response."
+                finish(.failure(.downloadFailed(detail)))
+                return
+            }
+            guard let finalURL = httpResponse.url, isHTTPSWebURL(finalURL) else {
+                finish(.failure(.downloadFailed("The update redirected to a non-HTTPS location.")))
+                return
+            }
             guard let location else {
                 finish(.failure(.downloadFailed("No file was received.")))
+                return
+            }
+
+            let archiveSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                .map(Int64.init) ?? 0
+            guard archiveSize > 0 else {
+                finish(.failure(.downloadFailed("The update package was empty.")))
+                return
+            }
+            guard archiveSize <= maximumArchiveSize else {
+                finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
                 return
             }
 
@@ -74,7 +98,7 @@ enum UpdateInstaller {
                 try FileManager.default.moveItem(at: location, to: archiveFile)
 
                 let newApp = try extractApp(from: archiveFile, into: workDir)
-                try verify(appAt: newApp)
+                try verify(appAt: newApp, expectedVersion: manifest.latestVersion)
                 try removeQuarantine(at: newApp)
                 try swapAndScheduleRelaunch(newApp: newApp)
                 finish(.success(()))
@@ -150,7 +174,7 @@ enum UpdateInstaller {
         return contents.first { $0.lastPathComponent == appBundleName }
     }
 
-    private static func verify(appAt app: URL) throws {
+    private static func verify(appAt app: URL, expectedVersion: String) throws {
         let values = try app.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else {
             throw InstallError.verificationFailed("The package did not contain a real FinderPath app bundle.")
@@ -159,6 +183,11 @@ enum UpdateInstaller {
         guard let bundle = Bundle(url: app),
               bundle.bundleIdentifier == expectedBundleID else {
             throw InstallError.verificationFailed("The package did not contain FinderPath with the expected bundle identifier.")
+        }
+
+        guard let bundledVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              UpdateChecker.versionsAreEquivalent(bundledVersion, expectedVersion) else {
+            throw InstallError.verificationFailed("The app version did not match the release manifest.")
         }
 
         // Pin the signature to Apple's chain and the FinderPath team so a
@@ -182,7 +211,10 @@ enum UpdateInstaller {
     private static func removeQuarantine(at app: URL) throws {
         // Safe only because verify(appAt:) ran first; this is what lets the
         // relaunch happen without a Gatekeeper first-open prompt.
-        _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+        let result = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+        guard result.status == 0 else {
+            throw InstallError.installFailed("Could not prepare the verified app for launch: \(result.errorOutput)")
+        }
     }
 
     private static func swapAndScheduleRelaunch(newApp: URL) throws {
@@ -199,15 +231,32 @@ enum UpdateInstaller {
         let copy = run("/usr/bin/ditto", [newApp.path, target.path])
         guard copy.status == 0 else {
             // Roll the old version back so the user is never left without an app.
-            try? FileManager.default.moveItem(at: retired, to: target)
+            try restore(retiredApp: retired, to: target, after: copy.errorOutput)
             throw InstallError.installFailed(copy.errorOutput)
         }
 
+        do {
+            try scheduleRelaunch(of: target)
+        } catch {
+            try restore(retiredApp: retired, to: target, after: error.localizedDescription)
+            throw error
+        }
+
         try? FileManager.default.removeItem(at: retired)
-        scheduleRelaunch(of: target)
     }
 
-    private static func scheduleRelaunch(of app: URL) {
+    private static func restore(retiredApp: URL, to target: URL, after failure: String) throws {
+        try? FileManager.default.removeItem(at: target)
+        do {
+            try FileManager.default.moveItem(at: retiredApp, to: target)
+        } catch {
+            throw InstallError.installFailed(
+                "\(failure) The previous app also could not be restored: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private static func scheduleRelaunch(of app: URL) throws {
         let pid = ProcessInfo.processInfo.processIdentifier
         let quotedPath = ShellCommand.argument(app.path, quoteStyle: "single")
         let script = "while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \(quotedPath)"
@@ -215,9 +264,13 @@ enum UpdateInstaller {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
         task.arguments = ["-c", script]
-        task.standardOutput = Pipe()
-        task.standardError = Pipe()
-        try? task.run()
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            throw InstallError.installFailed("Could not schedule FinderPath to relaunch: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Process helper
@@ -237,7 +290,7 @@ enum UpdateInstaller {
         task.arguments = arguments
 
         let errorPipe = Pipe()
-        task.standardOutput = Pipe()
+        task.standardOutput = FileHandle.nullDevice
         task.standardError = errorPipe
 
         do {
@@ -246,8 +299,8 @@ enum UpdateInstaller {
             return CommandResult(status: -1, errorOutput: error.localizedDescription)
         }
 
-        task.waitUntilExit()
         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
         let errorText = String(data: errorData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return CommandResult(status: task.terminationStatus, errorOutput: errorText)
