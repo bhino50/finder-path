@@ -119,6 +119,13 @@ final class FinderPathActionRouter {
     }
 
     private func presentFailure(_ message: String, displayName: String) {
+        FinderPathAlertPresenter.presentLaunchFailure(message, displayName: displayName)
+    }
+}
+
+@MainActor
+enum FinderPathAlertPresenter {
+    static func presentLaunchFailure(_ message: String, displayName: String) {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "FinderPath could not open \(displayName)."
@@ -152,19 +159,25 @@ final class FinderPathState {
     func openInTerminal() {
         guard hasCopyablePath else { return }
 
-        TerminalBridge.open(at: currentPath) { _ in }
+        TerminalBridge.open(at: currentPath) { error in
+            self.presentLaunchFailure(error, displayName: "Terminal")
+        }
     }
 
     func openInGhostty() {
         guard hasCopyablePath else { return }
 
-        TerminalBridge.openGhostty(at: currentPath) { _ in }
+        TerminalBridge.openGhostty(at: currentPath) { error in
+            self.presentLaunchFailure(error, displayName: "Ghostty")
+        }
     }
 
     func openInCmux() {
         guard hasCopyablePath else { return }
 
-        TerminalBridge.openCmux(at: currentPath) { _ in }
+        TerminalBridge.openCmux(at: currentPath) { error in
+            self.presentLaunchFailure(error, displayName: "cmux")
+        }
     }
 
     func openWithCodex() {
@@ -177,7 +190,9 @@ final class FinderPathState {
             displayName: "Codex",
             executable: executable,
             at: currentPath
-        ) { _ in }
+        ) { error in
+            self.presentLaunchFailure(error, displayName: "Codex")
+        }
     }
 
     func openWithClaude() {
@@ -190,7 +205,9 @@ final class FinderPathState {
             displayName: "Claude",
             executable: executable,
             at: currentPath
-        ) { _ in }
+        ) { error in
+            self.presentLaunchFailure(error, displayName: "Claude")
+        }
     }
 
     func openWithHermes() {
@@ -203,7 +220,9 @@ final class FinderPathState {
             displayName: "Hermes",
             executable: executable,
             at: currentPath
-        ) { _ in }
+        ) { error in
+            self.presentLaunchFailure(error, displayName: "Hermes")
+        }
     }
 
     func checkForUpdates(userInitiated: Bool) {
@@ -226,5 +245,13 @@ final class FinderPathState {
     private func copyToPasteboard(_ string: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(string, forType: .string)
+    }
+
+    private func presentLaunchFailure(_ message: String?, displayName: String) {
+        guard let message else { return }
+
+        Task { @MainActor in
+            FinderPathAlertPresenter.presentLaunchFailure(message, displayName: displayName)
+        }
     }
 }
