@@ -78,29 +78,33 @@ final class FinderPathActionRouter {
         case "connect", "connect-to-server":
             onOpenConnectWindow?()
         case "open-ghostty", "ghostty":
-            let path = FinderBridge.currentPath()
-            guard !path.hasPrefix("Finder AppleScript error:") else {
-                presentFailure(path, displayName: "Ghostty")
-                return
-            }
+            Task { @MainActor in
+                let path = await FinderBridge.fetchCurrentPath()
+                guard !path.hasPrefix("Finder AppleScript error:") else {
+                    self.presentFailure(path, displayName: "Ghostty")
+                    return
+                }
 
-            TerminalBridge.openGhostty(at: path) { error in
-                guard let error else { return }
-                Task { @MainActor in
-                    self.presentFailure(error, displayName: "Ghostty")
+                TerminalBridge.openGhostty(at: path) { error in
+                    guard let error else { return }
+                    Task { @MainActor in
+                        self.presentFailure(error, displayName: "Ghostty")
+                    }
                 }
             }
         case "open-cmux", "cmux":
-            let path = FinderBridge.currentPath()
-            guard !path.hasPrefix("Finder AppleScript error:") else {
-                presentFailure(path, displayName: "cmux")
-                return
-            }
+            Task { @MainActor in
+                let path = await FinderBridge.fetchCurrentPath()
+                guard !path.hasPrefix("Finder AppleScript error:") else {
+                    self.presentFailure(path, displayName: "cmux")
+                    return
+                }
 
-            TerminalBridge.openCmux(at: path) { error in
-                guard let error else { return }
-                Task { @MainActor in
-                    self.presentFailure(error, displayName: "cmux")
+                TerminalBridge.openCmux(at: path) { error in
+                    guard let error else { return }
+                    Task { @MainActor in
+                        self.presentFailure(error, displayName: "cmux")
+                    }
                 }
             }
         default:
@@ -139,9 +143,20 @@ enum FinderPathAlertPresenter {
 @MainActor
 final class FinderPathState {
     var currentPath = ""
+    private var refreshGeneration = 0
 
-    func refresh() {
-        currentPath = FinderBridge.currentPath()
+    /// Fetches the Finder path off the main thread and reports back on the
+    /// main actor, so a stalled Finder can never beachball the app. Stale
+    /// completions from an earlier refresh are dropped.
+    func refresh(onChange: (() -> Void)? = nil) {
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        Task { @MainActor [weak self] in
+            let path = await FinderBridge.fetchCurrentPath()
+            guard let self, generation == self.refreshGeneration else { return }
+            self.currentPath = path
+            onChange?()
+        }
     }
 
     func copyCurrentPath() {

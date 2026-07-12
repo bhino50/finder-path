@@ -1,14 +1,46 @@
 import AppKit
+import os
 
-enum FinderBridge {
+nonisolated enum FinderBridge {
     // AppleScript error -1743 (errAEEventNotPermitted): the user declined the
     // Automation prompt, or FinderPath was switched off later under
-    // System Settings > Privacy & Security > Automation.
-    private static let automationDeniedErrorNumber = -1743
+    // System Settings > Privacy & Security > Automation. osascript prints the
+    // code in parentheses at the end of its stderr line.
+    private static let automationDeniedErrorCode = "(-1743)"
 
     static let permissionDeniedMessage = "Finder AppleScript error: FinderPath is not allowed to control Finder."
 
+    static let finderStalledMessage = "Finder AppleScript error: Finder is not responding."
+
     static let automationSettingsURLString = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+
+    // The script's own AppleEvent timeout is 3 seconds, but a stalled Finder
+    // can burn that per Apple event; the watchdog is the hard upper bound.
+    private static let queryTimeoutSeconds: TimeInterval = 8
+
+    // Some Finder windows, such as the Computer view, report a target that
+    // cannot be coerced to a file alias. Treat those like no-window cases.
+    private static let pathQuerySource = """
+    with timeout of 3 seconds
+        tell application "Finder"
+            set finderPath to missing value
+            if (count of Finder windows) > 0 then
+                try
+                    set finderPath to POSIX path of (target of front Finder window as alias)
+                end try
+            end if
+            if finderPath is missing value then
+                try
+                    set finderPath to POSIX path of (insertion location as alias)
+                end try
+            end if
+            if finderPath is missing value then
+                return POSIX path of (path to desktop folder as alias)
+            end if
+            return finderPath
+        end tell
+    end timeout
+    """
 
     static func isPermissionDenied(_ path: String) -> Bool {
         path == permissionDeniedMessage
@@ -19,54 +51,83 @@ enum FinderBridge {
         NSWorkspace.shared.open(url)
     }
 
-    static func currentPath() -> String {
-        // Some Finder windows, such as the Computer view, report a target that
-        // cannot be coerced to a file alias. Treat those like no-window cases.
-        let source = """
-        with timeout of 3 seconds
-            tell application "Finder"
-                set finderPath to missing value
-                if (count of Finder windows) > 0 then
-                    try
-                        set finderPath to POSIX path of (target of front Finder window as alias)
-                    end try
-                end if
-                if finderPath is missing value then
-                    try
-                        set finderPath to POSIX path of (insertion location as alias)
-                    end try
-                end if
-                if finderPath is missing value then
-                    return POSIX path of (path to desktop folder as alias)
-                end if
-                return finderPath
-            end tell
-        end timeout
-        """
-
-        guard let script = NSAppleScript(source: source) else {
-            return "Finder AppleScript error: Could not create the Finder query."
-        }
-
-        var error: NSDictionary?
-        let result = script.executeAndReturnError(&error)
-
-        if let error {
-            if let errorNumber = error[NSAppleScript.errorNumber] as? Int,
-               errorNumber == automationDeniedErrorNumber {
-                return permissionDeniedMessage
+    /// Asks Finder for the front window's path without ever blocking the main
+    /// thread. The AppleScript runs in an osascript subprocess (NSAppleScript
+    /// is main-thread-only) on a background queue, and a watchdog kills the
+    /// query when Finder is beachballed — e.g. by a stalled network volume.
+    static func fetchCurrentPath() async -> String {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: executePathQuery())
             }
+        }
+    }
 
-            let message = error[NSAppleScript.errorMessage] as? String
-                ?? error.description
-            return "Finder AppleScript error: \(message)"
+    private static func executePathQuery() -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", pathQuerySource]
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            return "Finder AppleScript error: \(error.localizedDescription)"
         }
 
-        if let path = result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !path.isEmpty {
+        // Terminating the child closes its pipe ends, so the reads below also
+        // unblock when the watchdog fires.
+        let timedOutFlag = OSAllocatedUnfairLock(initialState: false)
+        let watchdog = DispatchWorkItem {
+            timedOutFlag.withLock { $0 = true }
+            process.terminate()
+        }
+        DispatchQueue.global(qos: .userInitiated)
+            .asyncAfter(deadline: .now() + queryTimeoutSeconds, execute: watchdog)
+
+        // Drain both pipes before waiting so a full pipe buffer can never
+        // deadlock against process exit.
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+
+        return interpretScriptResult(
+            terminationStatus: process.terminationStatus,
+            timedOut: timedOutFlag.withLock { $0 },
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self)
+        )
+    }
+
+    /// Maps an osascript run onto the path-or-error strings the UI expects.
+    /// A successful path wins even when the watchdog raced the exit.
+    static func interpretScriptResult(
+        terminationStatus: Int32,
+        timedOut: Bool,
+        stdout: String,
+        stderr: String
+    ) -> String {
+        let path = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if terminationStatus == 0, !path.isEmpty {
             return path
         }
-
+        if timedOut {
+            return finderStalledMessage
+        }
+        let errorText = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if errorText.contains(automationDeniedErrorCode) {
+            return permissionDeniedMessage
+        }
+        if terminationStatus != 0 {
+            let detail = errorText.isEmpty
+                ? "The Finder query failed (status \(terminationStatus))."
+                : errorText
+            return "Finder AppleScript error: \(detail)"
+        }
         return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)
             .first?
             .path ?? NSHomeDirectory()

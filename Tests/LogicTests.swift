@@ -47,6 +47,61 @@ struct FinderPathLogicTests {
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")
         expect(!AgentLauncher.availability(for: "finderpath-command-that-does-not-exist").isInstalled, "missing executables should not resolve")
 
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: false,
+                stdout: "/Users/demo/Documents\n",
+                stderr: ""
+            ) == "/Users/demo/Documents",
+            "successful query should return the trimmed path"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: true,
+                stdout: "/tmp\n",
+                stderr: ""
+            ) == "/tmp",
+            "a completed query should win over a racing timeout"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 1,
+                timedOut: false,
+                stdout: "",
+                stderr: "execution error: Not authorized to send Apple events to Finder. (-1743)"
+            ) == FinderBridge.permissionDeniedMessage,
+            "automation denial should map to the permission message"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 15,
+                timedOut: true,
+                stdout: "",
+                stderr: ""
+            ) == FinderBridge.finderStalledMessage,
+            "a watchdog kill should report Finder as not responding"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 1,
+                timedOut: false,
+                stdout: "",
+                stderr: "execution error: Finder got an error: AppleEvent timed out. (-1712)"
+            ).hasPrefix("Finder AppleScript error:"),
+            "other script failures should surface as error strings"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: false,
+                stdout: "",
+                stderr: ""
+            ).hasPrefix("/"),
+            "empty output should fall back to a local folder"
+        )
+
         if failures.isEmpty {
             print("FinderPath logic tests passed (\(assertionCount) assertions).")
             return
