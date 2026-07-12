@@ -136,7 +136,12 @@ The parser also accepts a plain JSON manifest if you point the URL elsewhere:
 To ship a new version:
 
 1. Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the Xcode project. The package script reads `MARKETING_VERSION` from the project file.
-2. `./script/package_release.sh` (set `DEVELOPER_ID` + `NOTARY_PROFILE` for a notarized DMG).
+2. Run `./script/package_release.sh` with both `DEVELOPER_ID` and
+   `NOTARY_PROFILE`. Only that mode emits `dist/FinderPath-$VERSION.dmg` and
+   updates `download-site/version.json`, after the DMG passes notarization,
+   stapling, signature validation, and Gatekeeper. Other modes emit an
+   unmistakably named `NOT-FOR-PUBLIC-RELEASE` artifact and leave the public
+   manifest untouched.
 3. Tag the commit and publish a GitHub Release with the `.dmg` attached:
 
    ```bash
@@ -153,6 +158,9 @@ To ship a new version:
 ```bash
 # Debug build + run
 ./script/build_and_run.sh
+
+# Fast dependency-free logic tests
+./script/test_logic.sh
 
 # Local-test DMG (ad-hoc signed, for personal use)
 ./script/package_release.sh

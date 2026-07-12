@@ -11,8 +11,15 @@ APP_NAME="FinderPath"
 BUNDLE_ID="io.github.bhino50.FinderPath"
 MODE="${1:-run}"
 
-if [[ -d /Applications/Xcode.app/Contents/Developer && -z "${DEVELOPER_DIR:-}" ]]; then
-  export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+if [[ -z "${DEVELOPER_DIR:-}" ]]; then
+  for developer_dir in \
+    /Applications/Xcode.app/Contents/Developer \
+    /Applications/Xcode-beta.app/Contents/Developer; do
+    if [[ -d "$developer_dir" ]]; then
+      export DEVELOPER_DIR="$developer_dir"
+      break
+    fi
+  done
 fi
 
 /usr/bin/pkill -x "$APP_NAME" >/dev/null 2>&1 || true
