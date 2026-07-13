@@ -52,8 +52,9 @@ final class TerminalView: NSView {
     var session: TerminalSession? {
         didSet {
             guard session !== oldValue else { return }
+            // Only onScreenUpdate belongs to the view; onStatusChange is owned
+            // by TerminalPanelController, so the view must never touch it.
             oldValue?.onScreenUpdate = nil
-            oldValue?.onStatusChange = nil
             scrollbackOffset = 0
             clearSelection()
             hookSessionCallbacks()
@@ -117,11 +118,11 @@ final class TerminalView: NSView {
     }
 
     private func hookSessionCallbacks() {
+        // The view claims only onScreenUpdate. onStatusChange belongs to
+        // TerminalPanelController, which repaints the view on status changes;
+        // taking it here would clobber the controller's exit/Restart handling.
         session?.onScreenUpdate = { [weak self] in
             self?.screenDirty = true
-        }
-        session?.onStatusChange = { [weak self] in
-            self?.needsDisplay = true
         }
     }
 

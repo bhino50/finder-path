@@ -104,7 +104,11 @@ final class TerminalSession: Identifiable {
         process.onExit = { [weak self, weak process] code in
             Task { @MainActor in
                 guard let self, let process, self.pty === process else { return }
-                self.pty = nil
+                // Keep the pty reference so buffered output that lands after
+                // the exit notification (the two arrive on unordered queues)
+                // still passes the identity guard and renders. Writes to the
+                // now-exited process are no-ops inside PTYProcess. restart()
+                // replaces the reference, which correctly drops stale output.
                 self.status = .exited(code)
                 self.onStatusChange?()
             }
