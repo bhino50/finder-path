@@ -10,6 +10,8 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private enum Layout {
         static let defaultSize = NSSize(width: 640, height: 420)
         static let minimumSize = NSSize(width: 380, height: 240)
+        static let maximumSize = NSSize(width: 1600, height: 1100)
+        static let gripSize: CGFloat = 16
         static let topBarHeight: CGFloat = 28
         static let topBarSpacing: CGFloat = 4
         static let topBarInset: CGFloat = 6
@@ -36,6 +38,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private let tabsStack = NSStackView()
     private let restartButton = NSButton()
     private let pinButton = NSButton()
+    private let resizeGrip = ResizeGripView()
 
     private var popover: NSPopover?
     private var panel: NSPanel?
@@ -186,6 +189,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         popover?.performClose(nil)
         popover = nil
         isPinned = true
+        // The floating panel resizes from its own edges, so the grip is only
+        // for the popover.
+        resizeGrip.isHidden = true
         updatePinButton()
         presentPanel()
     }
@@ -197,6 +203,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             panel.contentView = NSView()
         }
         isPinned = false
+        resizeGrip.isHidden = false
         updatePinButton()
         if let statusButton = lastStatusButton {
             presentPopover(relativeTo: statusButton)
@@ -381,6 +388,13 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         contentView.addSubview(topBar)
         contentView.addSubview(terminalView)
 
+        // Drag grip in the bottom-right corner resizes the popover. contentView
+        // is not flipped, so the bottom edge is y == 0.
+        resizeGrip.translatesAutoresizingMaskIntoConstraints = false
+        resizeGrip.onResizeBegan = { [weak self] in self?.contentView.frame.size ?? .zero }
+        resizeGrip.onResize = { [weak self] size in self?.applyContentResize(size) }
+        contentView.addSubview(resizeGrip)
+
         NSLayoutConstraint.activate([
             topBar.topAnchor.constraint(equalTo: contentView.topAnchor),
             topBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -390,7 +404,24 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             terminalView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             terminalView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             terminalView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            resizeGrip.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            resizeGrip.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            resizeGrip.widthAnchor.constraint(equalToConstant: Layout.gripSize),
+            resizeGrip.heightAnchor.constraint(equalToConstant: Layout.gripSize),
         ])
+    }
+
+    /// Applies a drag-resize to the popover, clamped to sane bounds. The
+    /// terminal reflows to the new width via the view's layout pass, which
+    /// pushes the new grid size to the PTY. The pinned panel resizes from its
+    /// own edges, so the grip is hidden there.
+    private func applyContentResize(_ requested: CGSize) {
+        let clamped = NSSize(
+            width: min(max(requested.width, Layout.minimumSize.width), Layout.maximumSize.width),
+            height: min(max(requested.height, Layout.minimumSize.height), Layout.maximumSize.height)
+        )
+        contentView.frame.size = clamped
+        popover?.contentSize = clamped
     }
 
     // MARK: - Tab strip
@@ -492,6 +523,47 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             button.title = fallbackTitle
         }
         return button
+    }
+}
+
+/// Bottom-right drag handle that resizes the popover. Reports the current size
+/// when a drag begins and the requested size as the drag proceeds; the
+/// controller clamps and applies it.
+private final class ResizeGripView: NSView {
+    var onResizeBegan: (() -> CGSize)?
+    var onResize: ((CGSize) -> Void)?
+
+    private var startMouse: NSPoint = .zero
+    private var startSize: CGSize = .zero
+
+    override func mouseDown(with event: NSEvent) {
+        startMouse = event.locationInWindow
+        startSize = onResizeBegan?() ?? .zero
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let now = event.locationInWindow
+        let dx = now.x - startMouse.x
+        let dy = now.y - startMouse.y
+        // Window coordinates increase upward, so dragging the corner down
+        // (negative dy) must grow the height.
+        onResize?(CGSize(width: startSize.width + dx, height: startSize.height - dy))
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.tertiaryLabelColor.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1
+        // Diagonal hatching in the bottom-right corner (y == 0 is the bottom).
+        for inset in stride(from: CGFloat(4), through: bounds.width, by: 4) {
+            path.move(to: NSPoint(x: bounds.maxX, y: inset))
+            path.line(to: NSPoint(x: inset, y: bounds.minY))
+        }
+        path.stroke()
     }
 }
 
