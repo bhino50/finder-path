@@ -375,9 +375,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         for (index, session) in store.sessions.enumerated() {
             let isActive = session === active
             tabsStack.addArrangedSubview(makeTabButton(for: session, at: index, isActive: isActive))
-            if isActive {
-                tabsStack.addArrangedSubview(makeCloseButton(at: index))
-            }
+            // Every tab carries its own close button so any session can be
+            // dismissed with one click without activating it first.
+            tabsStack.addArrangedSubview(makeCloseButton(at: index))
         }
     }
 
@@ -387,9 +387,15 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.setButtonType(.momentaryChange)
         button.tag = index
         button.attributedTitle = Self.tabTitle(name: session.name, status: session.status, isActive: isActive)
-        button.toolTip = session.workingDirectory
+        button.toolTip = "\(session.workingDirectory)\nDouble-click to rename, right-click to close"
         button.onRightClick = { [weak self] in self?.close(session) }
+        button.onDoubleClick = { [weak self] in self?.renameSession(session) }
         return button
+    }
+
+    private func renameSession(_ session: TerminalSession) {
+        guard let newName = TerminalRenamePrompt.run(currentName: session.name) else { return }
+        store.rename(session, to: newName)
     }
 
     private func makeCloseButton(at index: Int) -> NSButton {
@@ -464,6 +470,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 /// closed without reaching for its close button.
 private final class TerminalTabButton: NSButton {
     var onRightClick: (() -> Void)?
+    var onDoubleClick: (() -> Void)?
 
     override func rightMouseUp(with event: NSEvent) {
         guard let onRightClick else {
@@ -471,5 +478,15 @@ private final class TerminalTabButton: NSButton {
             return
         }
         onRightClick()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // A double-click renames; the first click still falls through to the
+        // normal action so the tab activates before the rename prompt opens.
+        if event.clickCount == 2, let onDoubleClick {
+            onDoubleClick()
+            return
+        }
+        super.mouseDown(with: event)
     }
 }

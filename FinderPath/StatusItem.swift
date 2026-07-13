@@ -228,14 +228,9 @@ final class StatusItemController: NSObject {
 
             for session in TerminalSessionStore.shared.sessions {
                 let indicator = session.status == .running ? "\u{25CF} " : "\u{25CB} "
-                let sessionItem = NSMenuItem(
-                    title: indicator + session.name,
-                    action: #selector(showTerminalSessionMenuItem(_:)),
-                    keyEquivalent: ""
-                )
-                sessionItem.target = self
+                let sessionItem = NSMenuItem(title: indicator + session.name, action: nil, keyEquivalent: "")
                 sessionItem.toolTip = session.workingDirectory
-                sessionItem.representedObject = session
+                sessionItem.submenu = makeSessionSubmenu(for: session)
                 menu.addItem(sessionItem)
             }
 
@@ -391,11 +386,47 @@ final class StatusItemController: NSObject {
         state.openWithHermes()
     }
 
+    // Each session gets a submenu so it can be shown, renamed, or closed
+    // without leaving the menu bar.
+    private func makeSessionSubmenu(for session: TerminalSession) -> NSMenu {
+        let submenu = NSMenu()
+
+        let showItem = NSMenuItem(title: "Show Terminal", action: #selector(showTerminalSessionMenuItem(_:)), keyEquivalent: "")
+        showItem.target = self
+        showItem.representedObject = session
+        submenu.addItem(showItem)
+
+        submenu.addItem(.separator())
+
+        let renameItem = NSMenuItem(title: "Rename…", action: #selector(renameTerminalSessionMenuItem(_:)), keyEquivalent: "")
+        renameItem.target = self
+        renameItem.representedObject = session
+        submenu.addItem(renameItem)
+
+        let closeItem = NSMenuItem(title: "Close Terminal", action: #selector(closeTerminalSessionMenuItem(_:)), keyEquivalent: "")
+        closeItem.target = self
+        closeItem.representedObject = session
+        submenu.addItem(closeItem)
+
+        return submenu
+    }
+
     @objc private func showTerminalSessionMenuItem(_ sender: NSMenuItem) {
         guard let session = sender.representedObject as? TerminalSession,
               let button = statusItem.button else { return }
 
         terminalPanelController.show(session: session, relativeTo: button)
+    }
+
+    @objc private func renameTerminalSessionMenuItem(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? TerminalSession else { return }
+        guard let newName = TerminalRenamePrompt.run(currentName: session.name) else { return }
+        TerminalSessionStore.shared.rename(session, to: newName)
+    }
+
+    @objc private func closeTerminalSessionMenuItem(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? TerminalSession else { return }
+        TerminalSessionStore.shared.remove(session)
     }
 
     @objc private func newTerminalHereMenuItem() {
