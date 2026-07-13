@@ -428,8 +428,8 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.setButtonType(.momentaryChange)
         button.tag = index
         button.attributedTitle = Self.tabTitle(name: session.displayName, status: session.status, isActive: isActive)
-        button.toolTip = "\(session.workingDirectory)\nDouble-click to rename, right-click to close"
-        button.onRightClick = { [weak self] in self?.close(session) }
+        button.toolTip = "\(session.workingDirectory)\nDouble-click or right-click to rename; use the × to close"
+        button.onRightClick = { [weak self] in self?.renameSession(session) }
         button.onDoubleClick = { [weak self] in self?.renameSession(session) }
         return button
     }

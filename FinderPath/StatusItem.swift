@@ -227,10 +227,18 @@ final class StatusItemController: NSObject {
             menu.addItem(.separator())
 
             for session in TerminalSessionStore.shared.sessions {
-                let indicator = session.status == .running ? "\u{25CF} " : "\u{25CB} "
-                let sessionItem = NSMenuItem(title: indicator + session.displayName, action: nil, keyEquivalent: "")
+                let sessionItem = NSMenuItem()
+                let row = TerminalMenuRowView(name: session.displayName)
+                row.onOpen = { [weak self] in
+                    menu.cancelTracking()
+                    self?.openTerminal(session)
+                }
+                row.onClose = { [weak self] in
+                    menu.cancelTracking()
+                    self?.closeTerminal(session)
+                }
+                sessionItem.view = row
                 sessionItem.toolTip = session.workingDirectory
-                sessionItem.submenu = makeSessionSubmenu(for: session)
                 menu.addItem(sessionItem)
             }
 
@@ -386,46 +394,14 @@ final class StatusItemController: NSObject {
         state.openWithHermes()
     }
 
-    // Each session gets a submenu so it can be shown, renamed, or closed
-    // without leaving the menu bar.
-    private func makeSessionSubmenu(for session: TerminalSession) -> NSMenu {
-        let submenu = NSMenu()
-
-        let showItem = NSMenuItem(title: "Show Terminal", action: #selector(showTerminalSessionMenuItem(_:)), keyEquivalent: "")
-        showItem.target = self
-        showItem.representedObject = session
-        submenu.addItem(showItem)
-
-        submenu.addItem(.separator())
-
-        let renameItem = NSMenuItem(title: "Rename…", action: #selector(renameTerminalSessionMenuItem(_:)), keyEquivalent: "")
-        renameItem.target = self
-        renameItem.representedObject = session
-        submenu.addItem(renameItem)
-
-        let closeItem = NSMenuItem(title: "Close Terminal", action: #selector(closeTerminalSessionMenuItem(_:)), keyEquivalent: "")
-        closeItem.target = self
-        closeItem.representedObject = session
-        submenu.addItem(closeItem)
-
-        return submenu
-    }
-
-    @objc private func showTerminalSessionMenuItem(_ sender: NSMenuItem) {
-        guard let session = sender.representedObject as? TerminalSession,
-              let button = statusItem.button else { return }
-
+    // Clicking a terminal row opens it directly; the row's trailing button
+    // closes it. Renaming lives on the panel tab (double- or right-click).
+    private func openTerminal(_ session: TerminalSession) {
+        guard let button = statusItem.button else { return }
         terminalPanelController.show(session: session, relativeTo: button)
     }
 
-    @objc private func renameTerminalSessionMenuItem(_ sender: NSMenuItem) {
-        guard let session = sender.representedObject as? TerminalSession else { return }
-        guard let newName = TerminalRenamePrompt.run(currentName: session.name) else { return }
-        TerminalSessionStore.shared.rename(session, to: newName)
-    }
-
-    @objc private func closeTerminalSessionMenuItem(_ sender: NSMenuItem) {
-        guard let session = sender.representedObject as? TerminalSession else { return }
+    private func closeTerminal(_ session: TerminalSession) {
         TerminalSessionStore.shared.remove(session)
     }
 
@@ -453,6 +429,98 @@ final class StatusItemController: NSObject {
 
     @objc private func quitMenuItem() {
         NSApp.terminate(nil)
+    }
+}
+
+/// A terminal row in the status menu: the session name on the left, a close
+/// button on the right. Clicking the row opens the terminal; clicking the
+/// button closes it. Highlights on hover like a normal menu item.
+final class TerminalMenuRowView: NSView {
+    var onOpen: (() -> Void)?
+    var onClose: (() -> Void)?
+
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
+    private var trackingArea: NSTrackingArea?
+
+    private var isHighlighted = false {
+        didSet {
+            guard isHighlighted != oldValue else { return }
+            nameLabel.textColor = isHighlighted ? .selectedMenuItemTextColor : .labelColor
+            closeButton.contentTintColor = isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
+            needsDisplay = true
+        }
+    }
+
+    init(name: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: FinderPathPreferences.menuHeaderWidth, height: 22))
+
+        nameLabel.stringValue = name
+        nameLabel.font = .menuFont(ofSize: 0)
+        nameLabel.textColor = .labelColor
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(nameLabel)
+
+        closeButton.isBordered = false
+        closeButton.setButtonType(.momentaryChange)
+        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close terminal")
+        closeButton.imageScaling = .scaleProportionallyDown
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.toolTip = "Close this terminal"
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 13),
+            closeButton.heightAnchor.constraint(equalToConstant: 13),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHighlighted = true }
+    override func mouseExited(with event: NSEvent) { isHighlighted = false }
+
+    // Route clicks: the close button handles its own area; everything else on
+    // the row opens the terminal.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        return closeButton.frame.contains(local) ? closeButton : self
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onOpen?()
+    }
+
+    @objc private func closeClicked() {
+        onClose?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isHighlighted else { return }
+        NSColor.selectedContentBackgroundColor.setFill()
+        bounds.fill()
     }
 }
 
