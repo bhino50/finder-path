@@ -22,10 +22,11 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 - **Open in cmux / Ghostty** — your primary launchers, at the top of the menu; open the current Finder folder in cmux or a new Ghostty window
 - **Open in Terminal** — opens Terminal.app in the current Finder folder
 - **Open with Codex / Claude / Hermes** — launches optional CLI agents in a new Terminal session at the current folder
+- **Mini terminals** — cmux-style terminal sessions built into the menu bar. A homegrown terminal emulator (no third-party dependencies) runs real shells, so you can use `git`, `ssh`, `vim`, `htop`, or CLI agents right in the popover. Sessions keep running in the background while the app is open and restore (name and working directory) after a restart. Left-click shows them in a **Terminals** menu section with **New Terminal Here** (opens in the current Finder folder); right-click opens the terminal panel directly. Switch sessions with the tab strip, and **pin** the panel to float it as a movable, resizable always-on-top window.
 - **Connect to Server** — a clean window (modeled on macOS Terminal's New Remote Connection) for SSH-ing to your machines. Lists your **Tailscale** devices live — Linux-only by default with a "Show all" toggle — shows VPN status with a Connect/Disconnect button, and keeps a curated list of your own servers you manage with +/−. Runs the session in Ghostty or Terminal.
 - **Shortcut action URLs** — `finderpath://open-ghostty`, `finderpath://open-cmux`, and `finderpath://connect` trigger those actions from keyboard tools like Karabiner
 - **Check for Updates** — pulls the latest GitHub Release and offers a one-click download if a newer version is available
-- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; choose the SSH terminal; configure agent executable paths and the update source URL
+- **Configurable Settings** — toggle menu items; choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; choose the SSH terminal; configure agent executable paths and the update source URL; toggle the Terminals section and right-click behavior, and set the mini-terminal font size, scrollback limit, and shell override
 
 ---
 
