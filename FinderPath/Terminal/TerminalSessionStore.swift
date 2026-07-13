@@ -40,13 +40,14 @@ final class TerminalSessionStore {
 
     // MARK: - Session management
 
-    func newSession(name: String?, workingDirectory: String) -> TerminalSession {
+    func newSession(name: String?, workingDirectory: String, initialCommand: String? = nil) -> TerminalSession {
         let configuration = configurationProvider()
         let session = TerminalSession(
             name: name ?? nextAutoName(),
             workingDirectory: workingDirectory,
             shellPath: configuration.shellPath,
-            scrollbackLimit: configuration.scrollbackLimit
+            scrollbackLimit: configuration.scrollbackLimit,
+            initialCommand: initialCommand
         )
         sessions.append(session)
         persist()

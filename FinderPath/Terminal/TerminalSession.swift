@@ -49,6 +49,10 @@ final class TerminalSession: Identifiable {
 
     private let shellPath: String
     private let scrollbackLimit: Int
+    /// Optional command run once after the shell starts, e.g. a CLI agent like
+    /// `claude`. Not persisted, so a restored session comes back as a plain
+    /// shell rather than silently re-launching the agent.
+    private let initialCommand: String?
     private var pty: PTYProcess?
     private var parser = TerminalParser()
     private var lastNotifiedTitle = ""
@@ -58,13 +62,15 @@ final class TerminalSession: Identifiable {
         name: String,
         workingDirectory: String,
         shellPath: String = PTYProcess.defaultShell(),
-        scrollbackLimit: Int = 2000
+        scrollbackLimit: Int = 2000,
+        initialCommand: String? = nil
     ) {
         self.id = id
         self.name = name
         self.workingDirectory = workingDirectory
         self.shellPath = shellPath
         self.scrollbackLimit = scrollbackLimit
+        self.initialCommand = initialCommand
         self.screen = TerminalScreen(
             rows: Self.defaultRows,
             columns: Self.defaultColumns,
@@ -137,6 +143,11 @@ final class TerminalSession: Identifiable {
             try process.launch()
             pty = process
             status = .running
+            // Feed the agent command to the shell. The PTY buffers it until the
+            // shell finishes loading and reads stdin, so it runs at the prompt.
+            if let initialCommand, !initialCommand.isEmpty {
+                process.write(Array((initialCommand + "\n").utf8))
+            }
         } catch let error as PTYProcess.LaunchError {
             pty = nil
             status = .failed(error.message)

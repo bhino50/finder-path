@@ -194,8 +194,14 @@ final class StatusItemController: NSObject {
                 let title = availability.isInstalled ? "Open with Codex" : "Codex Not Installed"
                 let codexItem = NSMenuItem(title: title, action: #selector(openWithCodexMenuItem), keyEquivalent: "")
                 codexItem.target = self
+                codexItem.keyEquivalentModifierMask = []
                 codexItem.isEnabled = state.hasCopyablePath && availability.isInstalled
                 menu.addItem(codexItem)
+                menu.addItem(harnessTerminalAlternate(
+                    title: "Open with Codex in FinderPath Terminal",
+                    action: #selector(openCodexInTerminalMenuItem),
+                    enabled: state.hasCopyablePath && availability.isInstalled
+                ))
             }
         }
 
@@ -206,8 +212,14 @@ final class StatusItemController: NSObject {
                 let title = availability.isInstalled ? "Open with Claude" : "Claude Not Installed"
                 let claudeItem = NSMenuItem(title: title, action: #selector(openWithClaudeMenuItem), keyEquivalent: "")
                 claudeItem.target = self
+                claudeItem.keyEquivalentModifierMask = []
                 claudeItem.isEnabled = state.hasCopyablePath && availability.isInstalled
                 menu.addItem(claudeItem)
+                menu.addItem(harnessTerminalAlternate(
+                    title: "Open with Claude in FinderPath Terminal",
+                    action: #selector(openClaudeInTerminalMenuItem),
+                    enabled: state.hasCopyablePath && availability.isInstalled
+                ))
             }
         }
 
@@ -218,8 +230,14 @@ final class StatusItemController: NSObject {
                 let title = availability.isInstalled ? "Open with Hermes" : "Hermes Not Installed"
                 let hermesItem = NSMenuItem(title: title, action: #selector(openWithHermesMenuItem), keyEquivalent: "")
                 hermesItem.target = self
+                hermesItem.keyEquivalentModifierMask = []
                 hermesItem.isEnabled = state.hasCopyablePath && availability.isInstalled
                 menu.addItem(hermesItem)
+                menu.addItem(harnessTerminalAlternate(
+                    title: "Open with Hermes in FinderPath Terminal",
+                    action: #selector(openHermesInTerminalMenuItem),
+                    enabled: state.hasCopyablePath && availability.isInstalled
+                ))
             }
         }
 
@@ -408,6 +426,44 @@ final class StatusItemController: NSObject {
 
     private func closeTerminal(_ session: TerminalSession) {
         TerminalSessionStore.shared.remove(session)
+    }
+
+    /// An Option-revealed alternate that opens an agent inside the built-in
+    /// terminal instead of an external one.
+    private func harnessTerminalAlternate(title: String, action: Selector, enabled: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.isAlternate = true
+        item.keyEquivalentModifierMask = .option
+        item.isEnabled = enabled
+        return item
+    }
+
+    /// Opens a new built-in terminal in the current folder that runs the given
+    /// agent command once the shell is ready.
+    private func openHarnessTerminal(command: String, name: String) {
+        guard let button = statusItem.button else { return }
+        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        let session = TerminalSessionStore.shared.newSession(
+            name: name,
+            workingDirectory: directory,
+            initialCommand: command
+        )
+        DispatchQueue.main.async { [weak self] in
+            self?.terminalPanelController.show(session: session, relativeTo: button)
+        }
+    }
+
+    @objc private func openCodexInTerminalMenuItem() {
+        openHarnessTerminal(command: FinderPathPreferences.codexExecutable, name: "Codex")
+    }
+
+    @objc private func openClaudeInTerminalMenuItem() {
+        openHarnessTerminal(command: FinderPathPreferences.claudeExecutable, name: "Claude")
+    }
+
+    @objc private func openHermesInTerminalMenuItem() {
+        openHarnessTerminal(command: FinderPathPreferences.hermesExecutable, name: "Hermes")
     }
 
     @objc private func newTerminalHereMenuItem() {
