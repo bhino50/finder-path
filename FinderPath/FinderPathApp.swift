@@ -20,6 +20,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FinderPathPreferences.registerDefaults()
+        // Feed shell and scrollback preferences into every session the store
+        // creates or restores. Resolved lazily so preference edits during the
+        // session take effect on the next new terminal.
+        TerminalSessionStore.shared.configurationProvider = {
+            let override = FinderPathPreferences.terminalShellOverride.trimmingCharacters(in: .whitespaces)
+            let usesOverride = !override.isEmpty && FileManager.default.isExecutableFile(atPath: override)
+            return TerminalSessionConfiguration(
+                shellPath: usesOverride ? override : PTYProcess.defaultShell(),
+                scrollbackLimit: FinderPathPreferences.terminalScrollbackLimit
+            )
+        }
+        // Restore stored terminal sessions (metadata only; shells relaunch
+        // lazily) before the menu builds so the Terminals section is complete.
+        TerminalSessionStore.shared.loadPersistedSessions()
         NSApp.setActivationPolicy(.accessory)
         statusItemController = StatusItemController()
         statusItemController?.onOpenWelcomeGuide = { [weak self] in
@@ -40,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Shells do not outlive the app; session metadata stays persisted.
+        TerminalSessionStore.shared.terminateAll()
         NSAppleEventManager.shared().removeEventHandler(
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)

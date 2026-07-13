@@ -12,6 +12,17 @@ final class StatusItemController: NSObject {
     private var remoteConnectionWindowController: RemoteConnectionWindowController?
     private var copyConfirmationTask: Task<Void, Never>?
 
+    // Lazy so the panel (and its views) only exist once terminals are used.
+    // New sessions start in the current Finder folder when it is a real path,
+    // falling back to home when Finder has no usable selection.
+    private lazy var terminalPanelController = TerminalPanelController(
+        store: .shared,
+        newSessionDirectory: { [weak self] in
+            guard let self, self.state.hasCopyablePath else { return NSHomeDirectory() }
+            return self.state.currentPath
+        }
+    )
+
     private static let copyConfirmationNanoseconds: UInt64 = 1_000_000_000
 
     override init() {
@@ -45,6 +56,15 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        // Right-click goes straight to the terminal panel (the button sends
+        // rightMouseUp); refresh keeps the new-session directory current.
+        if FinderPathPreferences.rightClickOpensTerminals,
+           NSApp.currentEvent?.type == .rightMouseUp {
+            state.refresh()
+            terminalPanelController.toggle(relativeTo: sender)
+            return
+        }
+
         // The Finder query runs off the main thread; the menu opens instantly
         // with the last-known path (or a fetching placeholder) and updates in
         // place when the result lands — NSMenu supports mutation while open.
@@ -203,6 +223,40 @@ final class StatusItemController: NSObject {
             }
         }
 
+        if FinderPathPreferences.showTerminalsSection {
+            menu.addItem(.separator())
+
+            for session in TerminalSessionStore.shared.sessions {
+                let indicator = session.status == .running ? "\u{25CF} " : "\u{25CB} "
+                let sessionItem = NSMenuItem(
+                    title: indicator + session.name,
+                    action: #selector(showTerminalSessionMenuItem(_:)),
+                    keyEquivalent: ""
+                )
+                sessionItem.target = self
+                sessionItem.toolTip = session.workingDirectory
+                sessionItem.representedObject = session
+                menu.addItem(sessionItem)
+            }
+
+            let newTerminalItem = NSMenuItem(
+                title: "New Terminal Here",
+                action: #selector(newTerminalHereMenuItem),
+                keyEquivalent: ""
+            )
+            newTerminalItem.target = self
+            newTerminalItem.isEnabled = state.hasCopyablePath
+            menu.addItem(newTerminalItem)
+
+            let showTerminalsItem = NSMenuItem(
+                title: "Show Terminals",
+                action: #selector(showTerminalsMenuItem),
+                keyEquivalent: ""
+            )
+            showTerminalsItem.target = self
+            menu.addItem(showTerminalsItem)
+        }
+
         if FinderPathPreferences.showConnectToServerItem {
             menu.addItem(.separator())
             let serverItem = NSMenuItem(title: "Connect to Server…", action: #selector(openConnectToServerMenuItem), keyEquivalent: "")
@@ -335,6 +389,27 @@ final class StatusItemController: NSObject {
 
     @objc private func openWithHermesMenuItem() {
         state.openWithHermes()
+    }
+
+    @objc private func showTerminalSessionMenuItem(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? TerminalSession,
+              let button = statusItem.button else { return }
+
+        terminalPanelController.show(session: session, relativeTo: button)
+    }
+
+    @objc private func newTerminalHereMenuItem() {
+        guard let button = statusItem.button else { return }
+
+        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: directory)
+        terminalPanelController.show(session: session, relativeTo: button)
+    }
+
+    @objc private func showTerminalsMenuItem() {
+        guard let button = statusItem.button else { return }
+
+        terminalPanelController.toggle(relativeTo: button)
     }
 
     @objc private func openConnectToServerMenuItem() {
