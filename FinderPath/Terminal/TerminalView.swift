@@ -256,20 +256,24 @@ final class TerminalView: NSView {
     }
 
     private func drawRowText(_ rowCells: [TerminalCell], rowTop: CGFloat, context: CGContext) {
-        let rowString = NSMutableAttributedString()
+        // Draw each same-style run at its exact grid column so glyph advances
+        // can never accumulate drift across a long or multi-color line (e.g. a
+        // recalled command or a syntax-highlighted prompt). Kerning keeps
+        // glyphs on the grid within a run; the per-run origin resets it between.
         var column = 0
         while column < rowCells.count {
             let style = rowCells[column].style
+            let startColumn = column
             var text = String(rowCells[column].character)
             var next = column + 1
             while next < rowCells.count, rowCells[next].style == style {
                 text.append(rowCells[next].character)
                 next += 1
             }
-            rowString.append(NSAttributedString(string: text, attributes: textAttributes(for: style)))
+            let run = NSAttributedString(string: text, attributes: textAttributes(for: style))
+            drawLine(run, atX: CGFloat(startColumn) * metrics.cellWidth, rowTop: rowTop, context: context)
             column = next
         }
-        drawLine(rowString, atX: 0, rowTop: rowTop, context: context)
     }
 
     /// CTLineDraw in a flipped view needs a mirrored text matrix; the text
