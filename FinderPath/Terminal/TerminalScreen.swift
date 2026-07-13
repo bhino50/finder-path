@@ -126,9 +126,15 @@ struct TerminalScreen {
             cursorColumn = 0
             pendingWrap = false
         case .scrollUp(let amount):
-            for _ in 0..<max(amount, 1) { scrollRegionUp(recordScrollback: false) }
+            // Clamp to region height so a huge CSI parameter cannot force
+            // disproportionate work from a few bytes of hostile output.
+            for _ in 0..<min(max(amount, 1), regionBottom - regionTop + 1) {
+                scrollRegionUp(recordScrollback: false)
+            }
         case .scrollDown(let amount):
-            for _ in 0..<max(amount, 1) { scrollRegionDown() }
+            for _ in 0..<min(max(amount, 1), regionBottom - regionTop + 1) {
+                scrollRegionDown()
+            }
         case .saveCursor:
             savedCursor = (cursorRow, cursorColumn)
         case .restoreCursor:
@@ -252,7 +258,9 @@ struct TerminalScreen {
 
     private mutating func insertLines(_ amount: Int) {
         guard cursorRow >= regionTop, cursorRow <= regionBottom else { return }
-        for _ in 0..<max(amount, 1) {
+        // Inserting more lines than fit below the cursor is indistinguishable
+        // from filling the region, so cap the work at the region size.
+        for _ in 0..<min(max(amount, 1), regionBottom - cursorRow + 1) {
             var row = regionBottom
             while row > cursorRow {
                 grid[row] = grid[row - 1]
@@ -266,7 +274,7 @@ struct TerminalScreen {
 
     private mutating func deleteLines(_ amount: Int) {
         guard cursorRow >= regionTop, cursorRow <= regionBottom else { return }
-        for _ in 0..<max(amount, 1) {
+        for _ in 0..<min(max(amount, 1), regionBottom - cursorRow + 1) {
             for row in cursorRow..<regionBottom {
                 grid[row] = grid[row + 1]
             }
@@ -343,17 +351,23 @@ struct TerminalScreen {
             )
         }
 
+        // The grid dropped `droppedTop` rows off the top when shrinking, so
+        // move the cursor up by the same amount to keep it on its own line.
+        let droppedTop = max(rows - targetRows, 0)
         rows = targetRows
         columns = targetColumns
         regionTop = 0
         regionBottom = rows - 1
-        cursorRow = clampRow(cursorRow)
+        cursorRow = clampRow(cursorRow - droppedTop)
         cursorColumn = clampColumn(cursorColumn)
         pendingWrap = false
     }
 
     private static func resizeGrid(_ source: [[TerminalCell]], rows: Int, columns: Int) -> [[TerminalCell]] {
-        var result = source.prefix(rows).map { line -> [TerminalCell] in
+        // Shrinking keeps the BOTTOM rows: the cursor and most recent output
+        // live there, so dropping the top preserves what the user is looking
+        // at instead of discarding the active prompt line.
+        var result = source.suffix(rows).map { line -> [TerminalCell] in
             if line.count > columns {
                 return Array(line.prefix(columns))
             }

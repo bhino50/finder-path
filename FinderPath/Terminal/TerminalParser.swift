@@ -144,8 +144,12 @@ struct TerminalParser {
         case UInt8(ascii: "8"):
             actions.append(.restoreCursor)
         case UInt8(ascii: "c"):
-            // RIS full reset: clear screen, home cursor, reset style.
+            // RIS hard reset: leave the alternate screen, restore autowrap and
+            // a full-height scroll region, then reset style, clear, and home.
             currentStyle = .plain
+            actions.append(.setMode(.alternateScreen, false))
+            actions.append(.setMode(.autowrap, true))
+            actions.append(.setScrollRegion(top: 1, bottom: 0))
             actions.append(.setStyle(.plain))
             actions.append(.eraseInDisplay(2))
             actions.append(.moveCursor(row: 1, column: 1))
@@ -248,7 +252,7 @@ struct TerminalParser {
         case "n":
             actions.append(.reportDeviceStatus(param(0, default: 0)))
         case "m":
-            applySGR(params, into: &actions)
+            applySGR(Self.sgrParameters(from: buffer), into: &actions)
         case "h", "l":
             guard isPrivate else { break }
             let enabled = final == "h"
@@ -273,6 +277,19 @@ struct TerminalParser {
     }
 
     // MARK: - SGR
+
+    /// SGR sub-parameters may be colon-delimited (ITU-T), e.g. `38:5:n` or
+    /// `38:2:r:g:b`. Treat ':' like ';' so extended-color values are not
+    /// collapsed into one non-numeric token that would reset all attributes.
+    private static func sgrParameters(from buffer: String) -> [Int?] {
+        let trimmed = buffer.drop(while: { "?><=".contains($0) })
+        guard !trimmed.isEmpty else { return [] }
+        let flattened = trimmed.replacingOccurrences(of: ":", with: ";")
+        return flattened.split(separator: ";", omittingEmptySubsequences: false).prefix(maxParameterCount * 2).map {
+            guard let value = Int($0) else { return nil }
+            return min(value, maxParameterValue)
+        }
+    }
 
     private mutating func applySGR(_ params: [Int?], into actions: inout [TerminalAction]) {
         var values = params.map { $0 ?? 0 }

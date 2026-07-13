@@ -225,16 +225,18 @@ struct FinderPathTerminalTests {
         expect(!screen.usingAlternateScreen, "back to primary screen")
         expect(screen.lineText(0) == "abc", "primary content restored")
 
-        // MARK: - Screen: resize
+        // MARK: - Screen: resize keeps the bottom rows
 
         screen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
-        for character in "abcd" { screen.apply(.print(character)) }
+        screen.apply(.moveCursor(row: 3, column: 1))
+        for character in "abcd" { screen.apply(.print(character)) } // content on the bottom row
+        expect(screen.cursorRow == 2, "cursor sits on the bottom row before resize")
         screen.resize(rows: 2, columns: 2)
         expect(screen.rows == 2 && screen.columns == 2, "resize applies dimensions")
-        expect(screen.lineText(0) == "ab", "narrower resize truncates")
-        expect(screen.cursorColumn <= 1 && screen.cursorRow <= 1, "cursor clamped on resize")
-        screen.resize(rows: 3, columns: 6)
-        expect(screen.lineText(0) == "ab    ", "wider resize pads with blanks")
+        expect(screen.lineText(1) == "ab", "shrink keeps the bottom row and truncates columns")
+        expect(screen.cursorRow == 1, "cursor tracks its retained line after shrink")
+        screen.resize(rows: 4, columns: 6)
+        expect(screen.lineText(1) == "ab    ", "grow pads columns and adds new rows at the bottom")
 
         // MARK: - Screen: modes and title
 
@@ -296,6 +298,35 @@ struct FinderPathTerminalTests {
             !TerminalInputEncoder.encodePaste("a\u{1B}[201~b", bracketed: true).dropFirst(6).dropLast(6).contains(0x1B),
             "bracketed paste strips ESC bytes from content"
         )
+
+        // MARK: - Parser: colon-delimited SGR (ITU-T)
+
+        var colonParser = TerminalParser()
+        var rgbColon = CellStyle.plain
+        rgbColon.foreground = .rgb(10, 20, 30)
+        expect(colonParser.parse(Array("\u{1B}[38:2:10:20:30m".utf8)) == [.setStyle(rgbColon)], "colon truecolor SGR parses")
+        var palColon = CellStyle.plain
+        palColon.foreground = .palette(196)
+        expect(colonParser.parse(Array("\u{1B}[38:5:196m".utf8)) == [.setStyle(palColon)], "colon palette SGR parses")
+
+        // MARK: - Parser: RIS hard reset
+
+        var risParser = TerminalParser()
+        let risActions = risParser.parse(Array("\u{1B}c".utf8))
+        expect(risActions.contains(.setMode(.alternateScreen, false)), "RIS exits the alternate screen")
+        expect(risActions.contains(.setMode(.autowrap, true)), "RIS restores autowrap")
+        expect(risActions.contains(.eraseInDisplay(2)), "RIS clears the screen")
+
+        // MARK: - Screen: hostile counts are clamped to the region
+
+        var clampScreen = TerminalScreen(rows: 3, columns: 3, scrollbackLimit: 5)
+        for (row, text) in ["aaa", "bbb", "ccc"].enumerated() {
+            clampScreen.apply(.moveCursor(row: row + 1, column: 1))
+            for character in text { clampScreen.apply(.print(character)) }
+        }
+        clampScreen.apply(.scrollUp(9999)) // clamped to region height, must not loop 9999 times
+        expect(clampScreen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty, "oversized scrollUp clears the region")
+        expect(clampScreen.lineText(2).trimmingCharacters(in: .whitespaces).isEmpty, "oversized scrollUp empties every row")
 
         // MARK: - PTY round trip (real child process)
 
