@@ -378,6 +378,72 @@ struct FinderPathTerminalTests {
 
         expect(!PTYProcess.defaultShell().isEmpty, "default shell resolves to a non-empty path")
 
+        // MARK: - PTY controlling terminal
+
+        do {
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "tty"],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            let lock = NSLock()
+            var collected: [UInt8] = []
+            let done = DispatchSemaphore(value: 0)
+            pty.onOutput = { bytes in
+                lock.lock(); collected.append(contentsOf: bytes); lock.unlock()
+            }
+            pty.onExit = { _ in done.signal() }
+            do {
+                try pty.launch()
+                _ = done.wait(timeout: .now() + 5)
+                var text = ""
+                for _ in 0..<100 {
+                    lock.lock(); text = String(decoding: collected, as: UTF8.self); lock.unlock()
+                    if text.contains("/dev/tty") { break }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                // `tty` prints the device path only when a controlling terminal
+                // exists, otherwise "not a tty" — so this proves the ctty fix.
+                expect(text.contains("/dev/tty"), "child acquires a controlling terminal")
+            } catch {
+                failures.append("controlling-terminal test launch threw: \(error)")
+            }
+        }
+
+        // MARK: - PTY write/drain deadlock regression
+
+        do {
+            // `yes` spews output forever and never reads stdin. Writing a large
+            // payload would block the write; if that block held the state queue
+            // (the original bug), draining and terminate() would wedge and the
+            // child would never exit. It must still terminate promptly.
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "yes"],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            let exited = DispatchSemaphore(value: 0)
+            pty.onOutput = { _ in } // discard; the point is that draining keeps flowing
+            pty.onExit = { _ in exited.signal() }
+            do {
+                try pty.launch()
+                pty.write([UInt8](repeating: 0x61, count: 200_000))
+                Thread.sleep(forTimeInterval: 0.2)
+                pty.terminate()
+                let ended = exited.wait(timeout: .now() + 5)
+                expect(ended == .success, "spewing child that ignores stdin still terminates (no deadlock)")
+                if ended != .success { pty.terminate() }
+            } catch {
+                failures.append("deadlock regression launch threw: \(error)")
+            }
+        }
+
         // MARK: - Result
 
         if failures.isEmpty {
