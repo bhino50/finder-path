@@ -33,6 +33,10 @@ final class PTYProcess {
     /// the backing storage directly; the public accessors would deadlock.
     private let stateQueue = DispatchQueue(label: PTYProcess.queueLabel + ".state")
     private let readQueue = DispatchQueue(label: PTYProcess.queueLabel + ".read")
+    // Writes run on their own queue: a write to a full PTY blocks, and it must
+    // never hold stateQueue, or it would stall the read source's handler
+    // lookup and wedge the whole session (draining, resize, terminate).
+    private let writeQueue = DispatchQueue(label: PTYProcess.queueLabel + ".write")
 
     private var outputHandler: (([UInt8]) -> Void)?
     private var exitHandler: ((Int32) -> Void)?
@@ -42,6 +46,9 @@ final class PTYProcess {
     private var readSource: DispatchSourceRead?
     private var currentRows: Int
     private var currentColumns: Int
+    /// Bumped on each successful launch so a delayed terminate() timer never
+    /// signals a PID that a later launch (or the OS) may have reused.
+    private var launchGeneration = 0
 
     // MARK: - Public surface
 
@@ -101,9 +108,11 @@ final class PTYProcess {
     private func launchOnQueue() throws {
         var primary: Int32 = -1
         var replica: Int32 = -1
-        guard openpty(&primary, &replica, nil, nil, nil) == 0 else {
+        var nameBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard openpty(&primary, &replica, &nameBuffer, nil, nil) == 0 else {
             throw LaunchError(message: "openpty failed: \(Self.message(forErrno: errno))")
         }
+        let ttyPath = String(cString: nameBuffer)
 
         var spawned = false
         defer {
@@ -124,11 +133,18 @@ final class PTYProcess {
             throw LaunchError(message: "posix_spawn_file_actions_init failed")
         }
         defer { posix_spawn_file_actions_destroy(&fileActions) }
-        try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, replica, 0), "dup stdin")
-        try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, replica, 1), "dup stdout")
-        try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, replica, 2), "dup stderr")
+        // Open the replica fresh in the child (fd 0) rather than dup'ing the
+        // inherited descriptor. With POSIX_SPAWN_SETSID applied first, the
+        // child is a session leader, so opening the tty without O_NOCTTY makes
+        // it the controlling terminal — the prerequisite for job control,
+        // /dev/tty, and Ctrl-C delivering signals to the foreground group.
+        try Self.checkSetup(posix_spawn_file_actions_addopen(&fileActions, 0, ttyPath, O_RDWR, 0), "open controlling tty")
+        try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, 0, 1), "dup stdout")
+        try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, 0, 2), "dup stderr")
         if replica > 2 {
-            try Self.checkSetup(posix_spawn_file_actions_addclose(&fileActions, replica), "close replica")
+            // The parent's replica fd is inherited at spawn; the child does not
+            // need it since it opens the tty by path, so close it there too.
+            try Self.checkSetup(posix_spawn_file_actions_addclose(&fileActions, replica), "close inherited replica")
         }
         try Self.checkSetup(
             posix_spawn_file_actions_addchdir_np(&fileActions, workingDirectory),
@@ -161,6 +177,7 @@ final class PTYProcess {
         childPID = pid
         primaryDescriptor = primary
         runningFlag = true
+        launchGeneration += 1
         startReading(from: primary)
         reapExit(of: pid)
     }
@@ -177,9 +194,13 @@ final class PTYProcess {
     /// EINTR; remaining bytes are dropped if the descriptor goes away.
     func write(_ bytes: [UInt8]) {
         guard !bytes.isEmpty else { return }
-        stateQueue.async { [weak self] in
-            guard let self, self.runningFlag, self.primaryDescriptor >= 0 else { return }
-            Self.writeFully(bytes, to: self.primaryDescriptor)
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            // Snapshot the descriptor under stateQueue (brief, non-blocking),
+            // then do the potentially blocking write off that queue.
+            let descriptor = self.stateQueue.sync { self.runningFlag ? self.primaryDescriptor : -1 }
+            guard descriptor >= 0 else { return }
+            Self.writeFully(bytes, to: descriptor)
         }
     }
 
@@ -232,9 +253,13 @@ final class PTYProcess {
         stateQueue.async { [weak self] in
             guard let self, self.runningFlag, self.childPID > 0 else { return }
             let pid = self.childPID
+            let generation = self.launchGeneration
             kill(pid, SIGHUP)
             self.stateQueue.asyncAfter(deadline: .now() + Self.killGracePeriod) { [weak self] in
-                guard let self, self.runningFlag, self.childPID == pid else { return }
+                // Only escalate if the same launch is still running; once the
+                // reaper clears runningFlag/childPID the PID may be reused.
+                guard let self, self.runningFlag, self.childPID == pid,
+                      self.launchGeneration == generation else { return }
                 kill(pid, SIGKILL)
             }
         }
