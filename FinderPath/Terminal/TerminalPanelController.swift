@@ -89,6 +89,11 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private func presentPopover(relativeTo statusButton: NSStatusBarButton) {
         let popover = ensurePopover()
         activateCurrentOrFirstSession()
+        // .applicationDefined popovers (unlike .transient) do not take key
+        // focus on their own, so the app must be activated for the terminal to
+        // receive keystrokes. No dismiss monitor is installed, so this does not
+        // make the popover vanish on interaction.
+        NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
         terminalView.focusTerminal()
     }
@@ -100,6 +105,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             panel.contentView = contentView
         }
         activateCurrentOrFirstSession()
+        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         terminalView.focusTerminal()
@@ -245,6 +251,8 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private func storeDidChange() {
         for session in store.sessions {
             session.onStatusChange = { [weak self] in self?.sessionStatusDidChange() }
+            // Follow the shell title so the tab renames itself to the running task.
+            session.onTitleChange = { [weak self] in self?.rebuildTabs() }
         }
         normalizeActiveSession()
         rebuildTabs()
@@ -419,7 +427,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.isBordered = false
         button.setButtonType(.momentaryChange)
         button.tag = index
-        button.attributedTitle = Self.tabTitle(name: session.name, status: session.status, isActive: isActive)
+        button.attributedTitle = Self.tabTitle(name: session.displayName, status: session.status, isActive: isActive)
         button.toolTip = "\(session.workingDirectory)\nDouble-click to rename, right-click to close"
         button.onRightClick = { [weak self] in self?.close(session) }
         button.onDoubleClick = { [weak self] in self?.renameSession(session) }

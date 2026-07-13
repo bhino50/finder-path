@@ -67,6 +67,8 @@ final class TerminalSessionStore {
     func rename(_ session: TerminalSession, to newName: String) {
         guard session.name != newName else { return }
         session.name = newName
+        // A manual rename pins the label so the shell title stops overriding it.
+        session.hasCustomName = true
         persist()
         onChange?()
     }

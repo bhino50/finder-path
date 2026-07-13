@@ -22,17 +22,32 @@ final class TerminalSession: Identifiable {
     let id: UUID
     var name: String
     var workingDirectory: String
+    /// True once the user renames the session, which pins the name so the
+    /// shell-provided title no longer overrides it.
+    var hasCustomName = false
 
     private(set) var status: Status = .notStarted
     private(set) var screen: TerminalScreen
 
     var onScreenUpdate: (() -> Void)?
     var onStatusChange: (() -> Void)?
+    /// Fires when the terminal title (OSC 0/2) changes, so the tab can follow
+    /// the running task.
+    var onTitleChange: (() -> Void)?
+
+    /// The tab label: a manual rename wins; otherwise the shell's title (the
+    /// running command or directory) when it has set one; otherwise the name.
+    var displayName: String {
+        if hasCustomName { return name }
+        let title = screen.title.trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? name : title
+    }
 
     private let shellPath: String
     private let scrollbackLimit: Int
     private var pty: PTYProcess?
     private var parser = TerminalParser()
+    private var lastNotifiedTitle = ""
 
     init(
         id: UUID = UUID(),
@@ -151,6 +166,10 @@ final class TerminalSession: Identifiable {
             }
         }
         onScreenUpdate?()
+        if screen.title != lastNotifiedTitle {
+            lastNotifiedTitle = screen.title
+            onTitleChange?()
+        }
     }
 
     private func replyToDeviceStatus(_ code: Int) {

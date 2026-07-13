@@ -228,7 +228,7 @@ final class StatusItemController: NSObject {
 
             for session in TerminalSessionStore.shared.sessions {
                 let indicator = session.status == .running ? "\u{25CF} " : "\u{25CB} "
-                let sessionItem = NSMenuItem(title: indicator + session.name, action: nil, keyEquivalent: "")
+                let sessionItem = NSMenuItem(title: indicator + session.displayName, action: nil, keyEquivalent: "")
                 sessionItem.toolTip = session.workingDirectory
                 sessionItem.submenu = makeSessionSubmenu(for: session)
                 menu.addItem(sessionItem)
