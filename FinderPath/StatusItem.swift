@@ -396,9 +396,14 @@ final class StatusItemController: NSObject {
 
     // Clicking a terminal row opens it directly; the row's trailing button
     // closes it. Renaming lives on the panel tab (double- or right-click).
+    // The popover is presented on the next runloop tick so the menu has fully
+    // dismissed first — a popover shown mid-menu-teardown anchors to the wrong
+    // place and loses its beak.
     private func openTerminal(_ session: TerminalSession) {
         guard let button = statusItem.button else { return }
-        terminalPanelController.show(session: session, relativeTo: button)
+        DispatchQueue.main.async { [weak self] in
+            self?.terminalPanelController.show(session: session, relativeTo: button)
+        }
     }
 
     private func closeTerminal(_ session: TerminalSession) {
