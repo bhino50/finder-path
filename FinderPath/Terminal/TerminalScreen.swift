@@ -342,6 +342,18 @@ struct TerminalScreen {
         let targetColumns = max(newColumns, 1)
         guard targetRows != rows || targetColumns != columns else { return }
 
+        // Rows dropped off the top when shrinking are preserved in scrollback
+        // (primary screen only) so resizing smaller never loses text outright.
+        let droppedRows = max(grid.count - targetRows, 0)
+        if droppedRows > 0, !usingAlternateScreen, scrollbackLimit > 0 {
+            for row in 0..<droppedRows {
+                scrollback.append(grid[row])
+            }
+            if scrollback.count > scrollbackLimit {
+                scrollback.removeFirst(scrollback.count - scrollbackLimit)
+            }
+        }
+
         grid = Self.resizeGrid(grid, rows: targetRows, columns: targetColumns)
         if let saved = savedPrimary {
             savedPrimary = (

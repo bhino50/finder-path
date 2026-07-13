@@ -39,6 +39,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private let tabsStack = NSStackView()
     private let restartButton = NSButton()
     private let pinButton = NSButton()
+    private let closePanelButton = NSButton()
     private let resizeGrip = ResizeGripView()
 
     private var popover: NSPopover?
@@ -119,6 +120,20 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             return
         }
         presentPanel()
+    }
+
+    /// Hides whichever surface is showing. Sessions keep running in the store,
+    /// so reopening restores them.
+    private func dismiss() {
+        if isPinned {
+            panel?.orderOut(nil)
+        } else {
+            popover?.performClose(nil)
+        }
+    }
+
+    @objc private func closePanelClicked() {
+        dismiss()
     }
 
     private func ensurePopover() -> NSPopover {
@@ -238,6 +253,11 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     }
 
     private func activateCurrentOrFirstSession() {
+        // Never present an empty window: if nothing is open, start a terminal
+        // in the current Finder folder so there is always something to show.
+        if store.sessions.isEmpty {
+            _ = store.newSession(name: nil, workingDirectory: newSessionDirectory())
+        }
         if let session = activeSession {
             activate(session)
             return
@@ -254,6 +274,12 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             session.onStatusChange = { [weak self] in self?.sessionStatusDidChange() }
             // Follow the shell title so the tab renames itself to the running task.
             session.onTitleChange = { [weak self] in self?.rebuildTabs() }
+        }
+        // Closing the last terminal dismisses the window rather than leaving an
+        // empty shell on screen.
+        if store.sessions.isEmpty && isPresented {
+            dismiss()
+            return
         }
         normalizeActiveSession()
         rebuildTabs()
@@ -360,11 +386,21 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         pinButton.action = #selector(pinClicked(_:))
         updatePinButton()
 
+        closePanelButton.isBordered = false
+        closePanelButton.setButtonType(.momentaryChange)
+        closePanelButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close terminals")
+        if closePanelButton.image == nil { closePanelButton.title = "Close" }
+        closePanelButton.contentTintColor = .secondaryLabelColor
+        closePanelButton.target = self
+        closePanelButton.action = #selector(closePanelClicked)
+        closePanelButton.toolTip = "Close this window (terminals keep running in the background)"
+
         topBar.addArrangedSubview(tabsStack)
         topBar.addArrangedSubview(spacer)
         topBar.addArrangedSubview(plusButton)
         topBar.addArrangedSubview(restartButton)
         topBar.addArrangedSubview(pinButton)
+        topBar.addArrangedSubview(closePanelButton)
 
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(topBar)
@@ -402,7 +438,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             width: min(max(requested.width, Layout.minimumSize.width), Layout.maximumSize.width),
             height: min(max(requested.height, Layout.minimumSize.height), Layout.maximumSize.height)
         )
-        contentView.frame.size = clamped
+        // Drive the popover only; it resizes its content view and Auto Layout
+        // lays out the subviews. Setting the content frame by hand as well
+        // fights that and can blank the terminal mid-drag.
         popover?.contentSize = clamped
     }
 
