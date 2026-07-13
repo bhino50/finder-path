@@ -12,6 +12,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         static let minimumSize = NSSize(width: 380, height: 240)
         static let maximumSize = NSSize(width: 1600, height: 1100)
         static let gripSize: CGFloat = 16
+        static let maxTabWidth: CGFloat = 160
         static let topBarHeight: CGFloat = 28
         static let topBarSpacing: CGFloat = 4
         static let topBarInset: CGFloat = 6
@@ -428,6 +429,10 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.setButtonType(.momentaryChange)
         button.tag = index
         button.attributedTitle = Self.tabTitle(name: session.displayName, status: session.status, isActive: isActive)
+        button.lineBreakMode = .byTruncatingTail
+        button.cell?.lineBreakMode = .byTruncatingTail
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        button.widthAnchor.constraint(lessThanOrEqualToConstant: Layout.maxTabWidth).isActive = true
         button.toolTip = "\(session.workingDirectory)\nDouble-click or right-click to rename; use the × to close"
         button.onRightClick = { [weak self] in self?.renameSession(session) }
         button.onDoubleClick = { [weak self] in self?.renameSession(session) }
@@ -452,23 +457,25 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         return button
     }
 
-    /// Dot + name rendered as one attributed title: a 6pt U+25CF indicator
-    /// (green while running, dimmed otherwise) leading the session name.
+    /// The session name only — no status circle. Exited/failed sessions dim so
+    /// the state still reads without a leading dot. Truncation and the tab
+    /// width cap keep a long title from stretching the strip.
     private static func tabTitle(name: String, status: TerminalSession.Status, isActive: Bool) -> NSAttributedString {
-        let dotColor: NSColor = status == .running ? .systemGreen : .tertiaryLabelColor
-        let title = NSMutableAttributedString(string: "\u{25CF} ", attributes: [
-            .font: NSFont.systemFont(ofSize: Layout.dotFontSize),
-            .foregroundColor: dotColor,
-            .baselineOffset: Layout.dotBaselineOffset,
-        ])
         let nameFont = isActive
             ? NSFont.boldSystemFont(ofSize: Layout.tabFontSize)
             : NSFont.systemFont(ofSize: Layout.tabFontSize)
-        title.append(NSAttributedString(string: name, attributes: [
+        let color: NSColor
+        switch status {
+        case .exited, .failed: color = .tertiaryLabelColor
+        case .running, .notStarted: color = .labelColor
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        return NSAttributedString(string: name, attributes: [
             .font: nameFont,
-            .foregroundColor: NSColor.labelColor,
-        ]))
-        return title
+            .foregroundColor: color,
+            .paragraphStyle: paragraph,
+        ])
     }
 
     // MARK: - Button helpers

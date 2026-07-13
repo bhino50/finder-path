@@ -37,10 +37,14 @@ final class TerminalSession: Identifiable {
 
     /// The tab label: a manual rename wins; otherwise the shell's title (the
     /// running command or directory) when it has set one; otherwise the name.
+    /// Capped so a very long title cannot stretch the tab strip or menu.
     var displayName: String {
         if hasCustomName { return name }
         let title = screen.title.trimmingCharacters(in: .whitespaces)
-        return title.isEmpty ? name : title
+        let base = title.isEmpty ? name : title
+        let maxLength = 28
+        guard base.count > maxLength else { return base }
+        return String(base.prefix(maxLength - 1)).trimmingCharacters(in: .whitespaces) + "\u{2026}"
     }
 
     private let shellPath: String
