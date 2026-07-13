@@ -248,6 +248,105 @@ struct FinderPathTerminalTests {
         screen.apply(.setTitle("build"))
         expect(screen.title == "build", "title tracked")
 
+        // MARK: - Input encoder
+
+        expect(TerminalInputEncoder.encode(text: "ls") == Array("ls".utf8), "plain text passes through")
+        expect(
+            TerminalInputEncoder.encode(specialKey: .up, applicationCursorKeys: false) == [0x1B, 0x5B, 0x41],
+            "up arrow is CSI A"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .up, applicationCursorKeys: true) == [0x1B, 0x4F, 0x41],
+            "application mode up arrow is SS3 A"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .backspace, applicationCursorKeys: false) == [0x7F],
+            "backspace sends DEL"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .enter, applicationCursorKeys: false) == [0x0D],
+            "enter sends CR"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .escape, applicationCursorKeys: false) == [0x1B],
+            "escape sends ESC"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .forwardDelete, applicationCursorKeys: false) == Array("\u{1B}[3~".utf8),
+            "forward delete is CSI 3~"
+        )
+        expect(
+            TerminalInputEncoder.encode(specialKey: .function(1), applicationCursorKeys: false) == [0x1B, 0x4F, 0x50],
+            "F1 is SS3 P"
+        )
+        expect(TerminalInputEncoder.encodeControl(character: "c") == [0x03], "ctrl-c is ETX")
+        expect(TerminalInputEncoder.encodeControl(character: "A") == [0x01], "ctrl-A is SOH")
+        expect(TerminalInputEncoder.encodeControl(character: "[") == [0x1B], "ctrl-[ is ESC")
+        expect(TerminalInputEncoder.encodeControl(character: "1") == nil, "ctrl-1 has no encoding")
+        expect(
+            TerminalInputEncoder.encodePaste("hi", bracketed: false) == Array("hi".utf8),
+            "unbracketed paste passes through"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("hi", bracketed: true)
+                == Array("\u{1B}[200~".utf8) + Array("hi".utf8) + Array("\u{1B}[201~".utf8),
+            "bracketed paste wraps content"
+        )
+        expect(
+            !TerminalInputEncoder.encodePaste("a\u{1B}[201~b", bracketed: true).dropFirst(6).dropLast(6).contains(0x1B),
+            "bracketed paste strips ESC bytes from content"
+        )
+
+        // MARK: - PTY round trip (real child process)
+
+        do {
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "printf ready"],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            let outputLock = NSLock()
+            var collected: [UInt8] = []
+            let exitSemaphore = DispatchSemaphore(value: 0)
+            var reportedExit: Int32 = -999
+
+            pty.onOutput = { bytes in
+                outputLock.lock()
+                collected.append(contentsOf: bytes)
+                outputLock.unlock()
+            }
+            pty.onExit = { code in
+                reportedExit = code
+                exitSemaphore.signal()
+            }
+
+            do {
+                try pty.launch()
+                let exited = exitSemaphore.wait(timeout: .now() + 5)
+                expect(exited == .success, "PTY child should exit within the timeout")
+                expect(reportedExit == 0, "PTY should report the child's exit code 0")
+
+                // Output can drain fractionally after the exit signal since the
+                // read source and reaper run on separate queues; poll briefly.
+                var text = ""
+                for _ in 0..<100 {
+                    outputLock.lock()
+                    text = String(decoding: collected, as: UTF8.self)
+                    outputLock.unlock()
+                    if text.contains("ready") { break }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                expect(text.contains("ready"), "PTY should relay the child's stdout")
+            } catch {
+                failures.append("PTY launch threw: \(error)")
+            }
+        }
+
+        expect(!PTYProcess.defaultShell().isEmpty, "default shell resolves to a non-empty path")
+
         // MARK: - Result
 
         if failures.isEmpty {
