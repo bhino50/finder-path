@@ -39,6 +39,11 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 
     private var popover: NSPopover?
     private var panel: NSPanel?
+    /// Outside-click dismissal for the popover. We manage it ourselves because
+    /// AppKit's .transient behavior also closes on Return and Escape, which are
+    /// essential terminal keys — so the popover uses .applicationDefined and
+    /// this monitor closes it only on a click in another app.
+    private var popoverDismissMonitor: Any?
     private var activeSessionID: UUID?
     /// Anchor for re-showing the popover after unpinning. Held weakly so the
     /// panel never keeps status bar machinery alive.
@@ -87,7 +92,28 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         let popover = ensurePopover()
         activateCurrentOrFirstSession()
         popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
+        installPopoverDismissMonitor()
+        NSApp.activate(ignoringOtherApps: true)
         terminalView.focusTerminal()
+    }
+
+    /// Closes the popover on a click in another application, replacing the
+    /// keystroke-sensitive dismissal that .transient would have provided.
+    private func installPopoverDismissMonitor() {
+        guard popoverDismissMonitor == nil else { return }
+        popoverDismissMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            guard let self, let popover = self.popover, popover.isShown else { return }
+            popover.performClose(nil)
+        }
+    }
+
+    private func removePopoverDismissMonitor() {
+        if let monitor = popoverDismissMonitor {
+            NSEvent.removeMonitor(monitor)
+            popoverDismissMonitor = nil
+        }
     }
 
     private func presentPanel() {
@@ -118,7 +144,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         let viewController = NSViewController()
         viewController.view = contentView
         let created = NSPopover()
-        created.behavior = .transient
+        // .applicationDefined (not .transient) so typing Return or Escape in
+        // the terminal does not dismiss the popover; we close it ourselves.
+        created.behavior = .applicationDefined
         created.contentViewController = viewController
         created.contentSize = contentView.frame.size
         created.delegate = self
@@ -178,6 +206,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     // MARK: - Popover size persistence
 
     func popoverDidClose(_ notification: Notification) {
+        removePopoverDismissMonitor()
         persistPopoverSize()
     }
 

@@ -30,6 +30,11 @@ final class TerminalView: NSView {
         let cellWidth: CGFloat
         let cellHeight: CGFloat
         let ascent: CGFloat
+        /// The font's natural glyph advance before rounding the cell to whole
+        /// pixels. The gap between this and cellWidth is applied as per-glyph
+        /// kerning so text lands on the same integer grid as the cursor and
+        /// backgrounds instead of drifting right across the row.
+        let kern: CGFloat
 
         init(fontSize: CGFloat) {
             font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
@@ -44,6 +49,7 @@ final class TerminalView: NSView {
             cellWidth = ceil(CGFloat(advance))
             cellHeight = ceil(probeAscent + probeDescent + probeLeading) + 1
             ascent = probeAscent
+            kern = cellWidth - CGFloat(advance)
         }
     }
 
@@ -287,6 +293,9 @@ final class TerminalView: NSView {
         var attributes: [NSAttributedString.Key: Any] = [
             .font: style.bold ? metrics.boldFont : metrics.font,
             NSAttributedString.Key(kCTForegroundColorAttributeName as String): foreground.cgColor,
+            // Pin every glyph to the integer cell grid so text stays aligned
+            // with the cursor and backgrounds across the whole row.
+            NSAttributedString.Key(kCTKernAttributeName as String): metrics.kern,
         ]
         if style.underline {
             attributes[NSAttributedString.Key(kCTUnderlineStyleAttributeName as String)] =
