@@ -21,3 +21,29 @@ TARGET="$(uname -m)-apple-macos13.0"
   -o "$TEST_BINARY"
 
 "$TEST_BINARY"
+
+# Terminal emulator logic tests build as a second binary so the terminal
+# subsystem's UI-free files stay covered without linking the whole app.
+TERMINAL_TEST_BINARY="$BUILD_DIR/FinderPathTerminalTests"
+TERMINAL_SRCS=()
+for CANDIDATE in \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalTypes.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalParser.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalScreen.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalInputEncoder.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/PTYProcess.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalSession.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalSessionStore.swift"; do
+  [[ -f "$CANDIDATE" ]] && TERMINAL_SRCS+=("$CANDIDATE")
+done
+
+"$SWIFTC" \
+  -parse-as-library \
+  -O \
+  -target "$TARGET" \
+  "${TERMINAL_SRCS[@]}" \
+  "$ROOT_DIR/Tests/TerminalLogicTests.swift" \
+  -framework AppKit \
+  -o "$TERMINAL_TEST_BINARY"
+
+"$TERMINAL_TEST_BINARY"
