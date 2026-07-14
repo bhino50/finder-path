@@ -226,18 +226,27 @@ struct FinderPathTerminalTests {
         expect(!screen.usingAlternateScreen, "back to primary screen")
         expect(screen.lineText(0) == "abc", "primary content restored")
 
-        // Resizing the alternate screen hands the app a clean slate: it repaints
-        // fully on the following SIGWINCH, so reflowing the old absolutely-
-        // positioned frame only leaves mangled overlap (the garbled Claude Code
-        // frame after a window resize). Primary-screen resize still reflows.
+        // Keep the last alternate-screen frame visible through resize. TUIs do
+        // not all repaint synchronously after SIGWINCH (Hermes is one example),
+        // so clearing first creates a permanently blank terminal when no full
+        // redraw follows.
         screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
         screen.apply(.setMode(.alternateScreen, true))
         for character in "claude" { screen.apply(.print(character)) }
         expect(screen.lineText(0) == "claude", "alt screen holds the drawn frame")
         screen.resize(rows: 2, columns: 3)
         expect(screen.columns == 3, "alt-screen resize applies the new width")
-        expect(screen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty,
-               "alt-screen resize clears to a clean slate, not a truncated frame")
+        expect(screen.lineText(0) == "cla", "alt-screen resize preserves the visible part of the frame")
+        screen.resize(rows: 2, columns: 6)
+        expect(screen.lineText(0) == "claude", "alt-screen grow restores temporarily hidden frame cells")
+
+        screen = TerminalScreen(rows: 4, columns: 6, scrollbackLimit: 10)
+        screen.apply(.setMode(.alternateScreen, true))
+        for character in "header" { screen.apply(.print(character)) }
+        screen.apply(.moveCursor(row: 4, column: 1))
+        for character in "footer" { screen.apply(.print(character)) }
+        screen.resize(rows: 2, columns: 6)
+        expect(screen.lineText(0) == "header", "alt-screen height shrink keeps top-anchored TUI content")
 
         // MARK: - Screen: resize keeps the bottom rows
 
