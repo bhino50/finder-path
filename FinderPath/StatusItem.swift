@@ -2,6 +2,13 @@ import AppKit
 
 @MainActor
 final class StatusItemController: NSObject {
+    private struct HarnessMenuItemBinding {
+        let item: NSMenuItem
+        let name: String
+        let externalAction: Selector
+        let terminalAction: Selector
+    }
+
     var onOpenWelcomeGuide: (() -> Void)?
 
     private let state = FinderPathState()
@@ -11,6 +18,9 @@ final class StatusItemController: NSObject {
     private var settingsWindowController: SettingsWindowController?
     private var remoteConnectionWindowController: RemoteConnectionWindowController?
     private var copyConfirmationTask: Task<Void, Never>?
+    private var isMenuTracking = false
+    private var menuOptionHeld = false
+    private var harnessMenuItemBindings: [HarnessMenuItemBinding] = []
 
     // Lazy so the panel (and its views) only exist once terminals are used.
     // New sessions start in the current Finder folder when it is a real path,
@@ -69,20 +79,53 @@ final class StatusItemController: NSObject {
         // with the last-known path (or a fetching placeholder) and updates in
         // place when the result lands — NSMenu supports mutation while open.
         // A beachballed Finder can no longer freeze the click.
-        let optionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
+        menuOptionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
+        isMenuTracking = true
         state.refresh { [weak self] in
-            guard let self else { return }
-            self.rebuildMenu(self.menu, optionHeld: optionHeld)
+            guard let self, self.isMenuTracking else { return }
+            // Re-read the live modifier state: this rebuild runs mid-track, so a
+            // stale menuOptionHeld would rebuild the harness rows in the wrong
+            // (external vs terminal) form until the next poll corrects it.
+            self.menuOptionHeld = NSEvent.modifierFlags.contains(.option)
+            self.rebuildMenu(self.menu, optionHeld: self.menuOptionHeld)
         }
-        rebuildMenu(menu, optionHeld: optionHeld)
+        rebuildMenu(menu, optionHeld: menuOptionHeld)
+
+        // NSMenu.popUp runs its own tracking loop that bypasses local
+        // flagsChanged monitors, so poll the current modifier state while the
+        // menu is visible. The menu's tracking mode is NOT .eventTracking — it
+        // is one of the common modes — so the timer must be scheduled in
+        // .common or it never fires during tracking (Option would then only swap
+        // when held before the menu opens, not while it is already open).
+        let modifierPollingTimer = Timer(
+            timeInterval: 1.0 / 30.0,
+            target: self,
+            selector: #selector(pollMenuModifierFlags(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(modifierPollingTimer, forMode: .common)
+
+        defer {
+            isMenuTracking = false
+            modifierPollingTimer.invalidate()
+        }
         sender.highlight(true)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
         sender.highlight(false)
     }
 
+    @objc private func pollMenuModifierFlags(_: Timer) {
+        let optionHeld = NSEvent.modifierFlags.contains(.option)
+        guard optionHeld != menuOptionHeld else { return }
+        menuOptionHeld = optionHeld
+        updateHarnessMenuItems(optionHeld: optionHeld)
+    }
+
     private func rebuildMenu(_ menu: NSMenu, optionHeld: Bool) {
         menu.removeAllItems()
         menu.autoenablesItems = false
+        harnessMenuItemBindings.removeAll(keepingCapacity: true)
 
         let isPermissionDenied = FinderBridge.isPermissionDenied(state.currentPath)
 
@@ -189,10 +232,10 @@ final class StatusItemController: NSObject {
         }
 
         // Each agent launcher opens an external terminal by default; holding
-        // Option when the menu opens swaps it to run the agent inside the
-        // built-in FinderPath terminal. Menus shown with popUp do not drive
-        // AppKit's live alternate-item swap, so the modifier is read once when
-        // the menu is built (hold Option, then open the menu).
+        // Option swaps each launcher to run the agent inside the built-in
+        // FinderPath terminal. Menus shown with popUp do not drive AppKit's
+        // live alternate-item swap, so statusItemClicked polls the modifier
+        // state and updates these rows while the menu is open.
         func addHarnessItem(show: Bool, executable: String, name: String, externalAction: Selector, terminalAction: Selector) {
             guard show else { return }
             let availability = AgentLauncher.availability(for: executable)
@@ -210,6 +253,14 @@ final class StatusItemController: NSObject {
             item.target = self
             item.isEnabled = state.hasCopyablePath
             menu.addItem(item)
+            harnessMenuItemBindings.append(
+                HarnessMenuItemBinding(
+                    item: item,
+                    name: name,
+                    externalAction: externalAction,
+                    terminalAction: terminalAction
+                )
+            )
         }
 
         addHarnessItem(
@@ -296,6 +347,19 @@ final class StatusItemController: NSObject {
             let quitItem = NSMenuItem(title: "Quit FinderPath", action: #selector(quitMenuItem), keyEquivalent: "q")
             quitItem.target = self
             menu.addItem(quitItem)
+        }
+    }
+
+    private func updateHarnessMenuItems(optionHeld: Bool) {
+        for binding in harnessMenuItemBindings {
+            let presentation = AgentLauncher.menuPresentation(
+                name: binding.name,
+                optionHeld: optionHeld
+            )
+            binding.item.title = presentation.title
+            binding.item.action = presentation.usesBuiltInTerminal
+                ? binding.terminalAction
+                : binding.externalAction
         }
     }
 
