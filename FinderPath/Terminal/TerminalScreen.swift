@@ -381,20 +381,22 @@ struct TerminalScreen {
             }
         }
 
-        if usingAlternateScreen {
-            // A full-screen (alternate-screen) app owns its buffer and repaints
-            // it on the SIGWINCH that follows a resize. Reflowing the old,
-            // absolutely-positioned frame into the new width leaves mangled
-            // overlap the app's redraw may not fully clear (e.g. a resized
-            // Claude Code / vim frame), so hand it a clean slate instead.
-            grid = Self.blankGrid(rows: targetRows, columns: targetColumns)
-        } else {
-            grid = Self.resizeGrid(grid, rows: targetRows, columns: targetColumns)
-        }
+        // Preserve both primary and alternate-screen contents until the child
+        // actually redraws them. Some TUIs repaint asynchronously after
+        // SIGWINCH and some (including Hermes in the observed failure) do not
+        // issue an immediate full repaint. Clearing the alternate grid here
+        // therefore turns a routine resize into a permanently blank terminal.
+        grid = Self.resizeGrid(
+            grid,
+            rows: targetRows,
+            columns: targetColumns,
+            keepTopRows: usingAlternateScreen
+        )
         if let saved = savedPrimary {
+            let savedDroppedTop = max(rows - targetRows, 0)
             savedPrimary = (
                 Self.resizeGrid(saved.grid, rows: targetRows, columns: targetColumns),
-                min(saved.cursorRow, targetRows - 1),
+                min(max(saved.cursorRow - savedDroppedTop, 0), targetRows - 1),
                 min(saved.cursorColumn, targetColumns - 1)
             )
         }
@@ -406,16 +408,25 @@ struct TerminalScreen {
         columns = targetColumns
         regionTop = 0
         regionBottom = rows - 1
-        cursorRow = clampRow(cursorRow - droppedTop)
+        // Primary shells stay bottom-anchored so their active prompt survives a
+        // height shrink. Alternate-screen TUIs are absolute/top-anchored; moving
+        // their cursor up by droppedTop would shift the preserved frame.
+        cursorRow = clampRow(cursorRow - (usingAlternateScreen ? 0 : droppedTop))
         cursorColumn = clampColumn(cursorColumn)
         pendingWrap = false
     }
 
-    private static func resizeGrid(_ source: [[TerminalCell]], rows: Int, columns: Int) -> [[TerminalCell]] {
-        // Shrinking keeps the BOTTOM rows: the cursor and most recent output
-        // live there, so dropping the top preserves what the user is looking
-        // at instead of discarding the active prompt line.
-        var result = source.suffix(rows).map { line -> [TerminalCell] in
+    private static func resizeGrid(
+        _ source: [[TerminalCell]],
+        rows: Int,
+        columns: Int,
+        keepTopRows: Bool = false
+    ) -> [[TerminalCell]] {
+        // Primary shells keep the bottom rows where their active prompt lives.
+        // Alternate-screen TUIs use absolute coordinates and keep their top
+        // rows so headers/content do not disappear in favor of blank footer rows.
+        let retainedRows = keepTopRows ? source.prefix(rows) : source.suffix(rows)
+        var result = retainedRows.map { line -> [TerminalCell] in
             // Keep cells beyond the temporarily visible width. If the user
             // widens the terminal again before that row is overwritten, its
             // right-hand content reappears instead of being destroyed.
