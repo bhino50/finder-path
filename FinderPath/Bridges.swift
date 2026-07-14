@@ -148,6 +148,23 @@ struct AgentAvailability: Equatable, Sendable {
 }
 
 nonisolated enum AgentLauncher {
+    struct MenuPresentation: Equatable {
+        let title: String
+        let usesBuiltInTerminal: Bool
+    }
+
+    /// Menus presented with `NSMenu.popUp` do not reliably perform AppKit's
+    /// live alternate-item swap. Choose the visible row while building the
+    /// menu instead, using the modifier state captured from the status click.
+    static func menuPresentation(name: String, optionHeld: Bool) -> MenuPresentation {
+        MenuPresentation(
+            title: optionHeld
+                ? "Open with \(name) in FinderPath Terminal"
+                : "Open with \(name)",
+            usesBuiltInTerminal: optionHeld
+        )
+    }
+
     static func availability(for executable: String, defaultExecutable: String? = nil) -> AgentAvailability {
         let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable

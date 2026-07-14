@@ -51,6 +51,8 @@ enum TerminalMode: Equatable, Sendable {
 }
 
 enum TerminalAction: Equatable, Sendable {
+    /// ESC c (RIS): restore the emulator's complete initial state.
+    case hardReset
     case print(Character)
     case lineFeed
     case carriageReturn

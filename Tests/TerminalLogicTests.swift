@@ -247,10 +247,10 @@ struct FinderPathTerminalTests {
         expect(screen.cursorRow == 2, "cursor sits on the bottom row before resize")
         screen.resize(rows: 2, columns: 2)
         expect(screen.rows == 2 && screen.columns == 2, "resize applies dimensions")
-        expect(screen.lineText(1) == "ab", "shrink keeps the bottom row and truncates columns")
+        expect(screen.lineText(1) == "ab", "shrink keeps the visible left side of the bottom row")
         expect(screen.cursorRow == 1, "cursor tracks its retained line after shrink")
         screen.resize(rows: 4, columns: 6)
-        expect(screen.lineText(1) == "ab    ", "grow pads columns and adds new rows at the bottom")
+        expect(screen.lineText(1) == "abcd  ", "grow restores right-side content hidden by a temporary shrink")
 
         // MARK: - Screen: modes and title
 
@@ -296,9 +296,60 @@ struct FinderPathTerminalTests {
             "F1 is SS3 P"
         )
         expect(TerminalInputEncoder.encodeControl(character: "c") == [0x03], "ctrl-c is ETX")
+        expect(TerminalInputEncoder.encodeControl(character: "c", meta: true) == [0x1B, 0x03], "Option-ctrl-c is ESC-prefixed ETX")
         expect(TerminalInputEncoder.encodeControl(character: "A") == [0x01], "ctrl-A is SOH")
         expect(TerminalInputEncoder.encodeControl(character: "[") == [0x1B], "ctrl-[ is ESC")
         expect(TerminalInputEncoder.encodeControl(character: "1") == nil, "ctrl-1 has no encoding")
+        expect(TerminalInputEncoder.encode(text: "b", meta: true) == [0x1B, 0x62], "Option-b is Meta-b")
+        expect(
+            TerminalInputEncoder.encode(
+                specialKey: .left,
+                modifiers: [.option],
+                applicationCursorKeys: false
+            ) == Array("\u{1B}[1;3D".utf8),
+            "Option-left uses the xterm modifier parameter"
+        )
+        expect(
+            TerminalInputEncoder.encode(
+                specialKey: .up,
+                modifiers: [.shift, .control],
+                applicationCursorKeys: true
+            ) == Array("\u{1B}[1;6A".utf8),
+            "modified arrows use CSI even while application cursor mode is active"
+        )
+        expect(
+            TerminalInputEncoder.encode(
+                specialKey: .tab,
+                modifiers: [.shift],
+                applicationCursorKeys: false
+            ) == Array("\u{1B}[Z".utf8),
+            "Shift-tab sends CSI Z"
+        )
+        expect(
+            TerminalInputEncoder.encode(
+                specialKey: .tab,
+                modifiers: [.shift, .option],
+                applicationCursorKeys: false
+            ) == Array("\u{1B}[1;4Z".utf8),
+            "Option-Shift-tab preserves both modifiers"
+        )
+        expect(
+            TerminalInputEncoder.encode(
+                specialKey: .tab,
+                modifiers: [.shift, .control],
+                applicationCursorKeys: false
+            ) == Array("\u{1B}[1;6Z".utf8),
+            "Control-Shift-tab preserves both modifiers"
+        )
+        for functionKey in 1...12 {
+            expect(
+                !TerminalInputEncoder.encode(
+                    specialKey: .function(functionKey),
+                    applicationCursorKeys: false
+                ).isEmpty,
+                "F\(functionKey) has a terminal sequence"
+            )
+        }
         expect(
             TerminalInputEncoder.encodePaste("hi", bracketed: false) == Array("hi".utf8),
             "unbracketed paste passes through"
@@ -322,14 +373,57 @@ struct FinderPathTerminalTests {
         var palColon = CellStyle.plain
         palColon.foreground = .palette(196)
         expect(colonParser.parse(Array("\u{1B}[38:5:196m".utf8)) == [.setStyle(palColon)], "colon palette SGR parses")
+        expect(
+            colonParser.parse(Array("\u{1B}[38:2::10:20:30m".utf8)) == [.setStyle(rgbColon)],
+            "colon truecolor SGR ignores the optional empty colorspace slot"
+        )
 
         // MARK: - Parser: RIS hard reset
 
         var risParser = TerminalParser()
         let risActions = risParser.parse(Array("\u{1B}c".utf8))
-        expect(risActions.contains(.setMode(.alternateScreen, false)), "RIS exits the alternate screen")
-        expect(risActions.contains(.setMode(.autowrap, true)), "RIS restores autowrap")
-        expect(risActions.contains(.eraseInDisplay(2)), "RIS clears the screen")
+        expect(risActions == [.hardReset], "RIS emits one atomic hard-reset action")
+        var resetScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        resetScreen.apply(.moveCursor(row: 3, column: 4))
+        resetScreen.apply(.saveCursor)
+        resetScreen.apply(.setMode(.bracketedPaste, true))
+        resetScreen.apply(.setMode(.applicationCursorKeys, true))
+        resetScreen.apply(.setMode(.cursorVisible, false))
+        resetScreen.apply(.setMode(.autowrap, false))
+        resetScreen.apply(.setMode(.alternateScreen, true))
+        resetScreen.apply(.setTitle("stale title"))
+        resetScreen.apply(.print("x"))
+        resetScreen.apply(.hardReset)
+        expect(!resetScreen.usingAlternateScreen, "RIS exits the alternate screen")
+        expect(resetScreen.autowrap, "RIS restores autowrap")
+        expect(!resetScreen.bracketedPaste, "RIS disables bracketed paste")
+        expect(!resetScreen.applicationCursorKeys, "RIS disables application cursor keys")
+        expect(resetScreen.cursorVisible, "RIS restores cursor visibility")
+        expect(resetScreen.title.isEmpty, "RIS clears the stale terminal title")
+        expect(resetScreen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty, "RIS clears the screen")
+        resetScreen.apply(.restoreCursor)
+        expect(resetScreen.cursorRow == 0 && resetScreen.cursorColumn == 0, "RIS clears the saved cursor")
+
+        // MARK: - Session metadata
+
+        let metadataID = UUID()
+        let metadata = TerminalSessionMetadata(
+            id: metadataID,
+            name: "Production",
+            workingDirectory: "/tmp",
+            hasCustomName: true
+        )
+        expect(
+            TerminalSessionStore.decodeMetadata(TerminalSessionStore.encodeMetadata([metadata])) == [metadata],
+            "session metadata preserves manual-name precedence"
+        )
+        let legacyMetadata = Data(
+            "[{\"id\":\"\(metadataID.uuidString)\",\"name\":\"Terminal 1\",\"workingDirectory\":\"/tmp\"}]".utf8
+        )
+        expect(
+            TerminalSessionStore.decodeMetadata(legacyMetadata).first?.hasCustomName == false,
+            "FinderPath 1.6 session metadata decodes with an unpinned legacy name"
+        )
 
         // MARK: - Screen: hostile counts are clamped to the region
 
@@ -456,6 +550,121 @@ struct FinderPathTerminalTests {
             } catch {
                 failures.append("deadlock regression launch threw: \(error)")
             }
+        }
+
+        // MARK: - PTY restart cleanup
+
+        do {
+            // A fast restart drops the old TerminalSession's PTY reference
+            // immediately. Its cleanup must remain alive long enough to kill a
+            // HUP-resistant child process rather than leaving it orphaned.
+            let pidFile = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("finderpath-pty-child-\(UUID().uuidString)")
+            let script = "trap '' HUP; sleep 30 & child=$!; printf '%s' \"$child\" > '\(pidFile.path)'; wait \"$child\""
+            var pty: PTYProcess? = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", script],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            pty?.onOutput = { _ in }
+            do {
+                try pty?.launch()
+                var descendantPID: pid_t = -1
+                for _ in 0..<200 {
+                    if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                       let parsed = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        descendantPID = parsed
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                expect(descendantPID > 1, "PTY cleanup test should capture the descendant PID")
+                pty?.terminate()
+                pty = nil // mirrors TerminalSession.restart() replacing the owner
+
+                if descendantPID > 1 {
+                    var disappeared = false
+                    for _ in 0..<500 {
+                        if kill(descendantPID, 0) == -1, errno == ESRCH {
+                            disappeared = true
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                    expect(disappeared, "fast PTY restart should not orphan a HUP-resistant descendant")
+                    if !disappeared { kill(descendantPID, SIGKILL) }
+                }
+            } catch {
+                failures.append("restart-cleanup regression launch threw: \(error)")
+            }
+            try? FileManager.default.removeItem(at: pidFile)
+        }
+
+        do {
+            // A pipeline/process-group leader can exit while another member of
+            // that group remains in the shell's session. Cleanup must find the
+            // live member by session rather than relying on the dead PGID leader.
+            let pidFile = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("finderpath-pty-orphaned-group-\(UUID().uuidString)")
+            let python = """
+            import os, signal, sys, time
+            leader = os.fork()
+            if leader == 0:
+                os.setpgid(0, 0)
+                member = os.fork()
+                if member == 0:
+                    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                    with open(sys.argv[1], 'w') as output:
+                        output.write(str(os.getpid()))
+                    time.sleep(30)
+                    os._exit(0)
+                os._exit(0)
+            os.waitpid(leader, 0)
+            time.sleep(30)
+            """
+            var pty: PTYProcess? = PTYProcess(
+                executable: "/usr/bin/python3",
+                arguments: ["-c", python, pidFile.path],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            pty?.onOutput = { _ in }
+            do {
+                try pty?.launch()
+                var orphanedGroupMember: pid_t = -1
+                for _ in 0..<300 {
+                    if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                       let parsed = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        orphanedGroupMember = parsed
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                expect(orphanedGroupMember > 1, "PTY cleanup test should capture the orphaned group member")
+                pty?.terminate()
+                pty = nil
+
+                if orphanedGroupMember > 1 {
+                    var disappeared = false
+                    for _ in 0..<500 {
+                        if kill(orphanedGroupMember, 0) == -1, errno == ESRCH {
+                            disappeared = true
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                    expect(disappeared, "PTY cleanup should kill a session member after its group leader exits")
+                    if !disappeared { kill(orphanedGroupMember, SIGKILL) }
+                }
+            } catch {
+                failures.append("orphaned-group cleanup launch threw: \(error)")
+            }
+            try? FileManager.default.removeItem(at: pidFile)
         }
 
         // MARK: - Result

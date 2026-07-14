@@ -15,7 +15,7 @@ struct TerminalParser {
         case oscEscape
     }
 
-    private static let maxParameterValue = 9999
+    private nonisolated static let maxParameterValue = 9999
     private static let maxParameterCount = 16
     private static let maxOSCLength = 2048
 
@@ -144,15 +144,10 @@ struct TerminalParser {
         case UInt8(ascii: "8"):
             actions.append(.restoreCursor)
         case UInt8(ascii: "c"):
-            // RIS hard reset: leave the alternate screen, restore autowrap and
-            // a full-height scroll region, then reset style, clear, and home.
+            // RIS hard reset is one atomic screen action so saved cursor,
+            // alternate-buffer, title, and mode state cannot leak through.
             currentStyle = .plain
-            actions.append(.setMode(.alternateScreen, false))
-            actions.append(.setMode(.autowrap, true))
-            actions.append(.setScrollRegion(top: 1, bottom: 0))
-            actions.append(.setStyle(.plain))
-            actions.append(.eraseInDisplay(2))
-            actions.append(.moveCursor(row: 1, column: 1))
+            actions.append(.hardReset)
         case UInt8(ascii: "="), UInt8(ascii: ">"):
             break // keypad modes, ignored
         case 0x1B:
@@ -284,11 +279,29 @@ struct TerminalParser {
     private static func sgrParameters(from buffer: String) -> [Int?] {
         let trimmed = buffer.drop(while: { "?><=".contains($0) })
         guard !trimmed.isEmpty else { return [] }
-        let flattened = trimmed.replacingOccurrences(of: ":", with: ";")
-        return flattened.split(separator: ";", omittingEmptySubsequences: false).prefix(maxParameterCount * 2).map {
-            guard let value = Int($0) else { return nil }
-            return min(value, maxParameterValue)
+        var values: [Int?] = []
+        for parameter in trimmed.split(separator: ";", omittingEmptySubsequences: false) {
+            let subparameters = parameter.split(separator: ":", omittingEmptySubsequences: false)
+            if subparameters.count >= 6,
+               (subparameters[0] == "38" || subparameters[0] == "48"),
+               subparameters[1] == "2" {
+                // ISO-8613-6 truecolor permits a colorspace-id slot:
+                // 38:2:<colorspace>:r:g:b. xterm commonly leaves it empty.
+                // The renderer supports sRGB, so ignore that slot deliberately.
+                values.append(clampedParameter(subparameters[0]))
+                values.append(clampedParameter(subparameters[1]))
+                values.append(contentsOf: subparameters[3...5].map(clampedParameter))
+            } else {
+                values.append(contentsOf: subparameters.map(clampedParameter))
+            }
+            if values.count >= maxParameterCount * 2 { break }
         }
+        return Array(values.prefix(maxParameterCount * 2))
+    }
+
+    private nonisolated static func clampedParameter<S: StringProtocol>(_ value: S) -> Int? {
+        guard let parsed = Int(value) else { return nil }
+        return min(parsed, maxParameterValue)
     }
 
     private mutating func applySGR(_ params: [Int?], into actions: inout [TerminalAction]) {

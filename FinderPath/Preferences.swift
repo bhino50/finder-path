@@ -35,6 +35,7 @@ enum FinderPathPreferences {
     static let terminalFontSizeKey = "terminalFontSize"
     static let terminalScrollbackLimitKey = "terminalScrollbackLimit"
     static let terminalShellOverrideKey = "terminalShellOverride"
+    static let terminalOptionAsMetaKey = "terminalOptionAsMeta"
     static let rightClickOpensTerminalsKey = "rightClickOpensTerminals"
     static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
 
@@ -77,6 +78,7 @@ enum FinderPathPreferences {
             terminalFontSizeKey: 12.0,
             terminalScrollbackLimitKey: 2000,
             terminalShellOverrideKey: "",
+            terminalOptionAsMetaKey: false,
             rightClickOpensTerminalsKey: true,
             completedWelcomeKey: false
         ])
@@ -233,6 +235,12 @@ enum FinderPathPreferences {
     static var terminalShellOverride: String {
         string(for: terminalShellOverrideKey, defaultValue: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Off by default so international keyboard layouts keep native Option
+    /// characters. Terminal users can opt into ESC-prefixed Meta behavior.
+    static var terminalOptionAsMeta: Bool {
+        bool(for: terminalOptionAsMetaKey, defaultValue: false)
     }
 
     static var rightClickOpensTerminals: Bool {

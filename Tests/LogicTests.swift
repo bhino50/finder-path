@@ -46,6 +46,16 @@ struct FinderPathLogicTests {
         expect(AgentLauncher.availability(for: "/bin/sh").resolvedPath == "/bin/sh", "absolute executables should resolve")
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")
         expect(!AgentLauncher.availability(for: "finderpath-command-that-does-not-exist").isInstalled, "missing executables should not resolve")
+        expect(
+            AgentLauncher.menuPresentation(name: "Codex", optionHeld: false)
+                == .init(title: "Open with Codex", usesBuiltInTerminal: false),
+            "normal harness menu row should use the external launcher"
+        )
+        expect(
+            AgentLauncher.menuPresentation(name: "Codex", optionHeld: true)
+                == .init(title: "Open with Codex in FinderPath Terminal", usesBuiltInTerminal: true),
+            "Option-held harness menu row should use FinderPath Terminal"
+        )
 
         expect(
             FinderBridge.interpretScriptResult(

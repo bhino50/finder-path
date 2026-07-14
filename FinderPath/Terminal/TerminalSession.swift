@@ -190,9 +190,11 @@ final class TerminalSession: Identifiable {
 
     // MARK: - Debug byte capture
 
-    /// Opt-in raw PTY capture for diagnosing render issues: set the environment
-    /// variable FINDERPATH_TERMINAL_LOG=1 to append to ~/finderpath-terminal.log,
-    /// or =<path> for a custom file. Off (nil) by default.
+    /// Opt-in Debug-only raw PTY capture for diagnosing render issues: set the
+    /// environment variable FINDERPATH_TERMINAL_LOG=1 to append to
+    /// ~/finderpath-terminal.log, or =<path> for a custom file. Release builds
+    /// never capture terminal contents.
+    #if DEBUG
     private static let debugLogURL: URL? = {
         guard let value = ProcessInfo.processInfo.environment["FINDERPATH_TERMINAL_LOG"],
               !value.isEmpty else { return nil }
@@ -201,6 +203,10 @@ final class TerminalSession: Identifiable {
         }
         return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
     }()
+    #else
+    private static let debugLogURL: URL? = nil
+    #endif
+    private static let maximumDebugLogBytes: UInt64 = 5 * 1024 * 1024
 
     /// Appends the exact bytes handed to the parser as space-separated hex, one
     /// line per chunk. All failures are swallowed so logging never disrupts I/O.
@@ -208,13 +214,25 @@ final class TerminalSession: Identifiable {
         guard let url = Self.debugLogURL, !bytes.isEmpty else { return }
         let line = bytes.map { String(format: "%02x", $0) }.joined(separator: " ") + "\n"
         guard let data = line.data(using: .utf8) else { return }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let existingSize = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        if existingSize + UInt64(data.count) > Self.maximumDebugLogBytes {
+            try? data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return
+        }
         if let handle = try? FileHandle(forWritingTo: url) {
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: data)
         } else {
-            try? data.write(to: url)
+            _ = FileManager.default.createFile(
+                atPath: url.path,
+                contents: data,
+                attributes: [.posixPermissions: 0o600]
+            )
         }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     private func replyToDeviceStatus(_ code: Int) {
@@ -232,13 +250,21 @@ final class TerminalSession: Identifiable {
 
     // MARK: - Input
 
-    func send(text: String) {
-        pty?.write(TerminalInputEncoder.encode(text: text))
+    func send(text: String, meta: Bool = false) {
+        pty?.write(TerminalInputEncoder.encode(text: text, meta: meta))
     }
 
-    func send(special: TerminalInputEncoder.SpecialKey) {
+    func send(bytes: [UInt8]) {
+        pty?.write(bytes)
+    }
+
+    func send(
+        special: TerminalInputEncoder.SpecialKey,
+        modifiers: TerminalInputEncoder.Modifiers = []
+    ) {
         let bytes = TerminalInputEncoder.encode(
             specialKey: special,
+            modifiers: modifiers,
             applicationCursorKeys: screen.applicationCursorKeys
         )
         pty?.write(bytes)

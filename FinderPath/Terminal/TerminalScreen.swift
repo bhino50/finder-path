@@ -63,13 +63,15 @@ struct TerminalScreen {
 
     func lineText(_ row: Int) -> String {
         guard row >= 0, row < rows else { return "" }
-        return String(grid[row].map(\.character))
+        return String(grid[row].prefix(columns).map(\.character))
     }
 
     // MARK: - Applying actions
 
     mutating func apply(_ action: TerminalAction) {
         switch action {
+        case .hardReset:
+            hardReset()
         case .print(let character):
             printCharacter(character)
         case .lineFeed:
@@ -109,6 +111,7 @@ struct TerminalScreen {
         case .deleteCharacters(let amount):
             deleteCharacters(amount)
         case .eraseCharacters(let amount):
+            discardHiddenColumns(in: cursorRow)
             let end = min(cursorColumn + max(amount, 1), columns)
             for column in cursorColumn..<end { grid[cursorRow][column] = blankCell }
         case .setScrollRegion(let top, let bottom):
@@ -164,6 +167,26 @@ struct TerminalScreen {
         }
     }
 
+    /// Restore the terminal's initial state without retaining hidden cursor,
+    /// alternate-screen, style, title, or private-mode state from before RIS.
+    private mutating func hardReset() {
+        grid = Self.blankGrid(rows: rows, columns: columns)
+        savedPrimary = nil
+        cursorRow = 0
+        cursorColumn = 0
+        cursorVisible = true
+        usingAlternateScreen = false
+        bracketedPaste = false
+        applicationCursorKeys = false
+        autowrap = true
+        title = ""
+        regionTop = 0
+        regionBottom = rows - 1
+        brush = .plain
+        savedCursor = nil
+        pendingWrap = false
+    }
+
     // MARK: - Printing and scrolling
 
     private mutating func printCharacter(_ character: Character) {
@@ -171,6 +194,7 @@ struct TerminalScreen {
             cursorColumn = 0
             lineFeed()
         }
+        discardHiddenColumns(in: cursorRow)
         grid[cursorRow][cursorColumn] = TerminalCell(character: character, style: brush)
         if cursorColumn == columns - 1 {
             pendingWrap = autowrap
@@ -242,6 +266,7 @@ struct TerminalScreen {
     }
 
     private mutating func eraseInLine(_ mode: Int) {
+        discardHiddenColumns(in: cursorRow)
         switch mode {
         case 0:
             for column in cursorColumn..<columns { grid[cursorRow][column] = blankCell }
@@ -285,6 +310,7 @@ struct TerminalScreen {
     }
 
     private mutating func insertCharacters(_ amount: Int) {
+        discardHiddenColumns(in: cursorRow)
         let count = min(max(amount, 1), columns - cursorColumn)
         var line = grid[cursorRow]
         line.removeLast(count)
@@ -293,6 +319,7 @@ struct TerminalScreen {
     }
 
     private mutating func deleteCharacters(_ amount: Int) {
+        discardHiddenColumns(in: cursorRow)
         let count = min(max(amount, 1), columns - cursorColumn)
         var line = grid[cursorRow]
         line.removeSubrange(cursorColumn..<(cursorColumn + count))
@@ -389,15 +416,24 @@ struct TerminalScreen {
         // live there, so dropping the top preserves what the user is looking
         // at instead of discarding the active prompt line.
         var result = source.suffix(rows).map { line -> [TerminalCell] in
-            if line.count > columns {
-                return Array(line.prefix(columns))
-            }
+            // Keep cells beyond the temporarily visible width. If the user
+            // widens the terminal again before that row is overwritten, its
+            // right-hand content reappears instead of being destroyed.
+            guard line.count < columns else { return line }
             return line + Array(repeating: TerminalCell.blank, count: columns - line.count)
         }
         while result.count < rows {
             result.append(Array(repeating: TerminalCell.blank, count: columns))
         }
         return result
+    }
+
+    /// A row can retain hidden right-hand cells across a temporary narrowing.
+    /// Once output mutates that row at the new width, discard the stale overflow
+    /// so it cannot reappear after newer content has replaced the line.
+    private mutating func discardHiddenColumns(in row: Int) {
+        guard row >= 0, row < grid.count, grid[row].count > columns else { return }
+        grid[row] = Array(grid[row].prefix(columns))
     }
 
     // MARK: - Clamping

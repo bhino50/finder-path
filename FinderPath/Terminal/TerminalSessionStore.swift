@@ -11,6 +11,31 @@ struct TerminalSessionMetadata: Codable, Equatable {
     let id: UUID
     var name: String
     var workingDirectory: String
+    /// A user rename pins the tab label against later OSC shell-title updates.
+    /// Decode missing values as false so metadata from FinderPath 1.6 remains valid.
+    var hasCustomName: Bool
+
+    init(id: UUID, name: String, workingDirectory: String, hasCustomName: Bool = false) {
+        self.id = id
+        self.name = name
+        self.workingDirectory = workingDirectory
+        self.hasCustomName = hasCustomName
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case workingDirectory
+        case hasCustomName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        workingDirectory = try container.decode(String.self, forKey: .workingDirectory)
+        hasCustomName = try container.decodeIfPresent(Bool.self, forKey: .hasCustomName) ?? false
+    }
 }
 
 /// Spawn settings the app layer supplies from user preferences. Kept as a
@@ -94,18 +119,25 @@ final class TerminalSessionStore {
     // MARK: - Persistence
 
     func loadPersistedSessions() {
-        guard let data = try? Data(contentsOf: Self.persistenceURL()) else { return }
+        let url = Self.persistenceURL()
+        // Upgrade permissions before decoding so an empty or corrupt legacy
+        // file cannot keep exposing working-directory metadata to other local
+        // accounts until the user happens to add or remove a session.
+        try? Self.hardenPersistencePermissions(at: url)
+        guard let data = try? Data(contentsOf: url) else { return }
         let metadata = Self.decodeMetadata(data)
         guard !metadata.isEmpty else { return }
         let configuration = configurationProvider()
         sessions = metadata.map { entry in
-            TerminalSession(
+            let session = TerminalSession(
                 id: entry.id,
                 name: entry.name,
                 workingDirectory: entry.workingDirectory,
                 shellPath: configuration.shellPath,
                 scrollbackLimit: configuration.scrollbackLimit
             )
+            session.hasCustomName = entry.hasCustomName
+            return session
         }
         onChange?()
     }
@@ -115,16 +147,20 @@ final class TerminalSessionStore {
             TerminalSessionMetadata(
                 id: session.id,
                 name: session.name,
-                workingDirectory: session.workingDirectory
+                workingDirectory: session.workingDirectory,
+                hasCustomName: session.hasCustomName
             )
         }
         let url = Self.persistenceURL()
         do {
+            let directory = url.deletingLastPathComponent()
             try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             try Self.encodeMetadata(metadata).write(to: url, options: .atomic)
+            try Self.hardenPersistencePermissions(at: url)
         } catch {
             // Persistence failure must never take sessions down with it.
             NSLog("TerminalSessionStore: failed to persist sessions: %@", error.localizedDescription)
@@ -135,6 +171,18 @@ final class TerminalSessionStore {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("FinderPath/terminal-sessions.json")
+    }
+
+    private nonisolated static func hardenPersistencePermissions(at url: URL) throws {
+        let fileManager = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+        if fileManager.fileExists(atPath: url.path) {
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
     }
 
     // MARK: - Metadata codec (pure, tested)

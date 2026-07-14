@@ -46,6 +46,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 
     private var popover: NSPopover?
     private var panel: NSPanel?
+    private var defaultsObserver: NSObjectProtocol?
     private var activeSessionID: UUID?
     /// Anchor for re-showing the popover after unpinning. Held weakly so the
     /// panel never keeps status bar machinery alive.
@@ -63,7 +64,23 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         // onStatusChange. TerminalView deliberately uses only onScreenUpdate,
         // so the two layers never clobber each other's handlers.
         store.onChange = { [weak self] in self?.storeDidChange() }
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.terminalView.fontSize = CGFloat(FinderPathPreferences.terminalFontSize)
+            }
+        }
         storeDidChange()
+    }
+
+    deinit {
+        if let defaultsObserver {
+            NotificationCenter.default.removeObserver(defaultsObserver)
+        }
     }
 
     // MARK: - Presentation
@@ -398,6 +415,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         plusButton.target = self
         plusButton.action = #selector(newSessionClicked(_:))
         plusButton.toolTip = "New terminal in the current Finder folder"
+        plusButton.setAccessibilityLabel("New Terminal")
 
         restartButton.title = "Restart"
         restartButton.bezelStyle = .rounded
@@ -406,6 +424,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         restartButton.target = self
         restartButton.action = #selector(restartClicked(_:))
         restartButton.isHidden = true
+        restartButton.setAccessibilityLabel("Restart Terminal")
 
         pinButton.isBordered = false
         pinButton.setButtonType(.momentaryChange)
@@ -421,6 +440,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         closePanelButton.target = self
         closePanelButton.action = #selector(closePanelClicked)
         closePanelButton.toolTip = "Close this window (terminals keep running in the background)"
+        closePanelButton.setAccessibilityLabel("Close Terminal Window")
 
         topBar.addArrangedSubview(tabsStack)
         topBar.addArrangedSubview(spacer)
@@ -487,7 +507,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             tabsStack.addArrangedSubview(makeTabButton(for: session, at: index, isActive: isActive))
             // Every tab carries its own close button so any session can be
             // dismissed with one click without activating it first.
-            tabsStack.addArrangedSubview(makeCloseButton(at: index))
+            tabsStack.addArrangedSubview(makeCloseButton(for: session, at: index))
         }
     }
 
@@ -502,6 +522,8 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         button.widthAnchor.constraint(lessThanOrEqualToConstant: Layout.maxTabWidth).isActive = true
         button.toolTip = "\(session.workingDirectory)\nDouble-click or right-click to rename; use the × to close"
+        button.setAccessibilityLabel("Terminal \(session.displayName)")
+        button.setAccessibilityValue(isActive ? "Active" : "Inactive")
         button.onRightClick = { [weak self] in self?.renameSession(session) }
         button.onDoubleClick = { [weak self] in self?.renameSession(session) }
         return button
@@ -512,8 +534,13 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         store.rename(session, to: newName)
     }
 
-    private func makeCloseButton(at index: Int) -> NSButton {
-        let button = Self.makeBarButton(symbol: "xmark", fallbackTitle: "x", accessibilityDescription: "Close Terminal")
+    private func makeCloseButton(for session: TerminalSession, at index: Int) -> NSButton {
+        let accessibilityLabel = "Close terminal \(session.displayName)"
+        let button = Self.makeBarButton(
+            symbol: "xmark",
+            fallbackTitle: "x",
+            accessibilityDescription: accessibilityLabel
+        )
         if let image = button.image {
             let configuration = NSImage.SymbolConfiguration(pointSize: Layout.closeSymbolPointSize, weight: .regular)
             button.image = image.withSymbolConfiguration(configuration) ?? image
@@ -522,6 +549,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         button.target = self
         button.action = #selector(closeTabClicked(_:))
         button.toolTip = "Close this terminal session"
+        button.setAccessibilityLabel(accessibilityLabel)
         return button
     }
 
@@ -567,6 +595,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         pinButton.toolTip = isPinned
             ? "Return terminals to the menu bar popover"
             : "Pin terminals as a floating window"
+        pinButton.setAccessibilityLabel(description)
     }
 
     private static func makeBarButton(symbol: String, fallbackTitle: String, accessibilityDescription: String) -> NSButton {

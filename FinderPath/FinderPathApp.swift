@@ -19,6 +19,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let actionRouter = FinderPathActionRouter()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Launch Services normally reuses a running app, but development builds,
+        // `open -n`, or duplicate bundles can still start a second process with
+        // the same identity. Refuse the duplicate before it creates another
+        // status item or races the shared terminal-session metadata file.
+        if let bundleIdentifier = Bundle.main.bundleIdentifier,
+           let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            existing.activate(options: [.activateIgnoringOtherApps])
+            NSApp.terminate(nil)
+            return
+        }
+
         FinderPathPreferences.registerDefaults()
         // Feed shell and scrollback preferences into every session the store
         // creates or restores. Resolved lazily so preference edits during the

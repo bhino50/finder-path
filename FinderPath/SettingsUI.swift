@@ -62,6 +62,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.terminalFontSizeKey) private var terminalFontSize = 12.0
     @AppStorage(FinderPathPreferences.terminalScrollbackLimitKey) private var terminalScrollbackLimit = 2000
     @AppStorage(FinderPathPreferences.terminalShellOverrideKey) private var terminalShellOverride = ""
+    @AppStorage(FinderPathPreferences.terminalOptionAsMetaKey) private var terminalOptionAsMeta = false
     @AppStorage(FinderPathPreferences.updateManifestURLKey) private var updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
     @State private var codexAvailability = AgentAvailability.unknown(executable: "codex")
     @State private var claudeAvailability = AgentAvailability.unknown(executable: "claude")
@@ -191,7 +192,9 @@ struct SettingsView: View {
 
                 TextField("Shell override", text: $terminalShellOverride)
 
-                Text("Leave empty for your login shell")
+                Toggle("Use Option as Meta key", isOn: $terminalOptionAsMeta)
+
+                Text("Leave the shell empty for your login shell. Option-as-Meta sends an ESC prefix; leave it off to type native Option characters.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -327,6 +330,7 @@ struct SettingsView: View {
         terminalFontSize = 12
         terminalScrollbackLimit = 2000
         terminalShellOverride = ""
+        terminalOptionAsMeta = false
         updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
         scheduleAgentAvailabilityCheck()
     }

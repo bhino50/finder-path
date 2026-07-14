@@ -69,17 +69,18 @@ final class StatusItemController: NSObject {
         // with the last-known path (or a fetching placeholder) and updates in
         // place when the result lands — NSMenu supports mutation while open.
         // A beachballed Finder can no longer freeze the click.
+        let optionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
         state.refresh { [weak self] in
             guard let self else { return }
-            self.rebuildMenu(self.menu)
+            self.rebuildMenu(self.menu, optionHeld: optionHeld)
         }
-        rebuildMenu(menu)
+        rebuildMenu(menu, optionHeld: optionHeld)
         sender.highlight(true)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
         sender.highlight(false)
     }
 
-    private func rebuildMenu(_ menu: NSMenu) {
+    private func rebuildMenu(_ menu: NSMenu, optionHeld: Bool) {
         menu.removeAllItems()
         menu.autoenablesItems = false
 
@@ -203,22 +204,12 @@ final class StatusItemController: NSObject {
                 menu.addItem(item)
                 return
             }
-            let enabled = state.hasCopyablePath
-            // Primary (no modifier): the external terminal, today's default.
-            // Option-held alternate: the built-in FinderPath terminal. NSMenu
-            // swaps them live while the menu is open, so the "…in FinderPath
-            // Terminal" row appears only while Option is held.
-            let external = NSMenuItem(title: "Open with \(name)", action: externalAction, keyEquivalent: "")
-            external.target = self
-            external.keyEquivalentModifierMask = []
-            external.isEnabled = enabled
-            menu.addItem(external)
-            let inTerminal = NSMenuItem(title: "Open with \(name) in FinderPath Terminal", action: terminalAction, keyEquivalent: "")
-            inTerminal.target = self
-            inTerminal.isAlternate = true
-            inTerminal.keyEquivalentModifierMask = .option
-            inTerminal.isEnabled = enabled
-            menu.addItem(inTerminal)
+            let presentation = AgentLauncher.menuPresentation(name: name, optionHeld: optionHeld)
+            let action = presentation.usesBuiltInTerminal ? terminalAction : externalAction
+            let item = NSMenuItem(title: presentation.title, action: action, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = state.hasCopyablePath
+            menu.addItem(item)
         }
 
         addHarnessItem(
@@ -432,13 +423,20 @@ final class StatusItemController: NSObject {
 
     /// Opens a new built-in terminal in the current folder that runs the given
     /// agent command once the shell is ready.
-    private func openHarnessTerminal(command: String, name: String) {
+    private func openHarnessTerminal(executable: String, name: String) {
         guard let button = statusItem.button else { return }
+        guard let resolvedPath = AgentLauncher.availability(for: executable).resolvedPath else {
+            FinderPathAlertPresenter.presentLaunchFailure(
+                "\(name) CLI was not found. Check its command or path in FinderPath Settings.",
+                displayName: name
+            )
+            return
+        }
         let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
         let session = TerminalSessionStore.shared.newSession(
             name: name,
             workingDirectory: directory,
-            initialCommand: command
+            initialCommand: ShellCommand.argument(resolvedPath)
         )
         DispatchQueue.main.async { [weak self] in
             self?.terminalPanelController.show(session: session, relativeTo: button)
@@ -446,15 +444,15 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func openCodexInTerminalMenuItem() {
-        openHarnessTerminal(command: FinderPathPreferences.codexExecutable, name: "Codex")
+        openHarnessTerminal(executable: FinderPathPreferences.codexExecutable, name: "Codex")
     }
 
     @objc private func openClaudeInTerminalMenuItem() {
-        openHarnessTerminal(command: FinderPathPreferences.claudeExecutable, name: "Claude")
+        openHarnessTerminal(executable: FinderPathPreferences.claudeExecutable, name: "Claude")
     }
 
     @objc private func openHermesInTerminalMenuItem() {
-        openHarnessTerminal(command: FinderPathPreferences.hermesExecutable, name: "Hermes")
+        openHarnessTerminal(executable: FinderPathPreferences.hermesExecutable, name: "Hermes")
     }
 
     @objc private func newTerminalHereMenuItem() {
@@ -484,35 +482,44 @@ final class StatusItemController: NSObject {
     }
 }
 
-/// A terminal row in the status menu: the session name on the left, a close
-/// button on the right. Clicking the row opens the terminal; clicking the
-/// button closes it. Highlights on hover like a normal menu item.
+/// A terminal row in the status menu: explicit Open and Close buttons inside
+/// an accessibility group. Highlights on hover like a normal menu item.
 final class TerminalMenuRowView: NSView {
     var onOpen: (() -> Void)?
     var onClose: (() -> Void)?
 
-    private let nameLabel = NSTextField(labelWithString: "")
+    private let openButton = NSButton()
     private let closeButton = NSButton()
     private var trackingArea: NSTrackingArea?
+    private let name: String
 
     private var isHighlighted = false {
         didSet {
             guard isHighlighted != oldValue else { return }
-            nameLabel.textColor = isHighlighted ? .selectedMenuItemTextColor : .labelColor
+            updateOpenButtonTitle()
             closeButton.contentTintColor = isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
             needsDisplay = true
         }
     }
 
     init(name: String) {
+        self.name = name
         super.init(frame: NSRect(x: 0, y: 0, width: FinderPathPreferences.menuHeaderWidth, height: 22))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Terminal \(name)")
 
-        nameLabel.stringValue = name
-        nameLabel.font = .menuFont(ofSize: 0)
-        nameLabel.textColor = .labelColor
-        nameLabel.lineBreakMode = .byTruncatingTail
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(nameLabel)
+        openButton.isBordered = false
+        openButton.setButtonType(.momentaryChange)
+        openButton.alignment = .left
+        openButton.lineBreakMode = .byTruncatingTail
+        openButton.target = self
+        openButton.action = #selector(openClicked)
+        openButton.toolTip = "Open this terminal"
+        openButton.setAccessibilityLabel("Open terminal \(name)")
+        openButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(openButton)
+        updateOpenButtonTitle()
 
         closeButton.isBordered = false
         closeButton.setButtonType(.momentaryChange)
@@ -522,17 +529,18 @@ final class TerminalMenuRowView: NSView {
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeButton.toolTip = "Close this terminal"
+        closeButton.setAccessibilityLabel("Close terminal \(name)")
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(closeButton)
 
         NSLayoutConstraint.activate([
-            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            openButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            openButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 13),
             closeButton.heightAnchor.constraint(equalToConstant: 13),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
+            openButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
         ])
     }
 
@@ -554,14 +562,17 @@ final class TerminalMenuRowView: NSView {
     override func mouseEntered(with event: NSEvent) { isHighlighted = true }
     override func mouseExited(with event: NSEvent) { isHighlighted = false }
 
-    // Route clicks: the close button handles its own area; everything else on
-    // the row opens the terminal.
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        let local = convert(point, from: superview)
-        return closeButton.frame.contains(local) ? closeButton : self
+    private func updateOpenButtonTitle() {
+        openButton.attributedTitle = NSAttributedString(
+            string: name,
+            attributes: [
+                .font: NSFont.menuFont(ofSize: 0),
+                .foregroundColor: isHighlighted ? NSColor.selectedMenuItemTextColor : NSColor.labelColor,
+            ]
+        )
     }
 
-    override func mouseUp(with event: NSEvent) {
+    @objc private func openClicked() {
         onOpen?()
     }
 

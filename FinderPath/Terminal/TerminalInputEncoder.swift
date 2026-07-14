@@ -5,6 +5,14 @@ import Foundation
 // runner. Sequences target TERM=xterm-256color.
 
 enum TerminalInputEncoder {
+    struct Modifiers: OptionSet, Equatable, Sendable {
+        let rawValue: Int
+
+        static let shift = Modifiers(rawValue: 1 << 0)
+        static let option = Modifiers(rawValue: 1 << 1)
+        static let control = Modifiers(rawValue: 1 << 2)
+    }
+
     enum SpecialKey: Equatable, Sendable {
         case up
         case down
@@ -29,11 +37,18 @@ enum TerminalInputEncoder {
     /// SS3 introducer, ESC O — used by application cursor mode and F1-F4.
     private static let ss3: [UInt8] = [0x1B, 0x4F]
 
-    static func encode(text: String) -> [UInt8] {
-        Array(text.utf8)
+    static func encode(text: String, meta: Bool = false) -> [UInt8] {
+        (meta ? [esc] : []) + Array(text.utf8)
     }
 
-    static func encode(specialKey: SpecialKey, applicationCursorKeys: Bool) -> [UInt8] {
+    static func encode(
+        specialKey: SpecialKey,
+        modifiers: Modifiers = [],
+        applicationCursorKeys: Bool
+    ) -> [UInt8] {
+        if !modifiers.isEmpty {
+            return modifiedSequence(for: specialKey, modifiers: modifiers)
+        }
         switch specialKey {
         case .up:
             return cursorSequence(final: 0x41, applicationMode: applicationCursorKeys)
@@ -69,26 +84,28 @@ enum TerminalInputEncoder {
     /// Control-key combinations with a defined C0 mapping: a-z (either case)
     /// map to 0x01-0x1A, and the classic punctuation set covers 0x1B-0x1F.
     /// Anything else has no control encoding and returns nil.
-    static func encodeControl(character: Character) -> [UInt8]? {
+    static func encodeControl(character: Character, meta: Bool = false) -> [UInt8]? {
         guard let ascii = character.asciiValue else { return nil }
+        let controlByte: UInt8
         switch ascii {
         case 0x61...0x7A: // a-z
-            return [ascii - 0x60]
+            controlByte = ascii - 0x60
         case 0x41...0x5A: // A-Z
-            return [ascii - 0x40]
+            controlByte = ascii - 0x40
         case 0x5B: // [
-            return [0x1B]
+            controlByte = 0x1B
         case 0x5C: // backslash
-            return [0x1C]
+            controlByte = 0x1C
         case 0x5D: // ]
-            return [0x1D]
+            controlByte = 0x1D
         case 0x5E: // ^
-            return [0x1E]
+            controlByte = 0x1E
         case 0x5F: // _
-            return [0x1F]
+            controlByte = 0x1F
         default:
             return nil
         }
+        return (meta ? [esc] : []) + [controlByte]
     }
 
     /// Bracketed paste wraps content in ESC[200~ / ESC[201~ and strips every
@@ -110,6 +127,58 @@ enum TerminalInputEncoder {
 
     private static func tildeSequence(code: Int) -> [UInt8] {
         csi + Array("\(code)~".utf8)
+    }
+
+    /// xterm encodes Shift/Option/Control as 2/3/5 (and additive
+    /// combinations) in CSI modifier parameters. Command remains an AppKit
+    /// shortcut modifier and is intentionally never forwarded by this layer.
+    private static func modifiedSequence(for key: SpecialKey, modifiers: Modifiers) -> [UInt8] {
+        let modifierCode = 1
+            + (modifiers.contains(.shift) ? 1 : 0)
+            + (modifiers.contains(.option) ? 2 : 0)
+            + (modifiers.contains(.control) ? 4 : 0)
+
+        func cursor(final: Character) -> [UInt8] {
+            csi + Array("1;\(modifierCode)\(final)".utf8)
+        }
+
+        func modifiedTilde(_ code: Int) -> [UInt8] {
+            csi + Array("\(code);\(modifierCode)~".utf8)
+        }
+
+        switch key {
+        case .up: return cursor(final: "A")
+        case .down: return cursor(final: "B")
+        case .right: return cursor(final: "C")
+        case .left: return cursor(final: "D")
+        case .home: return cursor(final: "H")
+        case .end: return cursor(final: "F")
+        case .pageUp: return modifiedTilde(5)
+        case .pageDown: return modifiedTilde(6)
+        case .forwardDelete: return modifiedTilde(3)
+        case .tab where modifiers.contains(.shift):
+            if modifiers == [.shift] { return csi + [0x5A] } // CSI Z (back-tab)
+            return csi + Array("1;\(modifierCode)Z".utf8)
+        case .tab: return (modifiers.contains(.option) ? [esc] : []) + [0x09]
+        case .escape: return (modifiers.contains(.option) ? [esc] : []) + [esc]
+        case .enter: return (modifiers.contains(.option) ? [esc] : []) + [0x0D]
+        case .backspace: return (modifiers.contains(.option) ? [esc] : []) + [0x7F]
+        case .function(let number):
+            switch number {
+            case 1...4:
+                let final = Character(UnicodeScalar(0x4F + number)!) // P, Q, R, S
+                return cursor(final: final)
+            case 5: return modifiedTilde(15)
+            case 6: return modifiedTilde(17)
+            case 7: return modifiedTilde(18)
+            case 8: return modifiedTilde(19)
+            case 9: return modifiedTilde(20)
+            case 10: return modifiedTilde(21)
+            case 11: return modifiedTilde(23)
+            case 12: return modifiedTilde(24)
+            default: return []
+            }
+        }
     }
 
     /// F1-F4 are SS3 P/Q/R/S (VT100 PF keys); F5-F12 use CSI n~ with the

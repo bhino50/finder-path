@@ -67,6 +67,7 @@ final class TerminalView: NSView {
             updateRedrawTimer()
             pushGridSizeToSession(force: true)
             needsDisplay = true
+            NSAccessibility.post(element: self, notification: .valueChanged)
         }
     }
 
@@ -104,6 +105,10 @@ final class TerminalView: NSView {
         // the layer stretch or drop its cached bitmap — otherwise the text
         // blanks while the window is being resized.
         layerContentsRedrawPolicy = .duringViewResize
+        setAccessibilityElement(true)
+        setAccessibilityRole(.textArea)
+        setAccessibilityLabel("FinderPath Terminal")
+        setAccessibilityHelp("Interactive terminal. Type commands or select text to copy it.")
     }
 
     required init?(coder: NSCoder) {
@@ -147,6 +152,7 @@ final class TerminalView: NSView {
                 guard let self, self.screenDirty else { return }
                 self.screenDirty = false
                 self.needsDisplay = true
+                NSAccessibility.post(element: self, notification: .valueChanged)
             }
             timer.resume()
             redrawTimer = timer
@@ -213,6 +219,17 @@ final class TerminalView: NSView {
 
         drawCursorIfNeeded(screen: screen, offset: offset, context: context)
         drawStatusBannerIfNeeded(status: session.status)
+    }
+
+    override func accessibilityValue() -> Any? {
+        guard let session else { return "" }
+        let screen = session.screen
+        let offset = min(scrollbackOffset, screen.scrollbackCount)
+        return (0..<screen.rows).map { displayRow in
+            let contentLine = screen.scrollbackCount - offset + displayRow
+            let text = String(cells(forContentLine: contentLine, screen: screen).map(\.character))
+            return String(text.reversed().drop(while: { $0 == " " }).reversed())
+        }.joined(separator: "\n")
     }
 
     /// Cells for a content line: scrollback lines are padded or truncated to
@@ -441,23 +458,27 @@ final class TerminalView: NSView {
         // Typing while scrolled back always snaps to the live grid.
         snapToLiveGrid()
 
+        let optionAsMeta = FinderPathPreferences.terminalOptionAsMeta
+        let terminalModifiers = Self.terminalModifiers(from: modifiers, optionAsMeta: optionAsMeta)
         if let special = Self.specialKey(forKeyCode: event.keyCode) {
-            session.send(special: special)
+            session.send(special: special, modifiers: terminalModifiers)
             return
         }
 
         if modifiers.contains(.control),
            let character = event.charactersIgnoringModifiers?.first,
-           let bytes = TerminalInputEncoder.encodeControl(character: character) {
-            // TerminalSession has no raw-byte entry point, but encode(text:)
-            // is a byte-exact UTF-8 pass-through, so a control byte such as
-            // 0x03 survives the String round trip unchanged.
-            session.send(text: String(decoding: bytes, as: UTF8.self))
+           let bytes = TerminalInputEncoder.encodeControl(
+               character: character,
+               meta: optionAsMeta && modifiers.contains(.option)
+           ) {
+            session.send(bytes: bytes)
             return
         }
 
-        if let characters = event.characters, !characters.isEmpty, Self.isPrintable(characters) {
-            session.send(text: characters)
+        let usesMeta = optionAsMeta && modifiers.contains(.option)
+        let text = usesMeta ? event.charactersIgnoringModifiers : event.characters
+        if let text, !text.isEmpty, Self.isPrintable(text) {
+            session.send(text: text, meta: usesMeta)
             return
         }
 
@@ -485,8 +506,31 @@ final class TerminalView: NSView {
         case 48: return .tab
         case 36, 76: return .enter // return and keypad enter
         case 51: return .backspace
+        case 122: return .function(1)
+        case 120: return .function(2)
+        case 99: return .function(3)
+        case 118: return .function(4)
+        case 96: return .function(5)
+        case 97: return .function(6)
+        case 98: return .function(7)
+        case 100: return .function(8)
+        case 101: return .function(9)
+        case 109: return .function(10)
+        case 103: return .function(11)
+        case 111: return .function(12)
         default: return nil
         }
+    }
+
+    private static func terminalModifiers(
+        from flags: NSEvent.ModifierFlags,
+        optionAsMeta: Bool
+    ) -> TerminalInputEncoder.Modifiers {
+        var result: TerminalInputEncoder.Modifiers = []
+        if flags.contains(.shift) { result.insert(.shift) }
+        if optionAsMeta, flags.contains(.option) { result.insert(.option) }
+        if flags.contains(.control) { result.insert(.control) }
+        return result
     }
 
     /// NSEvent encodes non-character keys in the Unicode private-use range

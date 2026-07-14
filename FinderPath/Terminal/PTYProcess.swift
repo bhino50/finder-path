@@ -7,7 +7,7 @@ import Foundation
 // Mutable state is confined to a private serial queue, and both callbacks
 // fire on background queues, so callers hop to the main actor themselves.
 
-final class PTYProcess {
+final class PTYProcess: @unchecked Sendable {
     struct LaunchError: Error {
         let message: String
     }
@@ -18,7 +18,7 @@ final class PTYProcess {
     private static let killGracePeriod: DispatchTimeInterval = .seconds(2)
     private static let forcedTerm = "xterm-256color"
     private static let fallbackLanguage = "en_US.UTF-8"
-    private static let fallbackShell = "/bin/zsh"
+    private nonisolated static let fallbackShell = "/bin/zsh"
 
     // MARK: - Launch configuration
 
@@ -33,14 +33,15 @@ final class PTYProcess {
     /// the backing storage directly; the public accessors would deadlock.
     private let stateQueue = DispatchQueue(label: PTYProcess.queueLabel + ".state")
     private let readQueue = DispatchQueue(label: PTYProcess.queueLabel + ".read")
-    // Writes run on their own queue: a write to a full PTY blocks, and it must
-    // never hold stateQueue, or it would stall the read source's handler
-    // lookup and wedge the whole session (draining, resize, terminate).
+    // Writes run on their own queue and poll a nonblocking descriptor. They
+    // must never hold stateQueue while waiting, or they would stall draining,
+    // resize, and termination.
     private let writeQueue = DispatchQueue(label: PTYProcess.queueLabel + ".write")
 
     private var outputHandler: (([UInt8]) -> Void)?
     private var exitHandler: ((Int32) -> Void)?
     private var runningFlag = false
+    private var terminatingFlag = false
     private var childPID: pid_t = -1
     private var primaryDescriptor: Int32 = -1
     private var readSource: DispatchSourceRead?
@@ -89,6 +90,7 @@ final class PTYProcess {
     deinit {
         // The cancel handler owns closing the descriptor; SIGHUP covers a
         // child that outlives its owner so orphaned shells do not linger.
+        Self.signalSessionMembers(Self.sessionMembers(ledBy: childPID), ledBy: childPID, signal: SIGHUP)
         readSource?.cancel()
         if childPID > 0 {
             kill(childPID, SIGHUP)
@@ -125,7 +127,17 @@ final class PTYProcess {
         }
 
         // The child must not inherit the primary side of its own PTY.
-        _ = fcntl(primary, F_SETFD, FD_CLOEXEC)
+        guard fcntl(primary, F_SETFD, FD_CLOEXEC) == 0 else {
+            throw LaunchError(message: "could not protect PTY descriptor inheritance: \(Self.message(forErrno: errno))")
+        }
+        // A child that temporarily stops reading must never wedge the serial
+        // write queue. Nonblocking writes wait with poll and re-check launch
+        // ownership, so terminate/restart can always make progress.
+        let fileStatusFlags = fcntl(primary, F_GETFL)
+        guard fileStatusFlags >= 0,
+              fcntl(primary, F_SETFL, fileStatusFlags | O_NONBLOCK) == 0 else {
+            throw LaunchError(message: "could not make PTY nonblocking: \(Self.message(forErrno: errno))")
+        }
         Self.applyWindowSize(rows: currentRows, columns: currentColumns, to: primary)
 
         var fileActions: posix_spawn_file_actions_t?
@@ -177,6 +189,7 @@ final class PTYProcess {
         childPID = pid
         primaryDescriptor = primary
         runningFlag = true
+        terminatingFlag = false
         launchGeneration += 1
         startReading(from: primary)
         reapExit(of: pid)
@@ -196,23 +209,49 @@ final class PTYProcess {
         guard !bytes.isEmpty else { return }
         writeQueue.async { [weak self] in
             guard let self else { return }
-            // Snapshot the descriptor under stateQueue (brief, non-blocking),
-            // then do the potentially blocking write off that queue.
-            let descriptor = self.stateQueue.sync { self.runningFlag ? self.primaryDescriptor : -1 }
-            guard descriptor >= 0 else { return }
-            Self.writeFully(bytes, to: descriptor)
+            // Duplicate the descriptor while ownership is locked. The duplicate
+            // cannot turn into an unrelated reused fd if the read source closes
+            // the primary during this write.
+            let snapshot: (descriptor: Int32, generation: Int)? = self.stateQueue.sync {
+                guard self.runningFlag, !self.terminatingFlag, self.primaryDescriptor >= 0 else { return nil }
+                // Unlike dup(), F_DUPFD_CLOEXEC prevents a concurrent spawn
+                // from inheriting this temporary master descriptor.
+                let descriptor = fcntl(self.primaryDescriptor, F_DUPFD_CLOEXEC, 0)
+                guard descriptor >= 0 else { return nil }
+                return (descriptor, self.launchGeneration)
+            }
+            guard let snapshot else { return }
+            defer { close(snapshot.descriptor) }
+            Self.writeFully(bytes, to: snapshot.descriptor) {
+                self.stateQueue.sync {
+                    self.runningFlag
+                        && !self.terminatingFlag
+                        && self.launchGeneration == snapshot.generation
+                }
+            }
         }
     }
 
-    private static func writeFully(_ bytes: [UInt8], to descriptor: Int32) {
+    private static func writeFully(
+        _ bytes: [UInt8],
+        to descriptor: Int32,
+        while shouldContinue: () -> Bool
+    ) {
         var offset = 0
         while offset < bytes.count {
+            guard shouldContinue() else { return }
             let written = bytes[offset...].withUnsafeBytes { buffer in
                 Darwin.write(descriptor, buffer.baseAddress, buffer.count)
             }
             if written > 0 {
                 offset += written
             } else if written == -1 && errno == EINTR {
+                continue
+            } else if written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                guard shouldContinue() else { return }
+                var writable = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+                let result = poll(&writable, 1, 100)
+                if result == -1 && errno != EINTR { return }
                 continue
             } else {
                 return
@@ -250,17 +289,34 @@ final class PTYProcess {
     /// Asks the child to hang up, then force-kills it if it is still around
     /// after the grace period. Safe to call at any time.
     func terminate() {
-        stateQueue.async { [weak self] in
-            guard let self, self.runningFlag, self.childPID > 0 else { return }
-            let pid = self.childPID
-            let generation = self.launchGeneration
+        // Retain this owner through the delayed escalation. restart() replaces
+        // the PTY immediately, and a weak cleanup task could otherwise vanish
+        // before an uncooperative child or process group has actually exited.
+        stateQueue.async { [self] in
+            guard runningFlag, childPID > 0 else { return }
+            let pid = childPID
+            let generation = launchGeneration
+            terminatingFlag = true
+            // Snapshot every process in the shell's POSIX session before any
+            // signal is delivered. Unlike a foreground PGID, this remains able
+            // to identify a pipeline member after its group leader exits.
+            let sessionMembers = Self.sessionMembers(ledBy: pid)
+            Self.signalSessionMembers(sessionMembers, ledBy: pid, signal: SIGHUP)
             kill(pid, SIGHUP)
-            self.stateQueue.asyncAfter(deadline: .now() + Self.killGracePeriod) { [weak self] in
-                // Only escalate if the same launch is still running; once the
-                // reaper clears runningFlag/childPID the PID may be reused.
-                guard let self, self.runningFlag, self.childPID == pid,
-                      self.launchGeneration == generation else { return }
-                kill(pid, SIGKILL)
+            // Closing the primary side delivers a terminal hangup and releases
+            // readers even when the shell or a foreground child is misbehaving.
+            readSource?.cancel()
+            readSource = nil
+            primaryDescriptor = -1
+            stateQueue.asyncAfter(deadline: .now() + Self.killGracePeriod) { [self] in
+                // A same-object relaunch changes the generation and invalidates
+                // this cleanup. Each captured PID is revalidated against the
+                // original session before escalation, protecting against reuse.
+                guard launchGeneration == generation else { return }
+                Self.signalSessionMembers(sessionMembers, ledBy: pid, signal: SIGKILL)
+                if runningFlag, childPID == pid {
+                    kill(pid, SIGKILL)
+                }
             }
         }
     }
@@ -321,6 +377,7 @@ final class PTYProcess {
     private func finishExit(waitStatus: Int32) {
         let handler: ((Int32) -> Void)? = stateQueue.sync {
             runningFlag = false
+            terminatingFlag = true
             childPID = -1
             return exitHandler
         }
@@ -337,9 +394,66 @@ final class PTYProcess {
         return (status >> 8) & 0xFF
     }
 
+    /// Snapshot all live processes in the child shell's POSIX session using
+    /// the public BSD process table. Capturing concrete PIDs before SIGHUP lets
+    /// delayed cleanup safely handle pipelines whose group leader exits first.
+    private nonisolated static func sessionMembers(ledBy sessionLeader: pid_t) -> [pid_t] {
+        guard sessionLeader > 1 else { return [] }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        let stride = MemoryLayout<kinfo_proc>.stride
+
+        for _ in 0..<3 {
+            var byteCount = 0
+            guard sysctl(&mib, UInt32(mib.count), nil, &byteCount, nil, 0) == 0,
+                  byteCount > 0 else {
+                break
+            }
+            // The process table can grow between the sizing and fill calls.
+            byteCount += stride * 16
+            var processes = [kinfo_proc](
+                repeating: kinfo_proc(),
+                count: max(byteCount / stride, 1)
+            )
+            var filledBytes = processes.count * stride
+            let result = processes.withUnsafeMutableBytes { buffer in
+                sysctl(&mib, UInt32(mib.count), buffer.baseAddress, &filledBytes, nil, 0)
+            }
+            if result == -1, errno == ENOMEM { continue }
+            guard result == 0 else { break }
+
+            var seen = Set<pid_t>()
+            var members: [pid_t] = []
+            for process in processes.prefix(filledBytes / stride) {
+                let candidate = process.kp_proc.p_pid
+                guard candidate > 1,
+                      getsid(candidate) == sessionLeader,
+                      seen.insert(candidate).inserted else { continue }
+                members.append(candidate)
+            }
+            // Signal the session leader last so it stays available while the
+            // membership checks for its descendants run.
+            return members.sorted { lhs, rhs in
+                if lhs == sessionLeader { return false }
+                if rhs == sessionLeader { return true }
+                return lhs < rhs
+            }
+        }
+        return [sessionLeader]
+    }
+
+    private nonisolated static func signalSessionMembers(
+        _ members: [pid_t],
+        ledBy sessionLeader: pid_t,
+        signal: Int32
+    ) {
+        for member in members where member > 1 && getsid(member) == sessionLeader {
+            kill(member, signal)
+        }
+    }
+
     // MARK: - Environment
 
-    static func defaultShell() -> String {
+    nonisolated static func defaultShell() -> String {
         if let shell = ProcessInfo.processInfo.environment["SHELL"], !shell.isEmpty {
             return shell
         }

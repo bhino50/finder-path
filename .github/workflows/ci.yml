@@ -21,6 +21,7 @@ jobs:
       - name: Validate project files
         run: |
           plutil -lint Info.plist
+          plutil -lint FinderPath.entitlements
           ruby -rjson -e 'ARGV.each { |path| JSON.parse(File.read(path)) }' \
             FinderPath/Assets.xcassets/Contents.json \
             FinderPath/Assets.xcassets/AppIcon.appiconset/Contents.json \
@@ -44,3 +45,18 @@ jobs:
             -derivedDataPath .build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Build Release app
+        run: |
+          xcodebuild \
+            -project FinderPath.xcodeproj \
+            -scheme FinderPath \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath .build/ReleaseDerivedData \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build without xcodebuild
+        run: ./script/run_no_xcode.sh build
