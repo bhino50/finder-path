@@ -425,6 +425,28 @@ struct FinderPathTerminalTests {
             "FinderPath 1.6 session metadata decodes with an unpinned legacy name"
         )
 
+        // MARK: - Session startup geometry
+
+        // A restored/new session can be activated while AppKit is still
+        // reparenting the terminal view. Starting at the fallback 80x24 grid
+        // and resizing a moment later corrupts zsh prompt/history redraws, so
+        // the spawn must wait for the first real viewport dimensions.
+        MainActor.assumeIsolated {
+            let deferredSession = TerminalSession(
+                name: "Deferred",
+                workingDirectory: "/tmp",
+                shellPath: "/bin/zsh",
+                scrollbackLimit: 10
+            )
+            deferredSession.start()
+            expect(deferredSession.status == .notStarted, "session waits for a real viewport before spawning")
+            deferredSession.resize(rows: 12, columns: 37)
+            expect(deferredSession.screen.rows == 12 && deferredSession.screen.columns == 37,
+                   "first viewport dimensions reach the screen before spawn")
+            expect(deferredSession.status == .running, "session spawns once viewport geometry is ready")
+            deferredSession.terminate()
+        }
+
         // MARK: - Screen: hostile counts are clamped to the region
 
         var clampScreen = TerminalScreen(rows: 3, columns: 3, scrollbackLimit: 5)

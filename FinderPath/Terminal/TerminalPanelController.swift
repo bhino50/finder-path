@@ -289,8 +289,17 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 
     private func activate(_ session: TerminalSession) {
         activeSessionID = session.id
-        session.start()
+        // Resolve Auto Layout before attaching a new session. Starting the PTY
+        // at its 80x24 fallback and then briefly resizing it through a zero-size
+        // view (2x10 after minimum clamping) makes zsh redraw its prompt at
+        // conflicting widths. History recall then leaves the familiar "<..."
+        // left-edge marker mixed into the prompt.
+        contentView.layoutSubtreeIfNeeded()
         terminalView.session = session
+        // TerminalView pushes the real grid size while the session is still
+        // .notStarted, so the PTY is born at the correct dimensions and never
+        // needs a startup SIGWINCH/redraw cycle.
+        session.start()
         terminalView.focusTerminal()
         rebuildTabs()
         updateRestartButton()
