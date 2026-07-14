@@ -456,8 +456,12 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         // Drag grip in the bottom-right corner resizes the popover. contentView
         // is not flipped, so the bottom edge is y == 0.
         resizeGrip.translatesAutoresizingMaskIntoConstraints = false
-        resizeGrip.onResizeBegan = { [weak self] in self?.contentView.frame.size ?? .zero }
+        resizeGrip.onResizeBegan = { [weak self] in
+            self?.terminalView.beginInteractiveResize()
+            return self?.contentView.frame.size ?? .zero
+        }
         resizeGrip.onResize = { [weak self] size in self?.applyContentResize(size) }
+        resizeGrip.onResizeEnded = { [weak self] in self?.terminalView.endInteractiveResize() }
         contentView.addSubview(resizeGrip)
         // The window resizes from its own edges, so the grip serves only the
         // popover; hide it while pinned (the default surface).
@@ -617,6 +621,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 private final class ResizeGripView: NSView {
     var onResizeBegan: (() -> CGSize)?
     var onResize: ((CGSize) -> Void)?
+    var onResizeEnded: (() -> Void)?
 
     private var startMouse: NSPoint = .zero
     private var startSize: CGSize = .zero
@@ -633,6 +638,10 @@ private final class ResizeGripView: NSView {
         // Window coordinates increase upward, so dragging the corner down
         // (negative dy) must grow the height.
         onResize?(CGSize(width: startSize.width + dx, height: startSize.height - dy))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onResizeEnded?()
     }
 
     override func resetCursorRects() {
