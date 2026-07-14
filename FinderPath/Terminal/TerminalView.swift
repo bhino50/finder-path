@@ -95,6 +95,9 @@ final class TerminalView: NSView {
     private var redrawTimer: DispatchSourceTimer?
     private var scrollAccumulator: CGFloat = 0
     private var lastPushedGrid = (rows: 0, columns: 0)
+    /// The popover's custom resize grip does not participate in AppKit's window
+    /// live-resize lifecycle, so it explicitly defers grid/PTY updates here.
+    private var isDeferringGridResize = false
 
     // MARK: - Lifecycle
 
@@ -184,6 +187,21 @@ final class TerminalView: NSView {
         needsDisplay = true
     }
 
+    /// Called by the popover resize grip. Keeping the existing terminal grid
+    /// visible during the drag avoids repeatedly clearing alternate-screen apps.
+    func beginInteractiveResize() {
+        isDeferringGridResize = true
+    }
+
+    /// Sends one final size after the custom popover drag completes. Unlike a
+    /// forced session attach, an unchanged grid does not need another SIGWINCH.
+    func endInteractiveResize() {
+        guard isDeferringGridResize else { return }
+        isDeferringGridResize = false
+        pushGridSizeToSession()
+        needsDisplay = true
+    }
+
     private func gridSize() -> (rows: Int, columns: Int) {
         let rows = max(Int(bounds.height / metrics.cellHeight), Self.minimumRows)
         let columns = max(Int(bounds.width / metrics.cellWidth), Self.minimumColumns)
@@ -192,6 +210,13 @@ final class TerminalView: NSView {
 
     private func pushGridSizeToSession(force: Bool = false) {
         guard let session else { return }
+        // Debounce during a live drag: resizing the grid/PTY on every
+        // intermediate frame floods the child with SIGWINCH and, for a
+        // full-screen (alternate-screen) app, reblanks the buffer each frame so
+        // the view stays empty for the whole drag ("resizing loses all text").
+        // The view keeps redrawing the existing grid during the drag;
+        // viewDidEndLiveResize reconciles to the final size once with force.
+        if (inLiveResize || isDeferringGridResize) && !force { return }
         let size = gridSize()
         guard force || size != lastPushedGrid else { return }
         lastPushedGrid = size

@@ -189,7 +189,7 @@ struct RemoteConnectionView: View {
     private var deviceEmptyText: String {
         if tailscale.backend == .unavailable { return "Tailscale is not installed." }
         if isLoadingTailscale { return "Loading devices…" }
-        return showAllDevices ? "No devices online." : "No Linux devices online. Enable \"Show all\" to see every device."
+        return showAllDevices ? "No devices found." : "No Linux devices found. Enable \"Show all\" to see every device."
     }
 
     private var serverSection: some View {
@@ -362,6 +362,7 @@ struct RemoteConnectionView: View {
         current.remove(at: index)
         remoteServersText = RemoteServers.serialize(current)
         selection = nil
+        selectedTarget = ""
     }
 
     private func connect() {
@@ -399,7 +400,15 @@ struct RemoteConnectionView: View {
 
     private func refreshTailscale(forceRefresh: Bool = false) async {
         isLoadingTailscale = true
-        tailscale = await TailscaleBridge.status(forceRefresh: forceRefresh)
+        let refreshedStatus = await TailscaleBridge.status(forceRefresh: forceRefresh)
+        tailscale = refreshedStatus
+        if let selection, selection.hasPrefix("ts:") {
+            let selectedDeviceID = String(selection.dropFirst(3))
+            if !refreshedStatus.devices.contains(where: { $0.id == selectedDeviceID }) {
+                self.selection = nil
+                selectedTarget = ""
+            }
+        }
         isLoadingTailscale = false
     }
 }

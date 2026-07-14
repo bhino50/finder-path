@@ -14,18 +14,49 @@ struct FinderPathApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let releaseBundleIdentifier = "io.github.bhino50.FinderPath"
+    private static let developmentBundleIdentifier = "io.github.bhino50.FinderPathDev"
+    private static let finderPathBundleIdentifiers: Set<String> = [
+        releaseBundleIdentifier,
+        developmentBundleIdentifier,
+    ]
+
     private var statusItemController: StatusItemController?
     private var welcomeWindowController: WelcomeWindowController?
     private let actionRouter = FinderPathActionRouter()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Launch Services normally reuses a running app, but development builds,
-        // `open -n`, or duplicate bundles can still start a second process with
-        // the same identity. Refuse the duplicate before it creates another
+        // `open -n`, or stale FinderPathDev bundles can still start a second
+        // process. Refuse every FinderPath-owned bundle before it creates another
         // status item or races the shared terminal-session metadata file.
-        if let bundleIdentifier = Bundle.main.bundleIdentifier,
-           let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-            .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let currentBundleIdentifier = Bundle.main.bundleIdentifier
+        let existingApplications = NSWorkspace.shared.runningApplications.filter { application in
+            guard application.processIdentifier != currentPID else { return false }
+            if Self.finderPathBundleIdentifiers.contains(application.bundleIdentifier ?? "") {
+                return true
+            }
+            return application.bundleURL?.pathExtension.lowercased() == "app"
+                && application.executableURL?.lastPathComponent == "FinderPath"
+        }
+
+        // The official app owns the production identity. If an old development
+        // bundle was left running, ask it to quit and continue launching the
+        // official build instead of sending the user back to stale code.
+        if currentBundleIdentifier == Self.releaseBundleIdentifier {
+            for developmentApp in existingApplications
+                where developmentApp.bundleIdentifier == Self.developmentBundleIdentifier {
+                developmentApp.terminate()
+            }
+        }
+
+        if let existing = existingApplications.first(where: { application in
+            if currentBundleIdentifier == Self.releaseBundleIdentifier {
+                return application.bundleIdentifier != Self.developmentBundleIdentifier
+            }
+            return true
+        }) {
             existing.activate(options: [.activateIgnoringOtherApps])
             NSApp.terminate(nil)
             return
