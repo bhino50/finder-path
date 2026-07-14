@@ -21,7 +21,7 @@ struct TerminalParser {
 
     private var state: State = .ground
     private var csiBuffer = ""
-    private var oscBuffer = ""
+    private var oscBuffer: [UInt8] = []
     private var utf8Buffer: [UInt8] = []
     private var utf8Expected = 0
 
@@ -51,7 +51,7 @@ struct TerminalParser {
                     finishOSC(into: &actions)
                 } else {
                     // Not a string terminator; drop the OSC and reprocess.
-                    oscBuffer = ""
+                    oscBuffer = []
                     state = .ground
                     parseGround(byte, into: &actions)
                 }
@@ -129,7 +129,7 @@ struct TerminalParser {
             csiBuffer = ""
             state = .csi
         case UInt8(ascii: "]"):
-            oscBuffer = ""
+            oscBuffer = []
             state = .osc
         case UInt8(ascii: "("), UInt8(ascii: ")"):
             state = .escapeCharset
@@ -350,15 +350,17 @@ struct TerminalParser {
         case 0x1B:
             state = .oscEscape
         default:
-            if oscBuffer.utf8.count < Self.maxOSCLength {
-                oscBuffer.append(Character(UnicodeScalar(byte)))
+            if oscBuffer.count < Self.maxOSCLength {
+                oscBuffer.append(byte)
             }
         }
     }
 
     private mutating func finishOSC(into actions: inout [TerminalAction]) {
-        let content = oscBuffer
-        oscBuffer = ""
+        // Decode the OSC payload as UTF-8; appending raw bytes as scalars would
+        // mangle multi-byte titles (e.g. "✳ Claude Code" -> "â³ Claude Code").
+        let content = String(decoding: oscBuffer, as: UTF8.self)
+        oscBuffer = []
         state = .ground
 
         let parts = content.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)

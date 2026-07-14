@@ -108,6 +108,7 @@ struct FinderPathTerminalTests {
         parser = TerminalParser()
         expect(parser.parse(Array("\u{1B}]0;My Title\u{07}".utf8)) == [.setTitle("My Title")], "OSC 0 BEL sets title")
         expect(parser.parse(Array("\u{1B}]2;Other\u{1B}\\".utf8)) == [.setTitle("Other")], "OSC 2 ST sets title")
+        expect(parser.parse(Array("\u{1B}]0;\u{2733} Claude Code\u{07}".utf8)) == [.setTitle("\u{2733} Claude Code")], "OSC title decodes multi-byte UTF-8, not Latin-1 per byte")
         expect(parser.parse(Array("\u{1B}]52;c;abc\u{07}".utf8)).isEmpty, "unknown OSC is ignored")
         expect(parser.parse(Array("\u{1B}[>c".utf8)).isEmpty, "device attributes query is ignored")
         expect(parser.parse(Array("\u{1B}(B".utf8)).isEmpty, "charset selection is consumed")
@@ -224,6 +225,19 @@ struct FinderPathTerminalTests {
         screen.apply(.setMode(.alternateScreen, false))
         expect(!screen.usingAlternateScreen, "back to primary screen")
         expect(screen.lineText(0) == "abc", "primary content restored")
+
+        // Resizing the alternate screen hands the app a clean slate: it repaints
+        // fully on the following SIGWINCH, so reflowing the old absolutely-
+        // positioned frame only leaves mangled overlap (the garbled Claude Code
+        // frame after a window resize). Primary-screen resize still reflows.
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        screen.apply(.setMode(.alternateScreen, true))
+        for character in "claude" { screen.apply(.print(character)) }
+        expect(screen.lineText(0) == "claude", "alt screen holds the drawn frame")
+        screen.resize(rows: 2, columns: 3)
+        expect(screen.columns == 3, "alt-screen resize applies the new width")
+        expect(screen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty,
+               "alt-screen resize clears to a clean slate, not a truncated frame")
 
         // MARK: - Screen: resize keeps the bottom rows
 

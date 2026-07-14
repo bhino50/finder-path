@@ -187,59 +187,61 @@ final class StatusItemController: NSObject {
             menu.addItem(terminalItem)
         }
 
-        if FinderPathPreferences.showOpenWithCodexItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.codexExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Codex" : "Codex Not Installed"
-                let codexItem = NSMenuItem(title: title, action: #selector(openWithCodexMenuItem), keyEquivalent: "")
-                codexItem.target = self
-                codexItem.keyEquivalentModifierMask = []
-                codexItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(codexItem)
-                menu.addItem(harnessTerminalAlternate(
-                    title: "Open with Codex in FinderPath Terminal",
-                    action: #selector(openCodexInTerminalMenuItem),
-                    enabled: state.hasCopyablePath && availability.isInstalled
-                ))
+        // Each agent launcher opens an external terminal by default; holding
+        // Option when the menu opens swaps it to run the agent inside the
+        // built-in FinderPath terminal. Menus shown with popUp do not drive
+        // AppKit's live alternate-item swap, so the modifier is read once when
+        // the menu is built (hold Option, then open the menu).
+        func addHarnessItem(show: Bool, executable: String, name: String, externalAction: Selector, terminalAction: Selector) {
+            guard show else { return }
+            let availability = AgentLauncher.availability(for: executable)
+            guard !hideUnavailableAgents || availability.isInstalled else { return }
+            addPendingLauncherSeparator()
+            guard availability.isInstalled else {
+                let item = NSMenuItem(title: "\(name) Not Installed", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+                return
             }
+            let enabled = state.hasCopyablePath
+            // Primary (no modifier): the external terminal, today's default.
+            // Option-held alternate: the built-in FinderPath terminal. NSMenu
+            // swaps them live while the menu is open, so the "…in FinderPath
+            // Terminal" row appears only while Option is held.
+            let external = NSMenuItem(title: "Open with \(name)", action: externalAction, keyEquivalent: "")
+            external.target = self
+            external.keyEquivalentModifierMask = []
+            external.isEnabled = enabled
+            menu.addItem(external)
+            let inTerminal = NSMenuItem(title: "Open with \(name) in FinderPath Terminal", action: terminalAction, keyEquivalent: "")
+            inTerminal.target = self
+            inTerminal.isAlternate = true
+            inTerminal.keyEquivalentModifierMask = .option
+            inTerminal.isEnabled = enabled
+            menu.addItem(inTerminal)
         }
 
-        if FinderPathPreferences.showOpenWithClaudeItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.claudeExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Claude" : "Claude Not Installed"
-                let claudeItem = NSMenuItem(title: title, action: #selector(openWithClaudeMenuItem), keyEquivalent: "")
-                claudeItem.target = self
-                claudeItem.keyEquivalentModifierMask = []
-                claudeItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(claudeItem)
-                menu.addItem(harnessTerminalAlternate(
-                    title: "Open with Claude in FinderPath Terminal",
-                    action: #selector(openClaudeInTerminalMenuItem),
-                    enabled: state.hasCopyablePath && availability.isInstalled
-                ))
-            }
-        }
-
-        if FinderPathPreferences.showOpenWithHermesItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Hermes" : "Hermes Not Installed"
-                let hermesItem = NSMenuItem(title: title, action: #selector(openWithHermesMenuItem), keyEquivalent: "")
-                hermesItem.target = self
-                hermesItem.keyEquivalentModifierMask = []
-                hermesItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(hermesItem)
-                menu.addItem(harnessTerminalAlternate(
-                    title: "Open with Hermes in FinderPath Terminal",
-                    action: #selector(openHermesInTerminalMenuItem),
-                    enabled: state.hasCopyablePath && availability.isInstalled
-                ))
-            }
-        }
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithCodexItem,
+            executable: FinderPathPreferences.codexExecutable,
+            name: "Codex",
+            externalAction: #selector(openWithCodexMenuItem),
+            terminalAction: #selector(openCodexInTerminalMenuItem)
+        )
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithClaudeItem,
+            executable: FinderPathPreferences.claudeExecutable,
+            name: "Claude",
+            externalAction: #selector(openWithClaudeMenuItem),
+            terminalAction: #selector(openClaudeInTerminalMenuItem)
+        )
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithHermesItem,
+            executable: FinderPathPreferences.hermesExecutable,
+            name: "Hermes",
+            externalAction: #selector(openWithHermesMenuItem),
+            terminalAction: #selector(openHermesInTerminalMenuItem)
+        )
 
         if FinderPathPreferences.showTerminalsSection {
             menu.addItem(.separator())
@@ -426,17 +428,6 @@ final class StatusItemController: NSObject {
 
     private func closeTerminal(_ session: TerminalSession) {
         TerminalSessionStore.shared.remove(session)
-    }
-
-    /// An Option-revealed alternate that opens an agent inside the built-in
-    /// terminal instead of an external one.
-    private func harnessTerminalAlternate(title: String, action: Selector, enabled: Bool) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
-        item.isAlternate = true
-        item.keyEquivalentModifierMask = .option
-        item.isEnabled = enabled
-        return item
     }
 
     /// Opens a new built-in terminal in the current folder that runs the given

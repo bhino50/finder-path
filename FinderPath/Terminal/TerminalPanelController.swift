@@ -31,8 +31,10 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private let store: TerminalSessionStore
     private let newSessionDirectory: () -> String
 
-    /// True while the content lives in the floating panel instead of the popover.
-    private(set) var isPinned = false
+    /// True while the content lives in the resizable floating window instead of
+    /// the popover. The window is the default surface so the terminal resizes
+    /// from every edge; unpinning returns to the menu-bar popover.
+    private(set) var isPinned = true
 
     private let contentView = NSView()
     private let terminalView = TerminalView(frame: .zero)
@@ -48,6 +50,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     /// Anchor for re-showing the popover after unpinning. Held weakly so the
     /// panel never keeps status bar machinery alive.
     private weak var lastStatusButton: NSStatusBarButton?
+    /// The panel is auto-placed near the menu bar only on its first appearance;
+    /// after that the user's position (and window autosave) win.
+    private var hasPositionedPanel = false
 
     init(store: TerminalSessionStore, newSessionDirectory: @escaping () -> String) {
         self.store = store
@@ -106,6 +111,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             contentView.removeFromSuperview()
             panel.contentView = contentView
         }
+        positionPanelIfNeeded(panel)
         activateCurrentOrFirstSession()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -168,10 +174,31 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         // down the content view while sessions are still running.
         created.isReleasedWhenClosed = false
         created.contentMinSize = Layout.minimumSize
-        created.center()
         created.setFrameAutosaveName(Self.panelFrameAutosaveName)
         panel = created
         return created
+    }
+
+    /// Places the panel near the menu bar on its first show when the user has
+    /// no saved window frame yet; a saved autosave frame always wins.
+    private func positionPanelIfNeeded(_ panel: NSPanel) {
+        guard !hasPositionedPanel else { return }
+        hasPositionedPanel = true
+        let autosaveKey = "NSWindow Frame \(Self.panelFrameAutosaveName)"
+        guard UserDefaults.standard.string(forKey: autosaveKey) == nil else { return }
+        guard let statusButton = lastStatusButton, let buttonWindow = statusButton.window else {
+            panel.center()
+            return
+        }
+        let buttonInScreen = buttonWindow.convertToScreen(statusButton.convert(statusButton.bounds, to: nil))
+        let visible = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? panel.frame
+        var frame = panel.frame
+        // Right edge under the status item, top just below the menu bar, clamped
+        // to the visible screen.
+        let originX = min(max(buttonInScreen.maxX - frame.width, visible.minX), visible.maxX - frame.width)
+        let originY = max(buttonInScreen.minY - frame.height - 4, visible.minY)
+        frame.origin = NSPoint(x: originX, y: originY)
+        panel.setFrame(frame, display: false)
     }
 
     // MARK: - Pinning
@@ -412,6 +439,9 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         resizeGrip.onResizeBegan = { [weak self] in self?.contentView.frame.size ?? .zero }
         resizeGrip.onResize = { [weak self] size in self?.applyContentResize(size) }
         contentView.addSubview(resizeGrip)
+        // The window resizes from its own edges, so the grip serves only the
+        // popover; hide it while pinned (the default surface).
+        resizeGrip.isHidden = isPinned
 
         NSLayoutConstraint.activate([
             topBar.topAnchor.constraint(equalTo: contentView.topAnchor),

@@ -354,7 +354,16 @@ struct TerminalScreen {
             }
         }
 
-        grid = Self.resizeGrid(grid, rows: targetRows, columns: targetColumns)
+        if usingAlternateScreen {
+            // A full-screen (alternate-screen) app owns its buffer and repaints
+            // it on the SIGWINCH that follows a resize. Reflowing the old,
+            // absolutely-positioned frame into the new width leaves mangled
+            // overlap the app's redraw may not fully clear (e.g. a resized
+            // Claude Code / vim frame), so hand it a clean slate instead.
+            grid = Self.blankGrid(rows: targetRows, columns: targetColumns)
+        } else {
+            grid = Self.resizeGrid(grid, rows: targetRows, columns: targetColumns)
+        }
         if let saved = savedPrimary {
             savedPrimary = (
                 Self.resizeGrid(saved.grid, rows: targetRows, columns: targetColumns),

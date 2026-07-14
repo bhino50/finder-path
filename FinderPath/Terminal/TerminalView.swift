@@ -100,6 +100,10 @@ final class TerminalView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        // Redraw the terminal contents during a live resize instead of letting
+        // the layer stretch or drop its cached bitmap — otherwise the text
+        // blanks while the window is being resized.
+        layerContentsRedrawPolicy = .duringViewResize
     }
 
     required init?(coder: NSCoder) {
@@ -162,6 +166,16 @@ final class TerminalView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         pushGridSizeToSession()
+        // The redraw pipeline only reacts to PTY output, so a resize with no new
+        // output would otherwise leave the view blank at its new size.
+        needsDisplay = true
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        // Reconcile the grid to the final size and force one clean repaint.
+        pushGridSizeToSession(force: true)
+        needsDisplay = true
     }
 
     private func gridSize() -> (rows: Int, columns: Int) {

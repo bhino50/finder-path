@@ -172,6 +172,7 @@ final class TerminalSession: Identifiable {
     // MARK: - Output
 
     private func handleOutput(_ bytes: [UInt8]) {
+        logRawBytes(bytes)
         let actions = parser.parse(bytes)
         guard !actions.isEmpty else { return }
         for action in actions {
@@ -184,6 +185,35 @@ final class TerminalSession: Identifiable {
         if screen.title != lastNotifiedTitle {
             lastNotifiedTitle = screen.title
             onTitleChange?()
+        }
+    }
+
+    // MARK: - Debug byte capture
+
+    /// Opt-in raw PTY capture for diagnosing render issues: set the environment
+    /// variable FINDERPATH_TERMINAL_LOG=1 to append to ~/finderpath-terminal.log,
+    /// or =<path> for a custom file. Off (nil) by default.
+    private static let debugLogURL: URL? = {
+        guard let value = ProcessInfo.processInfo.environment["FINDERPATH_TERMINAL_LOG"],
+              !value.isEmpty else { return nil }
+        if value == "1" || value.lowercased() == "true" {
+            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("finderpath-terminal.log")
+        }
+        return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
+    }()
+
+    /// Appends the exact bytes handed to the parser as space-separated hex, one
+    /// line per chunk. All failures are swallowed so logging never disrupts I/O.
+    private func logRawBytes(_ bytes: [UInt8]) {
+        guard let url = Self.debugLogURL, !bytes.isEmpty else { return }
+        let line = bytes.map { String(format: "%02x", $0) }.joined(separator: " ") + "\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
         }
     }
 
