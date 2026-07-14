@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$ROOT_DIR/FinderPath"
-SRCS=("$SRC_DIR"/*.swift)
+SRCS=("$SRC_DIR"/*.swift "$SRC_DIR"/Terminal/*.swift)
 PLIST_TEMPLATE="$ROOT_DIR/Info.plist"
 PBXPROJ="$ROOT_DIR/FinderPath.xcodeproj/project.pbxproj"
 

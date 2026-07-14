@@ -12,6 +12,17 @@ final class StatusItemController: NSObject {
     private var remoteConnectionWindowController: RemoteConnectionWindowController?
     private var copyConfirmationTask: Task<Void, Never>?
 
+    // Lazy so the panel (and its views) only exist once terminals are used.
+    // New sessions start in the current Finder folder when it is a real path,
+    // falling back to home when Finder has no usable selection.
+    private lazy var terminalPanelController = TerminalPanelController(
+        store: .shared,
+        newSessionDirectory: { [weak self] in
+            guard let self, self.state.hasCopyablePath else { return NSHomeDirectory() }
+            return self.state.currentPath
+        }
+    )
+
     private static let copyConfirmationNanoseconds: UInt64 = 1_000_000_000
 
     override init() {
@@ -45,21 +56,31 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        // Right-click goes straight to the terminal panel (the button sends
+        // rightMouseUp); refresh keeps the new-session directory current.
+        if FinderPathPreferences.rightClickOpensTerminals,
+           NSApp.currentEvent?.type == .rightMouseUp {
+            state.refresh()
+            terminalPanelController.toggle(relativeTo: sender)
+            return
+        }
+
         // The Finder query runs off the main thread; the menu opens instantly
         // with the last-known path (or a fetching placeholder) and updates in
         // place when the result lands — NSMenu supports mutation while open.
         // A beachballed Finder can no longer freeze the click.
+        let optionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
         state.refresh { [weak self] in
             guard let self else { return }
-            self.rebuildMenu(self.menu)
+            self.rebuildMenu(self.menu, optionHeld: optionHeld)
         }
-        rebuildMenu(menu)
+        rebuildMenu(menu, optionHeld: optionHeld)
         sender.highlight(true)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
         sender.highlight(false)
     }
 
-    private func rebuildMenu(_ menu: NSMenu) {
+    private func rebuildMenu(_ menu: NSMenu, optionHeld: Bool) {
         menu.removeAllItems()
         menu.autoenablesItems = false
 
@@ -167,40 +188,87 @@ final class StatusItemController: NSObject {
             menu.addItem(terminalItem)
         }
 
-        if FinderPathPreferences.showOpenWithCodexItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.codexExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Codex" : "Codex Not Installed"
-                let codexItem = NSMenuItem(title: title, action: #selector(openWithCodexMenuItem), keyEquivalent: "")
-                codexItem.target = self
-                codexItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(codexItem)
+        // Each agent launcher opens an external terminal by default; holding
+        // Option when the menu opens swaps it to run the agent inside the
+        // built-in FinderPath terminal. Menus shown with popUp do not drive
+        // AppKit's live alternate-item swap, so the modifier is read once when
+        // the menu is built (hold Option, then open the menu).
+        func addHarnessItem(show: Bool, executable: String, name: String, externalAction: Selector, terminalAction: Selector) {
+            guard show else { return }
+            let availability = AgentLauncher.availability(for: executable)
+            guard !hideUnavailableAgents || availability.isInstalled else { return }
+            addPendingLauncherSeparator()
+            guard availability.isInstalled else {
+                let item = NSMenuItem(title: "\(name) Not Installed", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+                return
             }
+            let presentation = AgentLauncher.menuPresentation(name: name, optionHeld: optionHeld)
+            let action = presentation.usesBuiltInTerminal ? terminalAction : externalAction
+            let item = NSMenuItem(title: presentation.title, action: action, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = state.hasCopyablePath
+            menu.addItem(item)
         }
 
-        if FinderPathPreferences.showOpenWithClaudeItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.claudeExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Claude" : "Claude Not Installed"
-                let claudeItem = NSMenuItem(title: title, action: #selector(openWithClaudeMenuItem), keyEquivalent: "")
-                claudeItem.target = self
-                claudeItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(claudeItem)
-            }
-        }
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithCodexItem,
+            executable: FinderPathPreferences.codexExecutable,
+            name: "Codex",
+            externalAction: #selector(openWithCodexMenuItem),
+            terminalAction: #selector(openCodexInTerminalMenuItem)
+        )
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithClaudeItem,
+            executable: FinderPathPreferences.claudeExecutable,
+            name: "Claude",
+            externalAction: #selector(openWithClaudeMenuItem),
+            terminalAction: #selector(openClaudeInTerminalMenuItem)
+        )
+        addHarnessItem(
+            show: FinderPathPreferences.showOpenWithHermesItem,
+            executable: FinderPathPreferences.hermesExecutable,
+            name: "Hermes",
+            externalAction: #selector(openWithHermesMenuItem),
+            terminalAction: #selector(openHermesInTerminalMenuItem)
+        )
 
-        if FinderPathPreferences.showOpenWithHermesItem {
-            let availability = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
-            if !hideUnavailableAgents || availability.isInstalled {
-                addPendingLauncherSeparator()
-                let title = availability.isInstalled ? "Open with Hermes" : "Hermes Not Installed"
-                let hermesItem = NSMenuItem(title: title, action: #selector(openWithHermesMenuItem), keyEquivalent: "")
-                hermesItem.target = self
-                hermesItem.isEnabled = state.hasCopyablePath && availability.isInstalled
-                menu.addItem(hermesItem)
+        if FinderPathPreferences.showTerminalsSection {
+            menu.addItem(.separator())
+
+            for session in TerminalSessionStore.shared.sessions {
+                let sessionItem = NSMenuItem()
+                let row = TerminalMenuRowView(name: session.displayName)
+                row.onOpen = { [weak self] in
+                    menu.cancelTracking()
+                    self?.openTerminal(session)
+                }
+                row.onClose = { [weak self] in
+                    menu.cancelTracking()
+                    self?.closeTerminal(session)
+                }
+                sessionItem.view = row
+                sessionItem.toolTip = session.workingDirectory
+                menu.addItem(sessionItem)
             }
+
+            let newTerminalItem = NSMenuItem(
+                title: "New Terminal Here",
+                action: #selector(newTerminalHereMenuItem),
+                keyEquivalent: ""
+            )
+            newTerminalItem.target = self
+            newTerminalItem.isEnabled = state.hasCopyablePath
+            menu.addItem(newTerminalItem)
+
+            let showTerminalsItem = NSMenuItem(
+                title: "Show Terminals",
+                action: #selector(showTerminalsMenuItem),
+                keyEquivalent: ""
+            )
+            showTerminalsItem.target = self
+            menu.addItem(showTerminalsItem)
         }
 
         if FinderPathPreferences.showConnectToServerItem {
@@ -337,6 +405,70 @@ final class StatusItemController: NSObject {
         state.openWithHermes()
     }
 
+    // Clicking a terminal row opens it directly; the row's trailing button
+    // closes it. Renaming lives on the panel tab (double- or right-click).
+    // The popover is presented on the next runloop tick so the menu has fully
+    // dismissed first — a popover shown mid-menu-teardown anchors to the wrong
+    // place and loses its beak.
+    private func openTerminal(_ session: TerminalSession) {
+        guard let button = statusItem.button else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.terminalPanelController.show(session: session, relativeTo: button)
+        }
+    }
+
+    private func closeTerminal(_ session: TerminalSession) {
+        TerminalSessionStore.shared.remove(session)
+    }
+
+    /// Opens a new built-in terminal in the current folder that runs the given
+    /// agent command once the shell is ready.
+    private func openHarnessTerminal(executable: String, name: String) {
+        guard let button = statusItem.button else { return }
+        guard let resolvedPath = AgentLauncher.availability(for: executable).resolvedPath else {
+            FinderPathAlertPresenter.presentLaunchFailure(
+                "\(name) CLI was not found. Check its command or path in FinderPath Settings.",
+                displayName: name
+            )
+            return
+        }
+        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        let session = TerminalSessionStore.shared.newSession(
+            name: name,
+            workingDirectory: directory,
+            initialCommand: ShellCommand.argument(resolvedPath)
+        )
+        DispatchQueue.main.async { [weak self] in
+            self?.terminalPanelController.show(session: session, relativeTo: button)
+        }
+    }
+
+    @objc private func openCodexInTerminalMenuItem() {
+        openHarnessTerminal(executable: FinderPathPreferences.codexExecutable, name: "Codex")
+    }
+
+    @objc private func openClaudeInTerminalMenuItem() {
+        openHarnessTerminal(executable: FinderPathPreferences.claudeExecutable, name: "Claude")
+    }
+
+    @objc private func openHermesInTerminalMenuItem() {
+        openHarnessTerminal(executable: FinderPathPreferences.hermesExecutable, name: "Hermes")
+    }
+
+    @objc private func newTerminalHereMenuItem() {
+        guard let button = statusItem.button else { return }
+
+        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: directory)
+        terminalPanelController.show(session: session, relativeTo: button)
+    }
+
+    @objc private func showTerminalsMenuItem() {
+        guard let button = statusItem.button else { return }
+
+        terminalPanelController.toggle(relativeTo: button)
+    }
+
     @objc private func openConnectToServerMenuItem() {
         openRemoteConnectionWindow()
     }
@@ -347,6 +479,111 @@ final class StatusItemController: NSObject {
 
     @objc private func quitMenuItem() {
         NSApp.terminate(nil)
+    }
+}
+
+/// A terminal row in the status menu: explicit Open and Close buttons inside
+/// an accessibility group. Highlights on hover like a normal menu item.
+final class TerminalMenuRowView: NSView {
+    var onOpen: (() -> Void)?
+    var onClose: (() -> Void)?
+
+    private let openButton = NSButton()
+    private let closeButton = NSButton()
+    private var trackingArea: NSTrackingArea?
+    private let name: String
+
+    private var isHighlighted = false {
+        didSet {
+            guard isHighlighted != oldValue else { return }
+            updateOpenButtonTitle()
+            closeButton.contentTintColor = isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
+            needsDisplay = true
+        }
+    }
+
+    init(name: String) {
+        self.name = name
+        super.init(frame: NSRect(x: 0, y: 0, width: FinderPathPreferences.menuHeaderWidth, height: 22))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Terminal \(name)")
+
+        openButton.isBordered = false
+        openButton.setButtonType(.momentaryChange)
+        openButton.alignment = .left
+        openButton.lineBreakMode = .byTruncatingTail
+        openButton.target = self
+        openButton.action = #selector(openClicked)
+        openButton.toolTip = "Open this terminal"
+        openButton.setAccessibilityLabel("Open terminal \(name)")
+        openButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(openButton)
+        updateOpenButtonTitle()
+
+        closeButton.isBordered = false
+        closeButton.setButtonType(.momentaryChange)
+        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close terminal")
+        closeButton.imageScaling = .scaleProportionallyDown
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.toolTip = "Close this terminal"
+        closeButton.setAccessibilityLabel("Close terminal \(name)")
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            openButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            openButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 13),
+            closeButton.heightAnchor.constraint(equalToConstant: 13),
+            openButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHighlighted = true }
+    override func mouseExited(with event: NSEvent) { isHighlighted = false }
+
+    private func updateOpenButtonTitle() {
+        openButton.attributedTitle = NSAttributedString(
+            string: name,
+            attributes: [
+                .font: NSFont.menuFont(ofSize: 0),
+                .foregroundColor: isHighlighted ? NSColor.selectedMenuItemTextColor : NSColor.labelColor,
+            ]
+        )
+    }
+
+    @objc private func openClicked() {
+        onOpen?()
+    }
+
+    @objc private func closeClicked() {
+        onClose?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isHighlighted else { return }
+        NSColor.selectedContentBackgroundColor.setFill()
+        bounds.fill()
     }
 }
 

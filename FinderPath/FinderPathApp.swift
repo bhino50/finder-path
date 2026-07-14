@@ -19,7 +19,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let actionRouter = FinderPathActionRouter()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Launch Services normally reuses a running app, but development builds,
+        // `open -n`, or duplicate bundles can still start a second process with
+        // the same identity. Refuse the duplicate before it creates another
+        // status item or races the shared terminal-session metadata file.
+        if let bundleIdentifier = Bundle.main.bundleIdentifier,
+           let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            existing.activate(options: [.activateIgnoringOtherApps])
+            NSApp.terminate(nil)
+            return
+        }
+
         FinderPathPreferences.registerDefaults()
+        // Feed shell and scrollback preferences into every session the store
+        // creates or restores. Resolved lazily so preference edits during the
+        // session take effect on the next new terminal.
+        TerminalSessionStore.shared.configurationProvider = {
+            let override = FinderPathPreferences.terminalShellOverride.trimmingCharacters(in: .whitespaces)
+            let usesOverride = !override.isEmpty && FileManager.default.isExecutableFile(atPath: override)
+            return TerminalSessionConfiguration(
+                shellPath: usesOverride ? override : PTYProcess.defaultShell(),
+                scrollbackLimit: FinderPathPreferences.terminalScrollbackLimit
+            )
+        }
+        // Restore stored terminal sessions (metadata only; shells relaunch
+        // lazily) before the menu builds so the Terminals section is complete.
+        TerminalSessionStore.shared.loadPersistedSessions()
         NSApp.setActivationPolicy(.accessory)
         statusItemController = StatusItemController()
         statusItemController?.onOpenWelcomeGuide = { [weak self] in
@@ -40,6 +66,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Shells do not outlive the app; session metadata stays persisted.
+        TerminalSessionStore.shared.terminateAll()
         NSAppleEventManager.shared().removeEventHandler(
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)

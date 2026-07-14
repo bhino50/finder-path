@@ -38,6 +38,7 @@ README_SRC="$ROOT_DIR/script/dmg-install-readme.txt"
 ENTITLEMENTS="$ROOT_DIR/FinderPath.entitlements"
 DMG_STAGING_DIR="$ROOT_DIR/.build/dmg-staging"
 VERSION_JSON="$ROOT_DIR/download-site/version.json"
+DOWNLOAD_INDEX="$ROOT_DIR/download-site/index.html"
 
 if [[ -n "${NOTARY_PROFILE:-}" && -z "${DEVELOPER_ID:-}" ]]; then
   echo "NOTARY_PROFILE requires DEVELOPER_ID; refusing to create an ambiguous artifact." >&2
@@ -102,41 +103,98 @@ cleanup() {
 trap cleanup EXIT
 
 update_public_manifest() {
-  /usr/bin/python3 - "$VERSION" "$VERSION_JSON" <<'PY'
+  /usr/bin/python3 - "$VERSION" "$VERSION_JSON" "$DOWNLOAD_INDEX" <<'PY'
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 
-version, path = sys.argv[1], sys.argv[2]
-with open(path, encoding="utf-8") as source:
-    manifest = json.load(source)
+version, manifest_path, index_path = sys.argv[1:4]
+with open(manifest_path, encoding="utf-8") as source:
+    original_manifest = source.read()
+manifest = json.loads(original_manifest)
 if not isinstance(manifest, dict):
-    raise ValueError(f"{path} must contain a JSON object")
+    raise ValueError(f"{manifest_path} must contain a JSON object")
 
 manifest["version"] = version
 manifest["downloadURL"] = (
     "https://github.com/bhino50/finder-path/releases/download/"
     f"v{version}/FinderPath-{version}.dmg"
 )
-manifest.setdefault("notes", f"FinderPath {version}.")
+manifest["notes"] = os.environ.get("RELEASE_NOTES", f"FinderPath {version}.")
 
-directory = os.path.dirname(path) or "."
-mode = stat.S_IMODE(os.stat(path).st_mode)
-temporary_path = ""
+with open(index_path, encoding="utf-8") as source:
+    original_index = source.read()
+index, replacements = re.subn(
+    r'(class="release-note">Version )[0-9A-Za-z._-]+',
+    rf'\g<1>{version}',
+    index,
+    count=1,
+)
+if replacements != 1:
+    raise ValueError(f"Could not update the release version label in {index_path}")
+
+def stage_file(path, prefix, write_content):
+    directory = os.path.dirname(path) or "."
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=prefix, delete=False
+        ) as destination:
+            temporary_path = destination.name
+            write_content(destination)
+        os.chmod(temporary_path, mode)
+        return temporary_path
+    except Exception:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        raise
+
+def write_manifest(destination):
+    json.dump(manifest, destination, indent=2)
+    destination.write("\n")
+
+manifest_staged = stage_file(
+    manifest_path,
+    ".version.",
+    write_manifest,
+)
+index_staged = ""
+manifest_rollback = ""
+manifest_replaced = False
 try:
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=directory, prefix=".version.", delete=False
-    ) as destination:
-        temporary_path = destination.name
-        json.dump(manifest, destination, indent=2)
-        destination.write("\n")
-    os.chmod(temporary_path, mode)
-    os.replace(temporary_path, path)
+    index_staged = stage_file(index_path, ".index.", lambda destination: destination.write(index))
+    manifest_rollback = stage_file(
+        manifest_path,
+        ".rollback.",
+        lambda destination: destination.write(original_manifest),
+    )
+    os.replace(manifest_staged, manifest_path)
+    manifest_staged = ""
+    manifest_replaced = True
+    os.replace(index_staged, index_path)
+    index_staged = ""
+except Exception:
+    # If the second commit fails, restore the exact original manifest before
+    # reporting failure so the updater can never point at artifacts cleanup
+    # is about to remove.
+    if manifest_replaced:
+        os.replace(manifest_rollback, manifest_path)
+        manifest_rollback = ""
+    raise
 finally:
-    if temporary_path and os.path.exists(temporary_path):
-        os.unlink(temporary_path)
+    for temporary_path in (manifest_staged, index_staged, manifest_rollback):
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 PY
 }
 
@@ -261,7 +319,7 @@ if [[ "$PUBLIC_RELEASE" == true ]]; then
   update_public_manifest
   PUBLIC_PROMOTION_COMPLETE=true
   echo "Created notarized public release: $DMG_PATH"
-  echo "Updated $VERSION_JSON to version $VERSION"
+  echo "Updated $VERSION_JSON and $DOWNLOAD_INDEX to version $VERSION"
 else
   echo "Created non-public DMG: $DMG_PATH"
   echo "Created non-public app archive: $APP_ARCHIVE_PATH"

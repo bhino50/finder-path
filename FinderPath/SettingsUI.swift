@@ -57,6 +57,12 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.claudeExecutableKey) private var claudeExecutable = "claude"
     @AppStorage(FinderPathPreferences.hermesExecutableKey) private var hermesExecutable = "hermes"
     @AppStorage(FinderPathPreferences.hideUnavailableAgentItemsKey) private var hideUnavailableAgentItems = true
+    @AppStorage(FinderPathPreferences.showTerminalsSectionKey) private var showTerminalsSection = true
+    @AppStorage(FinderPathPreferences.rightClickOpensTerminalsKey) private var rightClickOpensTerminals = true
+    @AppStorage(FinderPathPreferences.terminalFontSizeKey) private var terminalFontSize = 12.0
+    @AppStorage(FinderPathPreferences.terminalScrollbackLimitKey) private var terminalScrollbackLimit = 2000
+    @AppStorage(FinderPathPreferences.terminalShellOverrideKey) private var terminalShellOverride = ""
+    @AppStorage(FinderPathPreferences.terminalOptionAsMetaKey) private var terminalOptionAsMeta = false
     @AppStorage(FinderPathPreferences.updateManifestURLKey) private var updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
     @State private var codexAvailability = AgentAvailability.unknown(executable: "codex")
     @State private var claudeAvailability = AgentAvailability.unknown(executable: "claude")
@@ -160,6 +166,39 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
             }
 
+            Section("Terminals") {
+                Toggle("Show Terminals menu section", isOn: $showTerminalsSection)
+                Toggle("Right-click opens terminals", isOn: $rightClickOpensTerminals)
+
+                LabeledContent("Terminal font size") {
+                    HStack {
+                        Slider(value: $terminalFontSize, in: 9...24, step: 1)
+                        Text("\(Int(terminalFontSize)) pt")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                }
+
+                LabeledContent("Scrollback limit") {
+                    HStack {
+                        TextField("Lines", value: $terminalScrollbackLimit, format: .number)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 80)
+                        Stepper("Scrollback limit", value: $terminalScrollbackLimit, in: 100...20000, step: 100)
+                            .labelsHidden()
+                    }
+                }
+
+                TextField("Shell override", text: $terminalShellOverride)
+
+                Toggle("Use Option as Meta key", isOn: $terminalOptionAsMeta)
+
+                Text("Leave the shell empty for your login shell. Option-as-Meta sends an ESC prefix; leave it off to type native Option characters.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Remote Connections") {
                 Picker("Run SSH connections in", selection: $remoteConnectionTerminal) {
                     Text("Ghostty").tag("ghostty")
@@ -211,7 +250,7 @@ struct SettingsView: View {
 
             Section("Menu Bar") {
                 LabeledContent("Click", value: "Path menu")
-                LabeledContent("Right-click", value: "Path menu")
+                LabeledContent("Right-click", value: rightClickOpensTerminals ? "Terminal panel" : "Path menu")
             }
 
             Section {
@@ -286,6 +325,12 @@ struct SettingsView: View {
         claudeExecutable = "claude"
         hermesExecutable = "hermes"
         hideUnavailableAgentItems = true
+        showTerminalsSection = true
+        rightClickOpensTerminals = true
+        terminalFontSize = 12
+        terminalScrollbackLimit = 2000
+        terminalShellOverride = ""
+        terminalOptionAsMeta = false
         updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
         scheduleAgentAvailabilityCheck()
     }

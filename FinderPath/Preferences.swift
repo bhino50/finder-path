@@ -31,6 +31,12 @@ enum FinderPathPreferences {
     static let hideUnavailableAgentItemsKey = "hideUnavailableAgentItems"
     static let completedWelcomeKey = "completedWelcome"
     static let updateManifestURLKey = "updateManifestURL"
+    static let showTerminalsSectionKey = "showTerminalsSection"
+    static let terminalFontSizeKey = "terminalFontSize"
+    static let terminalScrollbackLimitKey = "terminalScrollbackLimit"
+    static let terminalShellOverrideKey = "terminalShellOverride"
+    static let terminalOptionAsMetaKey = "terminalOptionAsMeta"
+    static let rightClickOpensTerminalsKey = "rightClickOpensTerminals"
     static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
 
     static var completedWelcome: Bool {
@@ -68,6 +74,12 @@ enum FinderPathPreferences {
             hermesExecutableKey: "hermes",
             hideUnavailableAgentItemsKey: true,
             updateManifestURLKey: defaultUpdateManifestURL,
+            showTerminalsSectionKey: true,
+            terminalFontSizeKey: 12.0,
+            terminalScrollbackLimitKey: 2000,
+            terminalShellOverrideKey: "",
+            terminalOptionAsMetaKey: false,
+            rightClickOpensTerminalsKey: true,
             completedWelcomeKey: false
         ])
     }
@@ -207,6 +219,34 @@ enum FinderPathPreferences {
         return value.isEmpty ? defaultUpdateManifestURL : value
     }
 
+    static var showTerminalsSection: Bool {
+        bool(for: showTerminalsSectionKey, defaultValue: true)
+    }
+
+    static var terminalFontSize: Double {
+        clamp(double(for: terminalFontSizeKey, defaultValue: 12), min: 9, max: 24)
+    }
+
+    static var terminalScrollbackLimit: Int {
+        Int(clamp(Double(integer(for: terminalScrollbackLimitKey, defaultValue: 2000)), min: 100, max: 20000))
+    }
+
+    /// Empty string means the user's login shell; the session layer resolves it.
+    static var terminalShellOverride: String {
+        string(for: terminalShellOverrideKey, defaultValue: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Off by default so international keyboard layouts keep native Option
+    /// characters. Terminal users can opt into ESC-prefixed Meta behavior.
+    static var terminalOptionAsMeta: Bool {
+        bool(for: terminalOptionAsMetaKey, defaultValue: false)
+    }
+
+    static var rightClickOpensTerminals: Bool {
+        bool(for: rightClickOpensTerminalsKey, defaultValue: true)
+    }
+
     static func displayPath(for path: String) -> String {
         guard !path.hasPrefix("Finder AppleScript error:") else { return path }
 
@@ -268,6 +308,14 @@ enum FinderPathPreferences {
         }
 
         return UserDefaults.standard.double(forKey: key)
+    }
+
+    private static func integer(for key: String, defaultValue: Int) -> Int {
+        if UserDefaults.standard.object(forKey: key) == nil {
+            return defaultValue
+        }
+
+        return UserDefaults.standard.integer(forKey: key)
     }
 
     private static func clamp(_ value: Double, min lowerBound: Double, max upperBound: Double) -> Double {
