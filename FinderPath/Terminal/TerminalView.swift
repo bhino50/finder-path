@@ -63,9 +63,12 @@ final class TerminalView: NSView {
             oldValue?.onScreenUpdate = nil
             scrollbackOffset = 0
             clearSelection()
+            // Grid de-duplication is per attached session. Reset it so the new
+            // session receives this view's real geometry exactly once.
+            lastPushedGrid = (rows: 0, columns: 0)
             hookSessionCallbacks()
             updateRedrawTimer()
-            pushGridSizeToSession(force: true)
+            pushGridSizeToSession()
             needsDisplay = true
             NSAccessibility.post(element: self, notification: .valueChanged)
         }
@@ -75,7 +78,7 @@ final class TerminalView: NSView {
         didSet {
             guard fontSize != oldValue else { return }
             metrics = CellMetrics(fontSize: fontSize)
-            pushGridSizeToSession(force: true)
+            pushGridSizeToSession()
             needsDisplay = true
         }
     }
@@ -182,8 +185,10 @@ final class TerminalView: NSView {
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
-        // Reconcile the grid to the final size and force one clean repaint.
-        pushGridSizeToSession(force: true)
+        // Reconcile to the final grid once. If the pixel size changed without
+        // crossing a row/column boundary, do not send a no-op SIGWINCH that
+        // makes interactive shells redraw their prompt for no reason.
+        pushGridSizeToSession()
         needsDisplay = true
     }
 
@@ -202,23 +207,31 @@ final class TerminalView: NSView {
         needsDisplay = true
     }
 
-    private func gridSize() -> (rows: Int, columns: Int) {
+    private func gridSize() -> (rows: Int, columns: Int)? {
+        // During panel/popover reparenting AppKit temporarily lays the view out
+        // at zero size. Do not turn that transient geometry into a real 2x10
+        // terminal resize; the shell would redraw at the bogus width and leave
+        // stale prompt/history cells behind when the final size arrives.
+        guard bounds.width >= metrics.cellWidth * CGFloat(Self.minimumColumns),
+              bounds.height >= metrics.cellHeight * CGFloat(Self.minimumRows) else {
+            return nil
+        }
         let rows = max(Int(bounds.height / metrics.cellHeight), Self.minimumRows)
         let columns = max(Int(bounds.width / metrics.cellWidth), Self.minimumColumns)
         return (rows, columns)
     }
 
-    private func pushGridSizeToSession(force: Bool = false) {
+    private func pushGridSizeToSession() {
         guard let session else { return }
         // Debounce during a live drag: resizing the grid/PTY on every
         // intermediate frame floods the child with SIGWINCH and, for a
         // full-screen (alternate-screen) app, reblanks the buffer each frame so
         // the view stays empty for the whole drag ("resizing loses all text").
         // The view keeps redrawing the existing grid during the drag;
-        // viewDidEndLiveResize reconciles to the final size once with force.
-        if (inLiveResize || isDeferringGridResize) && !force { return }
-        let size = gridSize()
-        guard force || size != lastPushedGrid else { return }
+        // viewDidEndLiveResize reconciles to the final cell grid once.
+        if inLiveResize || isDeferringGridResize { return }
+        guard let size = gridSize() else { return }
+        guard size != lastPushedGrid else { return }
         lastPushedGrid = size
         session.resize(rows: size.rows, columns: size.columns)
     }

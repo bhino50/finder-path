@@ -56,6 +56,11 @@ final class TerminalSession: Identifiable {
     private var pty: PTYProcess?
     private var parser = TerminalParser()
     private var lastNotifiedTitle = ""
+    /// A shell must not start until a real TerminalView has supplied its grid.
+    /// Otherwise it emits the first prompt at the 80x24 fallback, then zsh has
+    /// to redraw immediately when the panel's actual width arrives.
+    private var hasPreparedViewport = false
+    private var startWhenViewportIsReady = false
 
     init(
         id: UUID = UUID(),
@@ -85,12 +90,17 @@ final class TerminalSession: Identifiable {
     /// makes the retry explicit.
     func start() {
         guard status == .notStarted else { return }
+        guard hasPreparedViewport else {
+            startWhenViewportIsReady = true
+            return
+        }
         spawn()
     }
 
     func restart() {
         pty?.terminate()
         pty = nil
+        startWhenViewportIsReady = false
         parser = TerminalParser()
         screen = TerminalScreen(
             rows: screen.rows,
@@ -121,13 +131,18 @@ final class TerminalSession: Identifiable {
         // been replaced by restart(); without them a stale exit callback
         // could mark a freshly restarted session as dead.
         process.onOutput = { [weak self, weak process] bytes in
-            Task { @MainActor in
+            // PTY output is produced on one serial read queue. Dispatching that
+            // queue directly onto the serial main queue preserves byte-chunk
+            // order; separate unstructured Tasks may execute out of order and
+            // split zsh's erase/cursor/redraw sequences during history recall
+            // or a SIGWINCH resize burst.
+            DispatchQueue.main.async {
                 guard let self, let process, self.pty === process else { return }
                 self.handleOutput(bytes)
             }
         }
         process.onExit = { [weak self, weak process] code in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 guard let self, let process, self.pty === process else { return }
                 // Keep the pty reference so buffered output that lands after
                 // the exit notification (the two arrive on unordered queues)
@@ -276,6 +291,12 @@ final class TerminalSession: Identifiable {
 
     func resize(rows: Int, columns: Int) {
         screen.resize(rows: rows, columns: columns)
+        hasPreparedViewport = true
+        if status == .notStarted, startWhenViewportIsReady {
+            startWhenViewportIsReady = false
+            spawn()
+            return
+        }
         pty?.resize(rows: rows, columns: columns)
     }
 }
