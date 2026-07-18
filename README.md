@@ -30,9 +30,14 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 
 ---
 
-## Screenshot
+## Screenshots
 
-![FinderPath menu bar screenshot](download-site/assets/finderpath-icon.png)
+| Menu bar actions | Remote connections |
+| --- | --- |
+| <img src="docs/screenshots/finderpath-menu.png" alt="FinderPath menu showing the current Finder path and quick actions" width="380"> | <img src="docs/screenshots/connect-to-server.png" alt="FinderPath Connect to Server window showing Tailscale devices and saved servers" width="460"> |
+| Copy a path or `cd` command, launch tools and agents, or open a built-in terminal without leaving Finder. | Browse Tailscale devices and saved SSH servers, then choose Ghostty or macOS Terminal for the connection. |
+
+The screenshots use fictional example paths, device names, usernames, and IP addresses.
 
 ---
 
