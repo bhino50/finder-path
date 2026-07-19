@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // status item or races the shared terminal-session metadata file.
         let currentPID = ProcessInfo.processInfo.processIdentifier
         let currentBundleIdentifier = Bundle.main.bundleIdentifier
+        let currentLaunchDate = NSRunningApplication.current.launchDate
         let existingApplications = NSWorkspace.shared.runningApplications.filter { application in
             guard application.processIdentifier != currentPID else { return false }
             if Self.finderPathBundleIdentifiers.contains(application.bundleIdentifier ?? "") {
@@ -41,25 +42,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 && application.executableURL?.lastPathComponent == "FinderPath"
         }
 
-        // The official app owns the production identity. If an old development
-        // bundle was left running, ask it to quit and continue launching the
-        // official build instead of sending the user back to stale code.
-        if currentBundleIdentifier == Self.releaseBundleIdentifier {
-            for developmentApp in existingApplications
-                where developmentApp.bundleIdentifier == Self.developmentBundleIdentifier {
-                developmentApp.terminate()
-            }
-        }
-
-        if let existing = existingApplications.first(where: { application in
-            if currentBundleIdentifier == Self.releaseBundleIdentifier {
-                return application.bundleIdentifier != Self.developmentBundleIdentifier
-            }
-            return true
+        // Every contender computes the same winner: official builds outrank
+        // development builds, then the older launch wins, with PID as a stable
+        // tie-breaker. This prevents two simultaneous launches from both
+        // yielding or both creating a status item.
+        if let existing = existingApplications.first(where: {
+            Self.shouldYieldCurrentInstance(
+                bundleIdentifier: currentBundleIdentifier,
+                launchDate: currentLaunchDate,
+                pid: currentPID,
+                to: $0
+            )
         }) {
             existing.activate(options: [.activateIgnoringOtherApps])
             NSApp.terminate(nil)
             return
+        }
+
+        // This process is the deterministic winner. Ask stale, lower-priority,
+        // or newer duplicates to exit before constructing shared app state.
+        for existing in existingApplications {
+            existing.terminate()
         }
 
         FinderPathPreferences.registerDefaults()
@@ -94,6 +97,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)
         )
+    }
+
+    private static func shouldYieldCurrentInstance(
+        bundleIdentifier: String?,
+        launchDate: Date?,
+        pid: pid_t,
+        to other: NSRunningApplication
+    ) -> Bool {
+        let currentPriority = instancePriority(bundleIdentifier)
+        let otherPriority = instancePriority(other.bundleIdentifier)
+        if currentPriority != otherPriority { return otherPriority < currentPriority }
+
+        if let launchDate, let otherLaunchDate = other.launchDate, launchDate != otherLaunchDate {
+            return otherLaunchDate < launchDate
+        }
+        return other.processIdentifier < pid
+    }
+
+    private static func instancePriority(_ bundleIdentifier: String?) -> Int {
+        switch bundleIdentifier {
+        case releaseBundleIdentifier: 0
+        case developmentBundleIdentifier: 1
+        default: 2
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

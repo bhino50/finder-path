@@ -68,7 +68,7 @@ enum FinderPathPreferences {
             statusIconKey: "folder",
             showStatusTitleKey: false,
             statusTitleKey: "FP",
-            cdQuoteStyleKey: "double",
+            cdQuoteStyleKey: "single",
             codexExecutableKey: "codex",
             claudeExecutableKey: "claude",
             hermesExecutableKey: "hermes",
@@ -194,7 +194,7 @@ enum FinderPathPreferences {
     }
 
     static var cdQuoteStyle: String {
-        string(for: cdQuoteStyleKey, defaultValue: "double")
+        string(for: cdQuoteStyleKey, defaultValue: "single")
     }
 
     static var codexExecutable: String {

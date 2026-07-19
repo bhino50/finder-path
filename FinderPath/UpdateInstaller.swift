@@ -12,6 +12,46 @@ enum UpdateInstaller {
     static let expectedTeamID = "VJPMCBH6NX"
     private static let maximumArchiveSize: Int64 = 256 * 1_024 * 1_024
 
+    /// Cancels an oversized update while bytes are still arriving. The final
+    /// file-size check remains as a second line of defense for responses whose
+    /// expected length is unknown or inaccurate.
+    private final class DownloadSizeLimiter: NSObject, URLSessionDownloadDelegate {
+        private let maximumSize: Int64
+        private let lock = NSLock()
+        private var exceeded = false
+
+        init(maximumSize: Int64) {
+            self.maximumSize = maximumSize
+        }
+
+        var didExceedLimit: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return exceeded
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            let knownLengthIsTooLarge = totalBytesExpectedToWrite > maximumSize
+            guard totalBytesWritten > maximumSize || knownLengthIsTooLarge else { return }
+            lock.lock()
+            exceeded = true
+            lock.unlock()
+            downloadTask.cancel()
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {}
+    }
+
     enum InstallError: LocalizedError {
         case noArchiveURL
         case downloadFailed(String)
@@ -60,10 +100,19 @@ enum UpdateInstaller {
         // Ephemeral session for the same reason as UpdateChecker.check: no
         // persisted HTTP/3 mappings, so the download cannot stall on networks
         // that silently drop UDP 443 (QUIC).
-        let session = URLSession(configuration: .ephemeral)
+        let sizeLimiter = DownloadSizeLimiter(maximumSize: maximumArchiveSize)
+        let session = URLSession(
+            configuration: .ephemeral,
+            delegate: sizeLimiter,
+            delegateQueue: nil
+        )
         session.downloadTask(with: archiveURL) { location, response, error in
             defer { session.finishTasksAndInvalidate() }
             if let error {
+                if sizeLimiter.didExceedLimit {
+                    finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
+                    return
+                }
                 finish(.failure(.downloadFailed(error.localizedDescription)))
                 return
             }
@@ -77,6 +126,10 @@ enum UpdateInstaller {
             }
             guard let finalURL = httpResponse.url, isHTTPSWebURL(finalURL) else {
                 finish(.failure(.downloadFailed("The update redirected to a non-HTTPS location.")))
+                return
+            }
+            if httpResponse.expectedContentLength > maximumArchiveSize {
+                finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
                 return
             }
             guard let location else {

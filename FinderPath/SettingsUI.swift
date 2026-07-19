@@ -51,7 +51,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.statusIconKey) private var statusIcon = "folder"
     @AppStorage(FinderPathPreferences.showStatusTitleKey) private var showStatusTitle = false
     @AppStorage(FinderPathPreferences.statusTitleKey) private var statusTitle = "FP"
-    @AppStorage(FinderPathPreferences.cdQuoteStyleKey) private var cdQuoteStyle = "double"
+    @AppStorage(FinderPathPreferences.cdQuoteStyleKey) private var cdQuoteStyle = "single"
     @AppStorage(FinderPathPreferences.remoteConnectionTerminalKey) private var remoteConnectionTerminal = "ghostty"
     @AppStorage(FinderPathPreferences.codexExecutableKey) private var codexExecutable = "codex"
     @AppStorage(FinderPathPreferences.claudeExecutableKey) private var claudeExecutable = "claude"
@@ -319,7 +319,7 @@ struct SettingsView: View {
         statusIcon = "folder"
         showStatusTitle = false
         statusTitle = "FP"
-        cdQuoteStyle = "double"
+        cdQuoteStyle = "single"
         remoteConnectionTerminal = "ghostty"
         codexExecutable = "codex"
         claudeExecutable = "claude"

@@ -26,7 +26,8 @@ jobs:
             FinderPath/Assets.xcassets/Contents.json \
             FinderPath/Assets.xcassets/AppIcon.appiconset/Contents.json \
             FinderPath/Assets.xcassets/AccentColor.colorset/Contents.json \
-            download-site/version.json
+            download-site/version.json \
+            download-site/vercel.json
           bash -n script/build_and_run.sh
           bash -n script/run_no_xcode.sh
           bash -n script/test_logic.sh

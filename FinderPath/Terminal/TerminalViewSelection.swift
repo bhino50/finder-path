@@ -84,7 +84,11 @@ extension TerminalView {
                 continue
             }
             let upperBound = min(lastColumn, cells.count - 1)
-            let text = String(cells[firstColumn...upperBound].map(\.character))
+            let text = String(
+                cells[firstColumn...upperBound]
+                    .filter { !$0.isContinuation }
+                    .map(\.character)
+            )
             // Trailing blanks on a terminal row are padding, not content.
             lines.append(String(text.reversed().drop(while: { $0 == " " }).reversed()))
         }

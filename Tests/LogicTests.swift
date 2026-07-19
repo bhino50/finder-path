@@ -42,6 +42,11 @@ struct FinderPathLogicTests {
                 == "\"\\$HOME/\\`pwd\\`/\\\"folder\\\"\"",
             "double-quote escaping should protect substitutions"
         )
+        expect(
+            TerminalBridge.escapedAppleScriptString("one\rtwo\n\"three\"\\four")
+                == "one two \\\"three\\\"\\\\four",
+            "Terminal AppleScript strings should neutralize CR, LF, quotes, and backslashes"
+        )
 
         expect(AgentLauncher.availability(for: "/bin/sh").resolvedPath == "/bin/sh", "absolute executables should resolve")
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")
