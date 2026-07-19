@@ -63,7 +63,7 @@ struct TerminalScreen {
 
     func lineText(_ row: Int) -> String {
         guard row >= 0, row < rows else { return "" }
-        return String(grid[row].prefix(columns).map(\.character))
+        return String(grid[row].prefix(columns).filter { !$0.isContinuation }.map(\.character))
     }
 
     // MARK: - Applying actions
@@ -113,7 +113,7 @@ struct TerminalScreen {
         case .eraseCharacters(let amount):
             discardHiddenColumns(in: cursorRow)
             let end = min(cursorColumn + max(amount, 1), columns)
-            for column in cursorColumn..<end { grid[cursorRow][column] = blankCell }
+            eraseCells(in: cursorColumn..<end, row: cursorRow)
         case .setScrollRegion(let top, let bottom):
             let resolvedBottom = (bottom <= 0 || bottom > rows) ? rows : bottom
             let newTop = clampRow(top - 1)
@@ -190,16 +190,194 @@ struct TerminalScreen {
     // MARK: - Printing and scrolling
 
     private mutating func printCharacter(_ character: Character) {
+        if shouldExtendPreviousCell(with: character), appendToPreviousCell(character) {
+            return
+        }
+
+        let width = Self.columnWidth(of: character)
+        guard width > 0 else { return }
+
         if pendingWrap && autowrap {
             cursorColumn = 0
             lineFeed()
         }
+
+        // A double-width grapheme cannot start in the final column. Wrap it
+        // before drawing when possible; a one-column terminal degrades to a
+        // single visible cell rather than corrupting the row.
+        if width == 2, columns > 1, cursorColumn == columns - 1, autowrap {
+            cursorColumn = 0
+            lineFeed()
+        }
+
         discardHiddenColumns(in: cursorRow)
+        clearGlyph(atRow: cursorRow, column: cursorColumn)
         grid[cursorRow][cursorColumn] = TerminalCell(character: character, style: brush)
-        if cursorColumn == columns - 1 {
+
+        if width == 2, cursorColumn + 1 < columns {
+            clearGlyph(atRow: cursorRow, column: cursorColumn + 1)
+            grid[cursorRow][cursorColumn + 1] = .continuation(with: brush)
+            if cursorColumn + 1 == columns - 1 {
+                cursorColumn = columns - 1
+                pendingWrap = autowrap
+            } else {
+                cursorColumn += 2
+            }
+        } else if cursorColumn == columns - 1 {
             pendingWrap = autowrap
         } else {
             cursorColumn += 1
+        }
+    }
+
+    /// Number of fixed terminal columns occupied by a grapheme. This is a
+    /// deliberately compact wcwidth implementation covering combining marks,
+    /// emoji sequences, and the East Asian wide/full-width ranges terminals
+    /// encounter most often.
+    nonisolated static func columnWidth(of character: Character) -> Int {
+        let scalars = character.unicodeScalars
+        guard !scalars.isEmpty else { return 0 }
+        if scalars.allSatisfy(isZeroWidth) { return 0 }
+        if scalars.contains(where: isWide) { return 2 }
+        return 1
+    }
+
+    private nonisolated static func isZeroWidth(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark, .format:
+            return true
+        default:
+            break
+        }
+
+        switch scalar.value {
+        case 0x1160...0x11FF, // Hangul Jamo medial/final
+             0x1F3FB...0x1F3FF, // emoji skin-tone modifiers
+             0xE0100...0xE01EF: // supplementary variation selectors
+            return true
+        default:
+            return false
+        }
+    }
+
+    private nonisolated static func isWide(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x1100...0x115F,
+             0x2329...0x232A,
+             0x2E80...0x303E,
+             0x3040...0xA4CF,
+             0xAC00...0xD7A3,
+             0xF900...0xFAFF,
+             0xFE10...0xFE19,
+             0xFE30...0xFE6F,
+             0xFF00...0xFF60,
+             0xFFE0...0xFFE6,
+             0x1F1E6...0x1F1FF,
+             0x1F300...0x1FAFF,
+             0x20000...0x3FFFD,
+             0xFE0F: // emoji presentation selector in a larger grapheme
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func previousBaseColumn() -> Int? {
+        var column: Int
+        if pendingWrap {
+            column = cursorColumn
+        } else {
+            guard cursorColumn > 0 else { return nil }
+            column = cursorColumn - 1
+        }
+        if grid[cursorRow][column].isContinuation {
+            guard column > 0 else { return nil }
+            column -= 1
+        }
+        return grid[cursorRow][column].isContinuation ? nil : column
+    }
+
+    private func shouldExtendPreviousCell(with character: Character) -> Bool {
+        if Self.columnWidth(of: character) == 0 { return true }
+        guard let column = previousBaseColumn() else { return false }
+        let previousScalars = grid[cursorRow][column].character.unicodeScalars
+        if previousScalars.last?.value == 0x200D { return true } // emoji ZWJ sequence
+
+        let incomingIsRegionalIndicator = character.unicodeScalars.allSatisfy {
+            (0x1F1E6...0x1F1FF).contains($0.value)
+        }
+        let previousRegionalCount = previousScalars.filter {
+            (0x1F1E6...0x1F1FF).contains($0.value)
+        }.count
+        return incomingIsRegionalIndicator && previousRegionalCount % 2 == 1
+    }
+
+    private mutating func appendToPreviousCell(_ character: Character) -> Bool {
+        guard let column = previousBaseColumn() else { return false }
+        let existing = grid[cursorRow][column].character
+        let combinedText = String(existing) + String(character)
+        guard combinedText.count == 1, let combined = combinedText.first else { return false }
+
+        let oldWidth = Self.columnWidth(of: existing)
+        let newWidth = Self.columnWidth(of: combined)
+        if oldWidth == 1, newWidth == 2 {
+            let continuationColumn = column + 1
+            guard continuationColumn < columns else { return false }
+            clearGlyph(atRow: cursorRow, column: continuationColumn)
+            grid[cursorRow][continuationColumn] = .continuation(with: grid[cursorRow][column].style)
+            if cursorColumn == continuationColumn {
+                if continuationColumn == columns - 1 {
+                    pendingWrap = autowrap
+                } else {
+                    cursorColumn += 1
+                }
+            }
+        }
+        grid[cursorRow][column].character = combined
+        return true
+    }
+
+    private mutating func clearGlyph(atRow row: Int, column: Int) {
+        guard row >= 0, row < grid.count, column >= 0, column < grid[row].count else { return }
+        if grid[row][column].isContinuation {
+            if column > 0 { grid[row][column - 1] = blankCell }
+            grid[row][column] = blankCell
+            return
+        }
+        grid[row][column] = blankCell
+        if column + 1 < grid[row].count, grid[row][column + 1].isContinuation {
+            grid[row][column + 1] = blankCell
+        }
+    }
+
+    private mutating func eraseCells(in range: Range<Int>, row: Int) {
+        for column in range { clearGlyph(atRow: row, column: column) }
+    }
+
+    private mutating func normalizeWideCells(in row: Int) {
+        guard row >= 0, row < grid.count else { return }
+        let limit = min(columns, grid[row].count)
+        var column = 0
+        while column < limit {
+            let cell = grid[row][column]
+            if cell.isContinuation {
+                let hasBase = column > 0
+                    && !grid[row][column - 1].isContinuation
+                    && Self.columnWidth(of: grid[row][column - 1].character) == 2
+                if !hasBase { grid[row][column] = blankCell }
+                column += 1
+                continue
+            }
+            if Self.columnWidth(of: cell.character) == 2 {
+                guard column + 1 < limit, grid[row][column + 1].isContinuation else {
+                    grid[row][column] = blankCell
+                    column += 1
+                    continue
+                }
+                column += 2
+            } else {
+                column += 1
+            }
         }
     }
 
@@ -269,9 +447,9 @@ struct TerminalScreen {
         discardHiddenColumns(in: cursorRow)
         switch mode {
         case 0:
-            for column in cursorColumn..<columns { grid[cursorRow][column] = blankCell }
+            eraseCells(in: cursorColumn..<columns, row: cursorRow)
         case 1:
-            for column in 0...min(cursorColumn, columns - 1) { grid[cursorRow][column] = blankCell }
+            eraseCells(in: 0..<(min(cursorColumn, columns - 1) + 1), row: cursorRow)
         case 2:
             grid[cursorRow] = Array(repeating: blankCell, count: columns)
         default:
@@ -316,6 +494,7 @@ struct TerminalScreen {
         line.removeLast(count)
         line.insert(contentsOf: Array(repeating: blankCell, count: count), at: cursorColumn)
         grid[cursorRow] = line
+        normalizeWideCells(in: cursorRow)
     }
 
     private mutating func deleteCharacters(_ amount: Int) {
@@ -325,6 +504,7 @@ struct TerminalScreen {
         line.removeSubrange(cursorColumn..<(cursorColumn + count))
         line.append(contentsOf: Array(repeating: blankCell, count: count))
         grid[cursorRow] = line
+        normalizeWideCells(in: cursorRow)
     }
 
     // MARK: - Modes
@@ -443,8 +623,11 @@ struct TerminalScreen {
     /// Once output mutates that row at the new width, discard the stale overflow
     /// so it cannot reappear after newer content has replaced the line.
     private mutating func discardHiddenColumns(in row: Int) {
-        guard row >= 0, row < grid.count, grid[row].count > columns else { return }
-        grid[row] = Array(grid[row].prefix(columns))
+        guard row >= 0, row < grid.count else { return }
+        if grid[row].count > columns {
+            grid[row] = Array(grid[row].prefix(columns))
+        }
+        normalizeWideCells(in: row)
     }
 
     // MARK: - Clamping

@@ -30,8 +30,22 @@ struct CellStyle: Equatable, Sendable {
 struct TerminalCell: Equatable, Sendable {
     var character: Character
     var style: CellStyle
+    /// The trailing grid cell occupied by a double-width grapheme. Renderers
+    /// skip its character while retaining its column for cursor/background
+    /// geometry.
+    var isContinuation: Bool
+
+    init(character: Character, style: CellStyle, isContinuation: Bool = false) {
+        self.character = character
+        self.style = style
+        self.isContinuation = isContinuation
+    }
 
     static let blank = TerminalCell(character: " ", style: .plain)
+
+    static func continuation(with style: CellStyle) -> TerminalCell {
+        TerminalCell(character: " ", style: style, isContinuation: true)
+    }
 
     /// A blank cell that keeps the current background color, used when
     /// erasing so cleared regions match the active SGR background.

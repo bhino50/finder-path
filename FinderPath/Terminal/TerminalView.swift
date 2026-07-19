@@ -265,7 +265,11 @@ final class TerminalView: NSView {
         let offset = min(scrollbackOffset, screen.scrollbackCount)
         return (0..<screen.rows).map { displayRow in
             let contentLine = screen.scrollbackCount - offset + displayRow
-            let text = String(cells(forContentLine: contentLine, screen: screen).map(\.character))
+            let text = String(
+                cells(forContentLine: contentLine, screen: screen)
+                    .filter { !$0.isContinuation }
+                    .map(\.character)
+            )
             return String(text.reversed().drop(while: { $0 == " " }).reversed())
         }.joined(separator: "\n")
     }
@@ -331,11 +335,17 @@ final class TerminalView: NSView {
         // glyphs on the grid within a run; the per-run origin resets it between.
         var column = 0
         while column < rowCells.count {
+            if rowCells[column].isContinuation {
+                column += 1
+                continue
+            }
             let style = rowCells[column].style
             let startColumn = column
             var text = String(rowCells[column].character)
             var next = column + 1
-            while next < rowCells.count, rowCells[next].style == style {
+            while next < rowCells.count,
+                  !rowCells[next].isContinuation,
+                  rowCells[next].style == style {
                 text.append(rowCells[next].character)
                 next += 1
             }

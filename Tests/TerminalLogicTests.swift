@@ -136,6 +136,44 @@ struct FinderPathTerminalTests {
         expect(screen.lineText(1).hasPrefix("e"), "wrap moves print to next row")
         expect(screen.cursorRow == 1 && screen.cursorColumn == 1, "cursor advanced after wrap")
 
+        // MARK: - Screen: Unicode cell widths and split graphemes
+
+        expect(TerminalScreen.columnWidth(of: "A") == 1, "ASCII occupies one terminal column")
+        expect(TerminalScreen.columnWidth(of: "界") == 2, "CJK occupies two terminal columns")
+        expect(TerminalScreen.columnWidth(of: "😀") == 2, "emoji occupies two terminal columns")
+        expect(TerminalScreen.columnWidth(of: "\u{0301}") == 0, "combining marks occupy no terminal column")
+
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        for character in "A界B" { screen.apply(.print(character)) }
+        expect(screen.lineText(0).hasPrefix("A界B"), "wide glyph text excludes its continuation cell")
+        expect(screen.cursorColumn == 4, "wide glyph advances the cursor by two columns")
+        expect(screen.cell(atRow: 0, column: 2).isContinuation, "wide glyph reserves a continuation cell")
+
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        screen.apply(.print("e"))
+        screen.apply(.print("\u{0301}"))
+        expect(screen.cell(atRow: 0, column: 0).character == "e\u{0301}", "split combining mark joins its base cell")
+        expect(screen.cursorColumn == 1, "split combining mark does not advance the cursor")
+
+        parser = TerminalParser()
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        for action in parser.parse(Array("👩‍💻".utf8)) { screen.apply(action) }
+        expect(screen.lineText(0).hasPrefix("👩‍💻"), "split emoji ZWJ scalars rejoin one grapheme")
+        expect(screen.cursorColumn == 2, "emoji ZWJ grapheme occupies two columns")
+        expect(screen.cell(atRow: 0, column: 1).isContinuation, "emoji ZWJ grapheme keeps one continuation")
+
+        screen = TerminalScreen(rows: 2, columns: 4, scrollbackLimit: 10)
+        for character in "abc界" { screen.apply(.print(character)) }
+        expect(screen.lineText(1).hasPrefix("界"), "wide glyph wraps before the final column")
+        expect(screen.cursorRow == 1 && screen.cursorColumn == 2, "wrapped wide glyph advances by two columns")
+
+        screen = TerminalScreen(rows: 1, columns: 6, scrollbackLimit: 10)
+        for character in "A界B" { screen.apply(.print(character)) }
+        screen.apply(.moveCursor(row: 1, column: 3))
+        screen.apply(.eraseCharacters(1))
+        expect(screen.cell(atRow: 0, column: 1).character == " ", "erasing a continuation clears its wide base")
+        expect(!screen.cell(atRow: 0, column: 2).isContinuation, "erasing a wide glyph clears its continuation")
+
         screen = TerminalScreen(rows: 2, columns: 3, scrollbackLimit: 10)
         for character in "abc" { screen.apply(.print(character)) }
         screen.apply(.carriageReturn)
@@ -371,6 +409,10 @@ struct FinderPathTerminalTests {
         expect(
             !TerminalInputEncoder.encodePaste("a\u{1B}[201~b", bracketed: true).dropFirst(6).dropLast(6).contains(0x1B),
             "bracketed paste strips ESC bytes from content"
+        )
+        expect(
+            !TerminalInputEncoder.encodePaste("a\u{1B}[31mb", bracketed: false).contains(0x1B),
+            "unbracketed paste strips ESC bytes from content"
         )
 
         // MARK: - Parser: colon-delimited SGR (ITU-T)

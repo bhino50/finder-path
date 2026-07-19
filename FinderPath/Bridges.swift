@@ -409,7 +409,7 @@ enum TerminalBridge {
         with timeout of 3 seconds
             tell application "Terminal"
                 activate
-                do script "\(appleScriptString(command))"
+                do script "\(escapedAppleScriptString(command))"
             end tell
         end timeout
         """
@@ -450,7 +450,7 @@ enum TerminalBridge {
         with timeout of 3 seconds
             tell application "Terminal"
                 activate
-                do script "\(appleScriptString(command))"
+                do script "\(escapedAppleScriptString(command))"
             end tell
         end timeout
         """
@@ -483,10 +483,11 @@ enum TerminalBridge {
         return URL(fileURLWithPath: path).deletingLastPathComponent()
     }
 
-    private static func appleScriptString(_ value: String) -> String {
+    static func escapedAppleScriptString(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
     }
 }

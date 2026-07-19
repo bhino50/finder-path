@@ -108,13 +108,12 @@ enum TerminalInputEncoder {
         return (meta ? [esc] : []) + [controlByte]
     }
 
-    /// Bracketed paste wraps content in ESC[200~ / ESC[201~ and strips every
-    /// ESC byte from the pasted text so hostile clipboard content cannot end
-    /// the bracket early or inject sequences (paste-injection defense).
+    /// Strip every ESC byte from pasted text so hostile clipboard content
+    /// cannot inject terminal control sequences. Bracketed-paste mode also
+    /// wraps the sanitized content in ESC[200~ / ESC[201~.
     static func encodePaste(_ text: String, bracketed: Bool) -> [UInt8] {
-        let content = Array(text.utf8)
-        guard bracketed else { return content }
-        let sanitized = content.filter { $0 != esc }
+        let sanitized = Array(text.utf8).filter { $0 != esc }
+        guard bracketed else { return sanitized }
         return csi + Array("200~".utf8) + sanitized + csi + Array("201~".utf8)
     }
 
