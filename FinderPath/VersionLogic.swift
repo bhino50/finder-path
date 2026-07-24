@@ -173,6 +173,14 @@ enum UpdateChecker {
             return false
         }
 
+        // numericComponents truncates each component at its first non-digit, so
+        // "1.7-beta" and "1.7-rc" both reduce to [1, 7]. UpdateInstaller.verify
+        // uses this call to confirm a downloaded bundle matches the manifest,
+        // so without a suffix check a manifest advertising one prerelease would
+        // accept a different prerelease build of the same version. `compare`
+        // deliberately keeps ignoring suffixes, which is right for ordering.
+        guard prereleaseSuffix(lhs) == prereleaseSuffix(rhs) else { return false }
+
         let left = numericComponents(lhs)
         let right = numericComponents(rhs)
         let length = max(left.count, right.count)
@@ -207,6 +215,17 @@ enum UpdateChecker {
 
     private static func isHTTPSWebURL(_ url: URL) -> Bool {
         url.scheme?.lowercased() == "https" && url.host?.isEmpty == false
+    }
+
+    /// Everything after the dotted numeric prefix, normalized: "v1.7-rc.2"
+    /// yields "-rc.2" and "1.7" yields "". Only used for equality, never for
+    /// ordering, so no precedence between suffixes is implied.
+    private static func prereleaseSuffix(_ version: String) -> String {
+        let cleaned = version
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "v", with: "", options: .caseInsensitive)
+        let numericPrefix = cleaned.prefix { $0.isNumber || $0 == "." }
+        return String(cleaned.dropFirst(numericPrefix.count)).lowercased()
     }
 
     private static func numericComponents(_ version: String) -> [Int] {

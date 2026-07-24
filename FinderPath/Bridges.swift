@@ -405,6 +405,24 @@ enum TerminalBridge {
         // Terminal runs the command through a shell, so the host must be quoted.
         // `--` ends ssh option parsing so a leading-dash host can't act as a flag.
         let command = "ssh -- \(ShellCommand.argument(host))"
+        runTerminalScript(command: command, completion: completion)
+    }
+
+    /// Runs a `do script` against Terminal.app without blocking the caller.
+    ///
+    /// NSAppleScript is main-thread-only and `executeAndReturnError` blocks for
+    /// the whole Apple event round trip — which includes Terminal.app's cold
+    /// launch and the TCC Automation consent prompt, and that prompt waits on
+    /// the user indefinitely. Every caller is main-actor isolated, so this
+    /// froze the entire app, including PTY rendering in every open built-in
+    /// terminal. Running osascript in a subprocess off the main thread is the
+    /// same approach FinderBridge.fetchCurrentPath already uses, for the same
+    /// reason. The completion may run off the main actor, matching the
+    /// contract openGhostty/openSSHInGhostty already have.
+    private static func runTerminalScript(
+        command: String,
+        completion: @escaping (String?) -> Void
+    ) {
         let source = """
         with timeout of 3 seconds
             tell application "Terminal"
@@ -414,20 +432,31 @@ enum TerminalBridge {
         end timeout
         """
 
-        guard let script = NSAppleScript(source: source) else {
-            completion("Could not create the Terminal launch script.")
-            return
-        }
+        Task.detached {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", source]
+            let errorPipe = Pipe()
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = errorPipe
 
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
+            do {
+                try process.run()
+            } catch {
+                completion("Could not run the Terminal launch script: \(error.localizedDescription)")
+                return
+            }
 
-        if let error {
-            let message = error[NSAppleScript.errorMessage] as? String
-                ?? error.description
-            completion("Terminal AppleScript error: \(message)")
-        } else {
-            completion(nil)
+            // Drain before waiting so a full pipe buffer cannot deadlock exit.
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus != 0 else {
+                completion(nil)
+                return
+            }
+            let detail = String(decoding: errorData, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            completion("Terminal AppleScript error: \(detail.isEmpty ? "the script failed." : detail)")
         }
     }
 
@@ -446,30 +475,7 @@ enum TerminalBridge {
 
         // Terminal can open a folder through NSWorkspace, but running a CLI
         // command in a new tab/window requires Terminal's AppleScript interface.
-        let source = """
-        with timeout of 3 seconds
-            tell application "Terminal"
-                activate
-                do script "\(escapedAppleScriptString(command))"
-            end tell
-        end timeout
-        """
-
-        guard let script = NSAppleScript(source: source) else {
-            completion("Could not create the Terminal launch script.")
-            return
-        }
-
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
-
-        if let error {
-            let message = error[NSAppleScript.errorMessage] as? String
-                ?? error.description
-            completion("Terminal AppleScript error: \(message)")
-        } else {
-            completion(nil)
-        }
+        runTerminalScript(command: command, completion: completion)
     }
 
     private static func resolvedDirectoryURL(for path: String) -> URL {

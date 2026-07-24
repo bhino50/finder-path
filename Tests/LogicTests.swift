@@ -36,6 +36,36 @@ struct FinderPathLogicTests {
         ]
         expect(RemoteServers.parse(RemoteServers.serialize(servers)) == servers, "server persistence should round-trip")
 
+        // Prerelease builds of the same version must not be treated as equal:
+        // UpdateInstaller.verify uses this to gate replacing the running app.
+        expect(!UpdateChecker.versionsAreEquivalent("1.7-beta", "1.7-rc"), "different prereleases must not match")
+        expect(UpdateChecker.versionsAreEquivalent("1.7-beta", "v1.7-BETA"), "the same prerelease still matches")
+        expect(!UpdateChecker.versionsAreEquivalent("1.7", "1.7-beta"), "a prerelease must not match the release")
+        expect(UpdateChecker.versionsAreEquivalent("v1.7", "1.7.0"), "plain releases still match across padding")
+        // Ordering deliberately keeps ignoring suffixes.
+        expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "ordering still ignores prerelease suffixes")
+
+        // A display name is stored in line-oriented `Name = target` text, so it
+        // must survive the round trip rather than deleting or duplicating rows.
+        let awkwardName = [RemoteServer(name: "Dev = Prod", target: "dev.example.com")]
+        let awkwardRoundTrip = RemoteServers.parse(RemoteServers.serialize(awkwardName))
+        expect(awkwardRoundTrip.count == 1, "a name containing '=' must not delete the server")
+        expect(awkwardRoundTrip.first?.target == "dev.example.com", "the target survives an awkward name")
+        expect(awkwardRoundTrip.first?.name == "Dev - Prod", "the '=' is replaced rather than splitting the line")
+
+        let multilineName = [RemoteServer(name: "Dev\nEvil = evil.example.com", target: "dev.example.com")]
+        let multilineRoundTrip = RemoteServers.parse(RemoteServers.serialize(multilineName))
+        expect(multilineRoundTrip.count == 1, "a newline in a name must not inject a second server")
+        expect(multilineRoundTrip.first?.target == "dev.example.com", "the injected host is not created")
+
+        let commentName = [RemoteServer(name: "#Dev", target: "dev.example.com")]
+        let commentRoundTrip = RemoteServers.parse(RemoteServers.serialize(commentName))
+        expect(commentRoundTrip.count == 1, "a leading '#' must not comment the line out")
+        expect(commentRoundTrip.first?.name == "Dev", "the comment marker is stripped from the name")
+
+        expect(RemoteServers.sanitizedName("  spaced  ") == "spaced", "names are trimmed")
+        expect(RemoteServers.sanitizedName("###") == "", "an all-marker name collapses to empty")
+
         expect(ShellCommand.argument("it's here") == "'it'\\''s here'", "single-quote escaping should be shell-safe")
         expect(
             ShellCommand.argument("$HOME/`pwd`/\"folder\"", quoteStyle: "double")
