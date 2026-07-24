@@ -99,11 +99,22 @@ final class TerminalSessionStore {
         onChange?()
     }
 
+    /// Shells must not outlive the app. This runs from
+    /// applicationWillTerminate, where AppKit exits as soon as the delegate
+    /// returns, so the work has to finish on this thread: the asynchronous
+    /// terminate() path never got to deliver its SIGHUP and left orphaned
+    /// shells (and any agent CLI running inside them) behind.
+    ///
+    /// Every session is signalled first and the grace period is then shared,
+    /// so quitting with ten terminals open is no slower than with one.
     func terminateAll() {
-        for session in sessions {
-            session.terminate()
-        }
+        let hungUp = sessions.compactMap { $0.hangUp() }
+        PTYProcess.waitForExit(of: hungUp, upTo: Self.quitGracePeriod)
     }
+
+    /// Long enough for a shell to run its exit traps, short enough that quit
+    /// still feels immediate.
+    private static let quitGracePeriod: TimeInterval = 0.35
 
     /// Smallest free N keeps names compact after removals: with Terminal 1
     /// and Terminal 3 stored, the next session becomes Terminal 2.

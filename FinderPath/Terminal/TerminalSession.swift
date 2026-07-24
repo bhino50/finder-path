@@ -117,6 +117,14 @@ final class TerminalSession: Identifiable {
         pty?.terminate()
     }
 
+    /// Hangs the child up on the caller's thread and returns its pid so the
+    /// caller can escalate. Used on app quit, where the normal asynchronous
+    /// terminate() never gets to run before the process exits.
+    @discardableResult
+    func hangUp() -> pid_t? {
+        pty?.hangUpSynchronously()
+    }
+
     private func spawn() {
         let process = PTYProcess(
             executable: shellPath,
@@ -130,15 +138,25 @@ final class TerminalSession: Identifiable {
         // Identity checks drop late output or exits from a process that has
         // been replaced by restart(); without them a stale exit callback
         // could mark a freshly restarted session as dead.
+        // PTY output is produced on one serial read queue. Dispatching that
+        // queue directly onto the serial main queue preserves byte-chunk
+        // order; separate unstructured Tasks may execute out of order and
+        // split zsh's erase/cursor/redraw sequences during history recall
+        // or a SIGWINCH resize burst.
+        //
+        // One main-queue block per 4 KB read let the queue grow without bound:
+        // `cat` of a large file enqueued thousands of blocks faster than the
+        // main thread could run them, each paying a dispatch and a copy. Bytes
+        // now accumulate in order and a single pending block drains all of it.
+        let outputBuffer = PTYOutputBuffer()
         process.onOutput = { [weak self, weak process] bytes in
-            // PTY output is produced on one serial read queue. Dispatching that
-            // queue directly onto the serial main queue preserves byte-chunk
-            // order; separate unstructured Tasks may execute out of order and
-            // split zsh's erase/cursor/redraw sequences during history recall
-            // or a SIGWINCH resize burst.
+            guard outputBuffer.appendAndClaimDrain(bytes) else { return }
             DispatchQueue.main.async {
+                // Always drain, even when the session is gone, so the claim is
+                // released and later output can schedule another drain.
+                let pending = outputBuffer.takeAll()
                 guard let self, let process, self.pty === process else { return }
-                self.handleOutput(bytes)
+                self.handleOutput(pending)
             }
         }
         process.onExit = { [weak self, weak process] code in
@@ -298,5 +316,35 @@ final class TerminalSession: Identifiable {
             return
         }
         pty?.resize(rows: rows, columns: columns)
+    }
+}
+
+/// Coalesces PTY reads so a burst of output costs one main-queue hop instead
+/// of one per 4 KB chunk. The read source delivers on a serial queue and the
+/// drain runs on the serial main queue, so byte order is preserved end to end.
+private final class PTYOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [UInt8] = []
+    private var drainScheduled = false
+
+    /// Appends bytes and reports whether the caller now owns scheduling the
+    /// drain. Only one drain is ever outstanding, however fast output arrives.
+    func appendAndClaimDrain(_ bytes: [UInt8]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pending.append(contentsOf: bytes)
+        guard !drainScheduled else { return false }
+        drainScheduled = true
+        return true
+    }
+
+    /// Hands over everything buffered and releases the drain claim.
+    func takeAll() -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        let bytes = pending
+        pending.removeAll(keepingCapacity: true)
+        drainScheduled = false
+        return bytes
     }
 }

@@ -740,6 +740,48 @@ struct FinderPathTerminalTests {
             try? FileManager.default.removeItem(at: pidFile)
         }
 
+        // MARK: - PTY synchronous hang-up (app quit path)
+
+        // applicationWillTerminate has no time to let the async terminate()
+        // path run, so quit used to leave shells and agent CLIs orphaned.
+        do {
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 30"],
+                workingDirectory: NSTemporaryDirectory(),
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            do {
+                try pty.launch()
+                let pid = pty.hangUpSynchronously()
+                expect(pid != nil, "hangUpSynchronously reports the pid it signalled")
+                if let pid {
+                    PTYProcess.waitForExit(of: [pid], upTo: 2.0)
+                    // The child is reaped by the exit watcher, so the pid is
+                    // gone rather than a zombie once it has actually died.
+                    var stillAlive = false
+                    for _ in 0..<50 {
+                        if kill(pid, 0) != 0 { break }
+                        usleep(20_000)
+                        stillAlive = kill(pid, 0) == 0
+                    }
+                    expect(!stillAlive, "the child is dead once the synchronous hang-up returns")
+                }
+                // A second call on an already-terminated process is harmless.
+                expect(pty.hangUpSynchronously() == nil, "hanging up twice is a no-op")
+            } catch {
+                failures.append("PTY hang-up test could not launch a child: \(error)")
+            }
+        }
+        // An empty pid list must not wait out the timeout.
+        do {
+            let started = Date()
+            PTYProcess.waitForExit(of: [], upTo: 5.0)
+            expect(Date().timeIntervalSince(started) < 1.0, "waiting on no children returns at once")
+        }
+
         // MARK: - Parser: DCS / APC / PM / SOS payloads are swallowed
 
         // Without a string state the parser returned to ground immediately and

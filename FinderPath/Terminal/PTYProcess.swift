@@ -321,6 +321,52 @@ final class PTYProcess: @unchecked Sendable {
         }
     }
 
+    /// Hangs the child up on the caller's thread and returns its pid.
+    ///
+    /// terminate() does its work in `stateQueue.async` with a delayed SIGKILL,
+    /// which is right while the app is running but useless at quit: AppKit
+    /// exits as soon as applicationWillTerminate returns, so the enqueued
+    /// SIGHUP never ran and shells — along with any agent CLI inside them —
+    /// were left orphaned despite the app claiming it terminates them.
+    /// Callers escalate survivors with `waitForExit(of:upTo:)`.
+    @discardableResult
+    func hangUpSynchronously() -> pid_t? {
+        stateQueue.sync {
+            guard runningFlag, childPID > 0 else { return nil }
+            let pid = childPID
+            terminatingFlag = true
+            Self.signalSessionMembers(Self.sessionMembers(ledBy: pid), ledBy: pid, signal: SIGHUP)
+            kill(pid, SIGHUP)
+            // Closing the primary side delivers a terminal hangup and releases
+            // readers even when the shell or a foreground child is misbehaving.
+            readSource?.cancel()
+            readSource = nil
+            primaryDescriptor = -1
+            return pid
+        }
+    }
+
+    /// Waits up to `timeout` for every pid to exit, then SIGKILLs the rest.
+    /// The budget is shared across all pids, so quitting with many terminals
+    /// open costs the same as quitting with one.
+    static func waitForExit(of pids: [pid_t], upTo timeout: TimeInterval) {
+        let live = pids.filter { $0 > 1 }
+        guard !live.isEmpty else { return }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            // kill(pid, 0) keeps succeeding for a zombie, but the reaper thread
+            // waitpid()s each child, so survivors here are genuinely running.
+            if live.allSatisfy({ kill($0, 0) != 0 }) { return }
+            usleep(10_000)
+        }
+
+        for pid in live where kill(pid, 0) == 0 {
+            signalSessionMembers(sessionMembers(ledBy: pid), ledBy: pid, signal: SIGKILL)
+            kill(pid, SIGKILL)
+        }
+    }
+
     // MARK: - Output draining
 
     private func startReading(from descriptor: Int32) {
