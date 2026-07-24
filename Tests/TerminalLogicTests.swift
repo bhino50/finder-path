@@ -740,6 +740,59 @@ struct FinderPathTerminalTests {
             try? FileManager.default.removeItem(at: pidFile)
         }
 
+        // MARK: - Parser: DCS / APC / PM / SOS payloads are swallowed
+
+        // Without a string state the parser returned to ground immediately and
+        // painted the whole payload onto the grid as literal text.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}P0;1|xyz\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "a DCS payload is consumed, and text after ST still prints")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}_Ga=T,f=100;PAYLOAD\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "an APC (kitty graphics) payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}^priv\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "a PM payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Xsos\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "an SOS payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Pabc\u{07}OK".utf8)) == [.print("O"), .print("K")],
+               "BEL also terminates a device string")
+        // Split across reads, the way a real PTY delivers it.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Pdata".utf8)).isEmpty, "a partial device string emits nothing")
+        expect(parser.parse(Array("more\u{1B}\\Z".utf8)) == [.print("Z")],
+               "a device string terminated in a later read is still consumed")
+
+        // MARK: - Parser: SGR colon sub-parameters stay one attribute
+
+        parser = TerminalParser()
+        var curly = CellStyle.plain
+        curly.underline = true
+        expect(parser.parse(Array("\u{1B}[4:3m".utf8)) == [.setStyle(curly)],
+               "4:3 curly underline sets underline only, not italic")
+        expect(parser.parse(Array("\u{1B}[4:0m".utf8)) == [.setStyle(.plain)],
+               "4:0 turns the underline off")
+        // Underline colour is not rendered and must not leak into the style.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}[58:2::255:0:0m".utf8)) == [.setStyle(.plain)],
+               "58 underline colour is swallowed rather than executed")
+        // The indexed and truecolor forms must keep working.
+        parser = TerminalParser()
+        var indexed = CellStyle.plain
+        indexed.foreground = .palette(2)
+        expect(parser.parse(Array("\u{1B}[38:5:2m".utf8)) == [.setStyle(indexed)],
+               "38:5:n indexed colour still resolves")
+        parser = TerminalParser()
+        var truecolor = CellStyle.plain
+        truecolor.foreground = .rgb(1, 2, 3)
+        expect(parser.parse(Array("\u{1B}[38:2::1:2:3m".utf8)) == [.setStyle(truecolor)],
+               "38:2 with a colorspace slot still resolves")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}[38:2:1:2:3m".utf8)) == [.setStyle(truecolor)],
+               "38:2 without a colorspace slot still resolves")
+
         // MARK: - Screen: shrinking keeps the cursor's screenful, not blank rows
 
         // A normal shell session has its prompt near the top with blank rows
