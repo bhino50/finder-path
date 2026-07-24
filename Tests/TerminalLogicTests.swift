@@ -740,6 +740,90 @@ struct FinderPathTerminalTests {
             try? FileManager.default.removeItem(at: pidFile)
         }
 
+        // MARK: - Screen: shrinking keeps the cursor's screenful, not blank rows
+
+        // A normal shell session has its prompt near the top with blank rows
+        // below. Bottom-anchoring the retained window kept those blanks and
+        // pushed every real line into scrollback, blanking the terminal.
+        screen = TerminalScreen(rows: 8, columns: 10, scrollbackLimit: 50)
+        for character in "$ make" { screen.apply(.print(character)) }
+        screen.apply(.carriageReturn)
+        screen.apply(.lineFeed)
+        for character in "building" { screen.apply(.print(character)) }
+        screen.apply(.carriageReturn)
+        screen.apply(.lineFeed)
+        for character in "$ " { screen.apply(.print(character)) }
+        expect(screen.cursorRow == 2, "prompt sits on row 2 with rows 3-7 blank")
+        screen.resize(rows: 4, columns: 10)
+        expect(screen.lineText(0) == "$ make    ", "shrink keeps the command line on screen")
+        expect(screen.lineText(1) == "building  ", "shrink keeps the output line on screen")
+        expect(screen.cursorRow == 2, "cursor keeps its row when nothing scrolled off")
+        expect(screen.scrollbackCount == 0, "nothing is pushed to scrollback when it need not be")
+
+        // With the cursor at the bottom, the window still anchors on it, which
+        // reproduces the previous bottom-anchored behavior.
+        screen = TerminalScreen(rows: 4, columns: 4, scrollbackLimit: 50)
+        for row in 1...4 {
+            screen.apply(.moveCursor(row: row, column: 1))
+            for character in "r\(row)" { screen.apply(.print(character)) }
+        }
+        screen.resize(rows: 2, columns: 4)
+        expect(screen.lineText(0) == "r3  " && screen.lineText(1) == "r4  ",
+               "shrinking from the bottom row keeps the last two lines")
+        expect(screen.scrollbackCount == 2, "rows scrolled off the top reach scrollback")
+        expect(screen.cursorRow == 1, "cursor stays on its own line")
+
+        // MARK: - Screen: CUU/CUD stop at the DECSTBM margins
+
+        screen = TerminalScreen(rows: 6, columns: 4, scrollbackLimit: 10)
+        screen.apply(.setScrollRegion(top: 2, bottom: 5)) // 0-based rows 1...4
+        screen.apply(.moveCursor(row: 3, column: 1))      // 0-based row 2, inside
+        screen.apply(.moveCursorRelative(rows: -9, columns: 0))
+        expect(screen.cursorRow == 1, "CUU stops at the top margin, not row 0")
+        screen.apply(.moveCursor(row: 3, column: 1))
+        screen.apply(.moveCursorRelative(rows: 9, columns: 0))
+        expect(screen.cursorRow == 4, "CUD stops at the bottom margin, not the last row")
+        // A cursor parked outside the region keeps plain grid clamping.
+        screen.apply(.moveCursor(row: 1, column: 1))      // 0-based row 0, outside
+        screen.apply(.moveCursorRelative(rows: 9, columns: 0))
+        expect(screen.cursorRow == 5, "a cursor outside the region is clamped to the grid")
+
+        // MARK: - Screen: wide-cell repair still runs after a narrowing resize
+
+        // printCharacter no longer rescans the row on every glyph, so the
+        // repair must still happen when a narrowing truncation splits a pair.
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        screen.apply(.print("漢"))                  // occupies columns 0-1
+        screen.apply(.print("字"))                  // occupies columns 2-3
+        expect(screen.cell(atRow: 0, column: 1).isContinuation, "wide glyph claims a continuation cell")
+        screen.resize(rows: 2, columns: 3)          // cuts the second pair in half
+        screen.apply(.moveCursor(row: 1, column: 3))
+        screen.apply(.print("x"))                   // first write at the new width
+        expect(!screen.cell(atRow: 0, column: 2).isContinuation,
+               "an orphaned continuation cell is repaired, not left dangling")
+        expect(screen.cell(atRow: 0, column: 0).character == "漢",
+               "the intact wide glyph is preserved")
+
+        // MARK: - Screen: ASCII fast path agrees with the Unicode path
+
+        expect(TerminalScreen.columnWidth(of: "A") == 1, "printable ASCII is one column")
+        expect(TerminalScreen.columnWidth(of: " ") == 1, "space is one column")
+        expect(TerminalScreen.columnWidth(of: "~") == 1, "tilde is one column")
+        // DEL is excluded from the fast path and falls through to the Unicode
+        // path, which classifies it as a control character of width 1 — the
+        // same answer the fast path would have to produce.
+        expect(TerminalScreen.columnWidth(of: "\u{7F}") == 1, "DEL keeps its pre-fast-path width")
+        expect(TerminalScreen.columnWidth(of: "漢") == 2, "CJK stays wide")
+        expect(TerminalScreen.columnWidth(of: "\u{0301}") == 0, "combining marks stay zero width")
+        expect(TerminalScreen.columnWidth(of: "🚀") == 2, "emoji stay wide")
+
+        // Combining marks still merge onto the previous ASCII base character.
+        screen = TerminalScreen(rows: 1, columns: 4, scrollbackLimit: 0)
+        screen.apply(.print("e"))
+        screen.apply(.print("\u{0301}"))
+        expect(screen.lineText(0).hasPrefix("é"), "a combining mark merges onto an ASCII base")
+        expect(screen.cursorColumn == 1, "a merged combining mark does not advance the cursor")
+
         // MARK: - Result
 
         if failures.isEmpty {

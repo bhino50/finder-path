@@ -17,7 +17,15 @@ struct TerminalScreen {
     private(set) var title = ""
 
     private var grid: [[TerminalCell]]
-    private var savedPrimary: (grid: [[TerminalCell]], cursorRow: Int, cursorColumn: Int)?
+    /// The primary screen's contents parked while the alternate screen is up.
+    /// `savedCursor` travels with it: DECSC/DECRC state is per screen, so a TUI
+    /// issuing ESC 7 must not clobber the position the shell saved earlier.
+    private var savedPrimary: (
+        grid: [[TerminalCell]],
+        cursorRow: Int,
+        cursorColumn: Int,
+        savedCursor: (row: Int, column: Int)?
+    )?
     private var scrollback: [[TerminalCell]] = []
     private let scrollbackLimit: Int
 
@@ -93,7 +101,7 @@ struct TerminalScreen {
             if let column { cursorColumn = clampColumn(column - 1) }
             pendingWrap = false
         case .moveCursorRelative(let deltaRows, let deltaColumns):
-            cursorRow = clampRow(cursorRow + deltaRows)
+            cursorRow = clampRowWithinRegion(cursorRow + deltaRows, startingAt: cursorRow)
             cursorColumn = clampColumn(cursorColumn + deltaColumns)
             pendingWrap = false
         case .setStyle(let style):
@@ -235,6 +243,13 @@ struct TerminalScreen {
     /// emoji sequences, and the East Asian wide/full-width ranges terminals
     /// encounter most often.
     nonisolated static func columnWidth(of character: Character) -> Int {
+        // Printable ASCII is the overwhelming majority of terminal output and
+        // always occupies exactly one column. Answering it without touching the
+        // Unicode property tables keeps the print path off ICU lookups, which
+        // dominate this function's cost.
+        if let ascii = character.asciiValue, ascii >= 0x20, ascii != 0x7F {
+            return 1
+        }
         let scalars = character.unicodeScalars
         guard !scalars.isEmpty else { return 0 }
         if scalars.allSatisfy(isZeroWidth) { return 0 }
@@ -298,18 +313,31 @@ struct TerminalScreen {
     }
 
     private func shouldExtendPreviousCell(with character: Character) -> Bool {
+        // Printable ASCII is never a combining mark, a ZWJ continuation, or a
+        // regional indicator, so it can never extend the previous cell. This
+        // early return keeps the common path free of grid reads entirely.
+        if let ascii = character.asciiValue, ascii >= 0x20, ascii != 0x7F {
+            return false
+        }
         if Self.columnWidth(of: character) == 0 { return true }
         guard let column = previousBaseColumn() else { return false }
         let previousScalars = grid[cursorRow][column].character.unicodeScalars
         if previousScalars.last?.value == 0x200D { return true } // emoji ZWJ sequence
 
-        let incomingIsRegionalIndicator = character.unicodeScalars.allSatisfy {
-            (0x1F1E6...0x1F1FF).contains($0.value)
+        guard character.unicodeScalars.allSatisfy(Self.isRegionalIndicator) else {
+            return false
         }
-        let previousRegionalCount = previousScalars.filter {
-            (0x1F1E6...0x1F1FF).contains($0.value)
-        }.count
-        return incomingIsRegionalIndicator && previousRegionalCount % 2 == 1
+        // Counted in place: `filter { }.count` heap-allocated an array on the
+        // way to a number for every character reaching this path.
+        var previousRegionalCount = 0
+        for scalar in previousScalars where Self.isRegionalIndicator(scalar) {
+            previousRegionalCount += 1
+        }
+        return previousRegionalCount % 2 == 1
+    }
+
+    private nonisolated static func isRegionalIndicator(_ scalar: Unicode.Scalar) -> Bool {
+        (0x1F1E6...0x1F1FF).contains(scalar.value)
     }
 
     private mutating func appendToPreviousCell(_ character: Character) -> Bool {
@@ -514,16 +542,19 @@ struct TerminalScreen {
         case .alternateScreen:
             guard enabled != usingAlternateScreen else { return }
             if enabled {
-                savedPrimary = (grid, cursorRow, cursorColumn)
+                savedPrimary = (grid, cursorRow, cursorColumn, savedCursor)
                 grid = Array(repeating: Array(repeating: blankCell, count: columns), count: rows)
                 cursorRow = 0
                 cursorColumn = 0
+                // The alternate screen starts with no saved cursor of its own.
+                savedCursor = nil
                 usingAlternateScreen = true
             } else {
                 if let saved = savedPrimary {
                     grid = saved.grid
                     cursorRow = clampRow(saved.cursorRow)
                     cursorColumn = clampColumn(saved.cursorColumn)
+                    savedCursor = saved.savedCursor
                 }
                 savedPrimary = nil
                 usingAlternateScreen = false
@@ -549,11 +580,21 @@ struct TerminalScreen {
         let targetColumns = max(newColumns, 1)
         guard targetRows != rows || targetColumns != columns else { return }
 
-        // Rows dropped off the top when shrinking are preserved in scrollback
-        // (primary screen only) so resizing smaller never loses text outright.
-        let droppedRows = max(grid.count - targetRows, 0)
-        if droppedRows > 0, !usingAlternateScreen, scrollbackLimit > 0 {
-            for row in 0..<droppedRows {
+        // Which existing row becomes the top of the new grid. Anchoring the
+        // window on the cursor keeps the active prompt and the output above it
+        // on screen. Anchoring on the bottom instead (the previous rule) kept
+        // whatever trailing blank rows happened to exist and pushed the real
+        // content into scrollback, so shrinking a normal shell session — whose
+        // prompt sits near the top with blanks below — blanked the terminal.
+        // Alternate-screen TUIs address rows absolutely, so they stay top-anchored.
+        let firstRetained = usingAlternateScreen
+            ? 0
+            : max(0, min(cursorRow - targetRows + 1, grid.count - targetRows))
+
+        // Rows scrolled off the top are preserved in scrollback (primary screen
+        // only) so resizing smaller never loses text outright.
+        if firstRetained > 0, scrollbackLimit > 0 {
+            for row in 0..<firstRetained {
                 scrollback.append(grid[row])
             }
             if scrollback.count > scrollbackLimit {
@@ -570,42 +611,55 @@ struct TerminalScreen {
             grid,
             rows: targetRows,
             columns: targetColumns,
-            keepTopRows: usingAlternateScreen
+            firstRetained: firstRetained
         )
         if let saved = savedPrimary {
-            let savedDroppedTop = max(rows - targetRows, 0)
+            // The parked primary screen is anchored on its own saved cursor.
+            let savedDroppedTop = max(
+                0,
+                min(saved.cursorRow - targetRows + 1, saved.grid.count - targetRows)
+            )
             savedPrimary = (
-                Self.resizeGrid(saved.grid, rows: targetRows, columns: targetColumns),
+                Self.resizeGrid(
+                    saved.grid,
+                    rows: targetRows,
+                    columns: targetColumns,
+                    firstRetained: savedDroppedTop
+                ),
                 min(max(saved.cursorRow - savedDroppedTop, 0), targetRows - 1),
-                min(saved.cursorColumn, targetColumns - 1)
+                min(saved.cursorColumn, targetColumns - 1),
+                saved.savedCursor.map { cursor in
+                    (
+                        min(max(cursor.row - savedDroppedTop, 0), targetRows - 1),
+                        min(cursor.column, targetColumns - 1)
+                    )
+                }
             )
         }
 
-        // The grid dropped `droppedTop` rows off the top when shrinking, so
-        // move the cursor up by the same amount to keep it on its own line.
-        let droppedTop = max(rows - targetRows, 0)
         rows = targetRows
         columns = targetColumns
         regionTop = 0
         regionBottom = rows - 1
-        // Primary shells stay bottom-anchored so their active prompt survives a
-        // height shrink. Alternate-screen TUIs are absolute/top-anchored; moving
-        // their cursor up by droppedTop would shift the preserved frame.
-        cursorRow = clampRow(cursorRow - (usingAlternateScreen ? 0 : droppedTop))
+        // The grid dropped `firstRetained` rows off the top, so move the cursor
+        // up by the same amount to keep it on its own line.
+        cursorRow = clampRow(cursorRow - firstRetained)
         cursorColumn = clampColumn(cursorColumn)
         pendingWrap = false
     }
 
+    /// Retains `rows` rows starting at `firstRetained`, padding each to at
+    /// least `columns`. The caller picks the anchor: 0 for alternate-screen
+    /// TUIs, and a cursor-derived offset for the primary screen so the active
+    /// prompt stays visible instead of scrolling away behind blank rows.
     private static func resizeGrid(
         _ source: [[TerminalCell]],
         rows: Int,
         columns: Int,
-        keepTopRows: Bool = false
+        firstRetained: Int = 0
     ) -> [[TerminalCell]] {
-        // Primary shells keep the bottom rows where their active prompt lives.
-        // Alternate-screen TUIs use absolute coordinates and keep their top
-        // rows so headers/content do not disappear in favor of blank footer rows.
-        let retainedRows = keepTopRows ? source.prefix(rows) : source.suffix(rows)
+        let start = min(max(firstRetained, 0), max(source.count - rows, 0))
+        let retainedRows = source.dropFirst(start).prefix(rows)
         var result = retainedRows.map { line -> [TerminalCell] in
             // Keep cells beyond the temporarily visible width. If the user
             // widens the terminal again before that row is overwritten, its
@@ -624,9 +678,13 @@ struct TerminalScreen {
     /// so it cannot reappear after newer content has replaced the line.
     private mutating func discardHiddenColumns(in row: Int) {
         guard row >= 0, row < grid.count else { return }
-        if grid[row].count > columns {
-            grid[row] = Array(grid[row].prefix(columns))
-        }
+        // A row already at the visible width has no stale overflow to drop, and
+        // printing and erasing keep wide-cell pairs consistent on their own, so
+        // the repair scan is only needed when this truncation can split a pair.
+        // Skipping it here is what takes printing from O(columns) back to O(1):
+        // printCharacter calls this for every glyph.
+        guard grid[row].count > columns else { return }
+        grid[row] = Array(grid[row].prefix(columns))
         normalizeWideCells(in: row)
     }
 
@@ -634,4 +692,13 @@ struct TerminalScreen {
 
     private func clampRow(_ row: Int) -> Int { min(max(row, 0), rows - 1) }
     private func clampColumn(_ column: Int) -> Int { min(max(column, 0), columns - 1) }
+
+    /// CUU/CUD stop at the scroll-region margins when the cursor starts inside
+    /// the region (DEC/xterm behavior). Without this a TUI's relative motion
+    /// escapes DECSTBM and overwrites the header or status rows it reserved.
+    /// A cursor already outside the region keeps plain grid clamping.
+    private func clampRowWithinRegion(_ row: Int, startingAt origin: Int) -> Int {
+        guard origin >= regionTop, origin <= regionBottom else { return clampRow(row) }
+        return min(max(row, regionTop), regionBottom)
+    }
 }
