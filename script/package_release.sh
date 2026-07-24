@@ -103,99 +103,13 @@ cleanup() {
 trap cleanup EXIT
 
 update_public_manifest() {
-  /usr/bin/python3 - "$VERSION" "$VERSION_JSON" "$DOWNLOAD_INDEX" <<'PY'
-import json
-import os
-import re
-import stat
-import sys
-import tempfile
-
-version, manifest_path, index_path = sys.argv[1:4]
-with open(manifest_path, encoding="utf-8") as source:
-    original_manifest = source.read()
-manifest = json.loads(original_manifest)
-if not isinstance(manifest, dict):
-    raise ValueError(f"{manifest_path} must contain a JSON object")
-
-manifest["version"] = version
-manifest["downloadURL"] = (
-    "https://github.com/bhino50/finder-path/releases/download/"
-    f"v{version}/FinderPath-{version}.dmg"
-)
-manifest["notes"] = os.environ.get("RELEASE_NOTES", f"FinderPath {version}.")
-
-with open(index_path, encoding="utf-8") as source:
-    original_index = source.read()
-index, replacements = re.subn(
-    r'(class="release-note">Version )[0-9A-Za-z._-]+',
-    rf'\g<1>{version}',
-    index,
-    count=1,
-)
-if replacements != 1:
-    raise ValueError(f"Could not update the release version label in {index_path}")
-
-def stage_file(path, prefix, write_content):
-    directory = os.path.dirname(path) or "."
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    temporary_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=directory, prefix=prefix, delete=False
-        ) as destination:
-            temporary_path = destination.name
-            write_content(destination)
-        os.chmod(temporary_path, mode)
-        return temporary_path
-    except Exception:
-        if temporary_path:
-            try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
-        raise
-
-def write_manifest(destination):
-    json.dump(manifest, destination, indent=2)
-    destination.write("\n")
-
-manifest_staged = stage_file(
-    manifest_path,
-    ".version.",
-    write_manifest,
-)
-index_staged = ""
-manifest_rollback = ""
-manifest_replaced = False
-try:
-    index_staged = stage_file(index_path, ".index.", lambda destination: destination.write(index))
-    manifest_rollback = stage_file(
-        manifest_path,
-        ".rollback.",
-        lambda destination: destination.write(original_manifest),
-    )
-    os.replace(manifest_staged, manifest_path)
-    manifest_staged = ""
-    manifest_replaced = True
-    os.replace(index_staged, index_path)
-    index_staged = ""
-except Exception:
-    # If the second commit fails, restore the exact original manifest before
-    # reporting failure so the updater can never point at artifacts cleanup
-    # is about to remove.
-    if manifest_replaced:
-        os.replace(manifest_rollback, manifest_path)
-        manifest_rollback = ""
-    raise
-finally:
-    for temporary_path in (manifest_staged, index_staged, manifest_rollback):
-        if temporary_path:
-            try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
-PY
+  # The updater lives in its own executable file so CI can run it against
+  # fixtures. Embedded as a here-document it was invisible to `bash -n`.
+  # RELEASE_NOTES is read from the inherited environment, so leaving it unset
+  # keeps the script's default note rather than blanking it.
+  /usr/bin/python3 \
+    "$ROOT_DIR/script/update_public_manifest.py" \
+    "$VERSION" "$VERSION_JSON" "$DOWNLOAD_INDEX"
 }
 
 rm -rf "$DERIVED_DATA_PATH" "$DIST_DIR"

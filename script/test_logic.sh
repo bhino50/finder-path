@@ -47,3 +47,8 @@ done
   -o "$TERMINAL_TEST_BINARY"
 
 "$TERMINAL_TEST_BINARY"
+
+# The release path's manifest updater is Python, and `bash -n` cannot see
+# inside a here-document. Execute it against fixtures so a broken release
+# script fails here rather than after a full Apple notarization round trip.
+/usr/bin/python3 "$ROOT_DIR/script/test_release_manifest.py"
