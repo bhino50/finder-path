@@ -267,6 +267,9 @@ struct RemoteConnectionView: View {
         .accessibilityLabel(title)
         .accessibilityValue(accessibilityValue(subtitle: subtitle, online: online))
         .accessibilityHint("Select this server, then use Connect. Double-click to connect immediately.")
+        // Selection was conveyed only by an 18%-opacity tint, which assistive
+        // technology cannot see — yet Connect is gated on it.
+        .accessibilityAddTraits(selection == id ? [.isSelected] : [])
     }
 
     private var footer: some View {
@@ -315,7 +318,10 @@ struct RemoteConnectionView: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { isAddingServer = false }
+                // `role: .cancel` plus the shortcut is what binds Escape to the
+                // sheet; without a cancel action the sheet was mouse-only.
+                Button("Cancel", role: .cancel) { isAddingServer = false }
+                    .keyboardShortcut(.cancelAction)
                 Button("Add") { commitAddServer() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(newServerTarget.trimmingCharacters(in: .whitespaces).isEmpty)
