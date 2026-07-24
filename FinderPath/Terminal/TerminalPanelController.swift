@@ -336,9 +336,16 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             session.onTitleChange = { [weak self] in self?.rebuildTabs() }
         }
         // Closing the last terminal dismisses the window rather than leaving an
-        // empty shell on screen.
-        if store.sessions.isEmpty && isPresented {
-            dismiss()
+        // empty shell on screen. Detach the view first: leaving the removed
+        // session attached kept its whole TerminalScreen and scrollback ring
+        // alive, and kept the view's 60 Hz redraw timer eligible to run even
+        // though there was nothing left to draw.
+        if store.sessions.isEmpty {
+            terminalView.session = nil
+            activeSessionID = nil
+            if isPresented { dismiss() }
+            rebuildTabs()
+            updateRestartButton()
             return
         }
         normalizeActiveSession()
