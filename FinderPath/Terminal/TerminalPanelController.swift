@@ -120,6 +120,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
         terminalView.focusTerminal()
+        terminalView.updateRedrawTimer()
     }
 
     private func presentPanel() {
@@ -134,12 +135,14 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         terminalView.focusTerminal()
+        terminalView.updateRedrawTimer()
     }
 
     private func togglePanel() {
         if let panel, panel.isVisible {
             // Hiding, not closing: sessions keep running in the store.
             panel.orderOut(nil)
+            terminalView.updateRedrawTimer()
             return
         }
         presentPanel()
@@ -153,6 +156,10 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         } else {
             popover?.performClose(nil)
         }
+        // orderOut leaves the view in its window, so the render gate has to be
+        // re-driven explicitly or the 60 Hz redraw timer keeps waking the main
+        // thread for the rest of the app's life.
+        terminalView.updateRedrawTimer()
     }
 
     @objc private func closePanelClicked() {
@@ -329,9 +336,16 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
             session.onTitleChange = { [weak self] in self?.rebuildTabs() }
         }
         // Closing the last terminal dismisses the window rather than leaving an
-        // empty shell on screen.
-        if store.sessions.isEmpty && isPresented {
-            dismiss()
+        // empty shell on screen. Detach the view first: leaving the removed
+        // session attached kept its whole TerminalScreen and scrollback ring
+        // alive, and kept the view's 60 Hz redraw timer eligible to run even
+        // though there was nothing left to draw.
+        if store.sessions.isEmpty {
+            terminalView.session = nil
+            activeSessionID = nil
+            if isPresented { dismiss() }
+            rebuildTabs()
+            updateRestartButton()
             return
         }
         normalizeActiveSession()

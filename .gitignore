@@ -2,6 +2,10 @@
 .build/
 dist/
 
+# Python bytecode (script/ release tooling)
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store
 

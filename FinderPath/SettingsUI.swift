@@ -403,8 +403,16 @@ struct AgentStatusRow: View {
 }
 
 @MainActor
-final class WelcomeWindowController: NSWindowController {
+final class WelcomeWindowController: NSWindowController, NSWindowDelegate {
     private static let contentSize = NSSize(width: 560, height: 560)
+
+    /// The guide counts as completed once it has been dismissed, however it was
+    /// dismissed. Writing the flag only from the Get Started / Skip buttons
+    /// meant closing the window with the red title-bar button left it false, so
+    /// the guide reappeared on every launch, forever.
+    func windowWillClose(_ notification: Notification) {
+        UserDefaults.standard.set(true, forKey: FinderPathPreferences.completedWelcomeKey)
+    }
 
     init() {
         let window = NSWindow(
@@ -420,6 +428,7 @@ final class WelcomeWindowController: NSWindowController {
 
         super.init(window: window)
 
+        window.delegate = self
         window.contentViewController = NSHostingController(
             rootView: WelcomeView(onFinish: { [weak window] in window?.close() })
         )

@@ -740,6 +740,185 @@ struct FinderPathTerminalTests {
             try? FileManager.default.removeItem(at: pidFile)
         }
 
+        // MARK: - PTY synchronous hang-up (app quit path)
+
+        // applicationWillTerminate has no time to let the async terminate()
+        // path run, so quit used to leave shells and agent CLIs orphaned.
+        do {
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 30"],
+                workingDirectory: NSTemporaryDirectory(),
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            do {
+                try pty.launch()
+                let pid = pty.hangUpSynchronously()
+                expect(pid != nil, "hangUpSynchronously reports the pid it signalled")
+                if let pid {
+                    PTYProcess.waitForExit(of: [pid], upTo: 2.0)
+                    // The child is reaped by the exit watcher, so the pid is
+                    // gone rather than a zombie once it has actually died.
+                    var stillAlive = false
+                    for _ in 0..<50 {
+                        if kill(pid, 0) != 0 { break }
+                        usleep(20_000)
+                        stillAlive = kill(pid, 0) == 0
+                    }
+                    expect(!stillAlive, "the child is dead once the synchronous hang-up returns")
+                }
+                // A second call on an already-terminated process is harmless.
+                expect(pty.hangUpSynchronously() == nil, "hanging up twice is a no-op")
+            } catch {
+                failures.append("PTY hang-up test could not launch a child: \(error)")
+            }
+        }
+        // An empty pid list must not wait out the timeout.
+        do {
+            let started = Date()
+            PTYProcess.waitForExit(of: [], upTo: 5.0)
+            expect(Date().timeIntervalSince(started) < 1.0, "waiting on no children returns at once")
+        }
+
+        // MARK: - Parser: DCS / APC / PM / SOS payloads are swallowed
+
+        // Without a string state the parser returned to ground immediately and
+        // painted the whole payload onto the grid as literal text.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}P0;1|xyz\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "a DCS payload is consumed, and text after ST still prints")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}_Ga=T,f=100;PAYLOAD\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "an APC (kitty graphics) payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}^priv\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "a PM payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Xsos\u{1B}\\OK".utf8)) == [.print("O"), .print("K")],
+               "an SOS payload is consumed")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Pabc\u{07}OK".utf8)) == [.print("O"), .print("K")],
+               "BEL also terminates a device string")
+        // Split across reads, the way a real PTY delivers it.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}Pdata".utf8)).isEmpty, "a partial device string emits nothing")
+        expect(parser.parse(Array("more\u{1B}\\Z".utf8)) == [.print("Z")],
+               "a device string terminated in a later read is still consumed")
+
+        // MARK: - Parser: SGR colon sub-parameters stay one attribute
+
+        parser = TerminalParser()
+        var curly = CellStyle.plain
+        curly.underline = true
+        expect(parser.parse(Array("\u{1B}[4:3m".utf8)) == [.setStyle(curly)],
+               "4:3 curly underline sets underline only, not italic")
+        expect(parser.parse(Array("\u{1B}[4:0m".utf8)) == [.setStyle(.plain)],
+               "4:0 turns the underline off")
+        // Underline colour is not rendered and must not leak into the style.
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}[58:2::255:0:0m".utf8)) == [.setStyle(.plain)],
+               "58 underline colour is swallowed rather than executed")
+        // The indexed and truecolor forms must keep working.
+        parser = TerminalParser()
+        var indexed = CellStyle.plain
+        indexed.foreground = .palette(2)
+        expect(parser.parse(Array("\u{1B}[38:5:2m".utf8)) == [.setStyle(indexed)],
+               "38:5:n indexed colour still resolves")
+        parser = TerminalParser()
+        var truecolor = CellStyle.plain
+        truecolor.foreground = .rgb(1, 2, 3)
+        expect(parser.parse(Array("\u{1B}[38:2::1:2:3m".utf8)) == [.setStyle(truecolor)],
+               "38:2 with a colorspace slot still resolves")
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}[38:2:1:2:3m".utf8)) == [.setStyle(truecolor)],
+               "38:2 without a colorspace slot still resolves")
+
+        // MARK: - Screen: shrinking keeps the cursor's screenful, not blank rows
+
+        // A normal shell session has its prompt near the top with blank rows
+        // below. Bottom-anchoring the retained window kept those blanks and
+        // pushed every real line into scrollback, blanking the terminal.
+        screen = TerminalScreen(rows: 8, columns: 10, scrollbackLimit: 50)
+        for character in "$ make" { screen.apply(.print(character)) }
+        screen.apply(.carriageReturn)
+        screen.apply(.lineFeed)
+        for character in "building" { screen.apply(.print(character)) }
+        screen.apply(.carriageReturn)
+        screen.apply(.lineFeed)
+        for character in "$ " { screen.apply(.print(character)) }
+        expect(screen.cursorRow == 2, "prompt sits on row 2 with rows 3-7 blank")
+        screen.resize(rows: 4, columns: 10)
+        expect(screen.lineText(0) == "$ make    ", "shrink keeps the command line on screen")
+        expect(screen.lineText(1) == "building  ", "shrink keeps the output line on screen")
+        expect(screen.cursorRow == 2, "cursor keeps its row when nothing scrolled off")
+        expect(screen.scrollbackCount == 0, "nothing is pushed to scrollback when it need not be")
+
+        // With the cursor at the bottom, the window still anchors on it, which
+        // reproduces the previous bottom-anchored behavior.
+        screen = TerminalScreen(rows: 4, columns: 4, scrollbackLimit: 50)
+        for row in 1...4 {
+            screen.apply(.moveCursor(row: row, column: 1))
+            for character in "r\(row)" { screen.apply(.print(character)) }
+        }
+        screen.resize(rows: 2, columns: 4)
+        expect(screen.lineText(0) == "r3  " && screen.lineText(1) == "r4  ",
+               "shrinking from the bottom row keeps the last two lines")
+        expect(screen.scrollbackCount == 2, "rows scrolled off the top reach scrollback")
+        expect(screen.cursorRow == 1, "cursor stays on its own line")
+
+        // MARK: - Screen: CUU/CUD stop at the DECSTBM margins
+
+        screen = TerminalScreen(rows: 6, columns: 4, scrollbackLimit: 10)
+        screen.apply(.setScrollRegion(top: 2, bottom: 5)) // 0-based rows 1...4
+        screen.apply(.moveCursor(row: 3, column: 1))      // 0-based row 2, inside
+        screen.apply(.moveCursorRelative(rows: -9, columns: 0))
+        expect(screen.cursorRow == 1, "CUU stops at the top margin, not row 0")
+        screen.apply(.moveCursor(row: 3, column: 1))
+        screen.apply(.moveCursorRelative(rows: 9, columns: 0))
+        expect(screen.cursorRow == 4, "CUD stops at the bottom margin, not the last row")
+        // A cursor parked outside the region keeps plain grid clamping.
+        screen.apply(.moveCursor(row: 1, column: 1))      // 0-based row 0, outside
+        screen.apply(.moveCursorRelative(rows: 9, columns: 0))
+        expect(screen.cursorRow == 5, "a cursor outside the region is clamped to the grid")
+
+        // MARK: - Screen: wide-cell repair still runs after a narrowing resize
+
+        // printCharacter no longer rescans the row on every glyph, so the
+        // repair must still happen when a narrowing truncation splits a pair.
+        screen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        screen.apply(.print("漢"))                  // occupies columns 0-1
+        screen.apply(.print("字"))                  // occupies columns 2-3
+        expect(screen.cell(atRow: 0, column: 1).isContinuation, "wide glyph claims a continuation cell")
+        screen.resize(rows: 2, columns: 3)          // cuts the second pair in half
+        screen.apply(.moveCursor(row: 1, column: 3))
+        screen.apply(.print("x"))                   // first write at the new width
+        expect(!screen.cell(atRow: 0, column: 2).isContinuation,
+               "an orphaned continuation cell is repaired, not left dangling")
+        expect(screen.cell(atRow: 0, column: 0).character == "漢",
+               "the intact wide glyph is preserved")
+
+        // MARK: - Screen: ASCII fast path agrees with the Unicode path
+
+        expect(TerminalScreen.columnWidth(of: "A") == 1, "printable ASCII is one column")
+        expect(TerminalScreen.columnWidth(of: " ") == 1, "space is one column")
+        expect(TerminalScreen.columnWidth(of: "~") == 1, "tilde is one column")
+        // DEL is excluded from the fast path and falls through to the Unicode
+        // path, which classifies it as a control character of width 1 — the
+        // same answer the fast path would have to produce.
+        expect(TerminalScreen.columnWidth(of: "\u{7F}") == 1, "DEL keeps its pre-fast-path width")
+        expect(TerminalScreen.columnWidth(of: "漢") == 2, "CJK stays wide")
+        expect(TerminalScreen.columnWidth(of: "\u{0301}") == 0, "combining marks stay zero width")
+        expect(TerminalScreen.columnWidth(of: "🚀") == 2, "emoji stay wide")
+
+        // Combining marks still merge onto the previous ASCII base character.
+        screen = TerminalScreen(rows: 1, columns: 4, scrollbackLimit: 0)
+        screen.apply(.print("e"))
+        screen.apply(.print("\u{0301}"))
+        expect(screen.lineText(0).hasPrefix("é"), "a combining mark merges onto an ASCII base")
+        expect(screen.cursorColumn == 1, "a merged combining mark does not advance the cursor")
+
         // MARK: - Result
 
         if failures.isEmpty {

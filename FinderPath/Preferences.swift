@@ -277,11 +277,16 @@ enum FinderPathPreferences {
         let url = URL(fileURLWithPath: path).standardizedFileURL
         let components = url.pathComponents.filter { $0 != "/" }
 
-        if components.count >= 2 {
-            return ".../\(components[components.count - 2])/\(components[components.count - 1])"
+        // Only elide when something is actually being elided. With `>= 2` an
+        // absolute two-component path such as /Applications/Utilities rendered
+        // as ".../Applications/Utilities" — a leading ellipsis implying hidden
+        // ancestors that do not exist, with the filesystem root silently lost.
+        // It also skipped the "~" abbreviation for the home folder itself.
+        guard components.count > 2 else {
+            return abbreviatingHomeDirectory(path)
         }
 
-        return abbreviatingHomeDirectory(path)
+        return ".../\(components[components.count - 2])/\(components[components.count - 1])"
     }
 
     private static func bool(for key: String, defaultValue: Bool) -> Bool {

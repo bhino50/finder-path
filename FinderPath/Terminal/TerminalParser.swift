@@ -13,6 +13,9 @@ struct TerminalParser {
         case csi
         case osc
         case oscEscape
+        /// DCS / APC / PM / SOS payload: consumed and discarded until ST.
+        case deviceString
+        case deviceStringEscape
     }
 
     private nonisolated static let maxParameterValue = 9999
@@ -46,6 +49,21 @@ struct TerminalParser {
                 parseCSI(byte, into: &actions)
             case .osc:
                 parseOSC(byte, into: &actions)
+            case .deviceString:
+                // The payload is discarded, so only the terminator matters.
+                if byte == 0x1B {
+                    state = .deviceStringEscape
+                } else if byte == 0x07 {
+                    state = .ground // BEL terminates these strings too
+                }
+            case .deviceStringEscape:
+                if byte == UInt8(ascii: "\\") {
+                    state = .ground // ST
+                } else if byte == 0x1B {
+                    state = .deviceStringEscape
+                } else {
+                    state = .deviceString
+                }
             case .oscEscape:
                 if byte == UInt8(ascii: "\\") {
                     finishOSC(into: &actions)
@@ -133,6 +151,14 @@ struct TerminalParser {
             state = .osc
         case UInt8(ascii: "("), UInt8(ascii: ")"):
             state = .escapeCharset
+        case UInt8(ascii: "P"),   // DCS - e.g. terminfo queries, sixel
+             UInt8(ascii: "_"),   // APC - e.g. the kitty graphics protocol
+             UInt8(ascii: "^"),   // PM
+             UInt8(ascii: "X"):   // SOS
+            // These introduce a string payload that runs until ST. Without a
+            // state to absorb it the parser returned to ground immediately and
+            // painted the entire payload onto the grid as literal text.
+            state = .deviceString
         case UInt8(ascii: "M"):
             actions.append(.reverseIndex)
         case UInt8(ascii: "D"):
@@ -282,21 +308,51 @@ struct TerminalParser {
         var values: [Int?] = []
         for parameter in trimmed.split(separator: ";", omittingEmptySubsequences: false) {
             let subparameters = parameter.split(separator: ":", omittingEmptySubsequences: false)
-            if subparameters.count >= 6,
-               (subparameters[0] == "38" || subparameters[0] == "48"),
-               subparameters[1] == "2" {
-                // ISO-8613-6 truecolor permits a colorspace-id slot:
-                // 38:2:<colorspace>:r:g:b. xterm commonly leaves it empty.
-                // The renderer supports sRGB, so ignore that slot deliberately.
+            if subparameters.count == 1 {
                 values.append(clampedParameter(subparameters[0]))
-                values.append(clampedParameter(subparameters[1]))
-                values.append(contentsOf: subparameters[3...5].map(clampedParameter))
             } else {
-                values.append(contentsOf: subparameters.map(clampedParameter))
+                values.append(contentsOf: expandedSubparameters(subparameters))
             }
             if values.count >= maxParameterCount * 2 { break }
         }
         return Array(values.prefix(maxParameterCount * 2))
+    }
+
+    /// A colon group is ONE parameter carrying sub-parameters, not several
+    /// independent parameters. Only the extended-color codes consume their
+    /// sub-parameters as values; elsewhere a sub-parameter selects a variant of
+    /// the same attribute. Emitting them all as top-level codes executed them
+    /// as unrelated attributes — `4:3` (curly underline) turned into underline
+    /// plus SGR 3 italic, and `58:2:...` (underline color) ran its arguments as
+    /// faint and colour codes.
+    private static func expandedSubparameters<S: StringProtocol>(_ parts: [S]) -> [Int?] {
+        guard let head = clampedParameter(parts[0]) else {
+            // A malformed empty head behaves like an empty parameter: reset.
+            return [nil]
+        }
+        switch head {
+        case 38, 48:
+            if parts.count >= 6, parts[1] == "2" {
+                // ISO-8613-6 truecolor permits a colorspace-id slot:
+                // 38:2:<colorspace>:r:g:b. xterm commonly leaves it empty.
+                // The renderer supports sRGB, so ignore that slot deliberately.
+                var expanded: [Int?] = [head, clampedParameter(parts[1])]
+                expanded.append(contentsOf: parts[3...5].map(clampedParameter))
+                return expanded
+            }
+            // 38:5:n and 38:2:r:g:b already line up with what applySGR expects.
+            return parts.map(clampedParameter)
+        case 58, 59:
+            // Underline colour is not rendered. Swallow the whole group so its
+            // arguments cannot be executed as unrelated attributes.
+            return []
+        case 4:
+            // 4:0 turns the underline off; every other style turns it on.
+            return [clampedParameter(parts[1]) == 0 ? 24 : 4]
+        default:
+            // A sub-parameterised variant of an attribute we do not model.
+            return [head]
+        }
     }
 
     private nonisolated static func clampedParameter<S: StringProtocol>(_ value: S) -> Int? {

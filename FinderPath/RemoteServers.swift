@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct RemoteServer: Equatable {
     let name: String
@@ -42,9 +43,28 @@ enum RemoteServers {
             let target = normalizedTarget(server.target)
             guard !target.isEmpty, isValidTarget(target) else { return nil }
 
-            let name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = sanitizedName(server.name)
             return "\(name.isEmpty ? target : name) = \(target)"
         }.joined(separator: "\n")
+    }
+
+    /// The storage format is line-oriented `Name = target` text, so a display
+    /// name is not free-form. An unsanitized name containing the separator, a
+    /// newline, or a leading comment marker did not survive the round trip:
+    /// `parse` splits on the FIRST '=', so "Dev = Prod" produced a line whose
+    /// target failed validation and the server the user had just added
+    /// silently vanished — or, with a newline, came back as a second phantom
+    /// entry pointing at a different host.
+    static func sanitizedName(_ rawName: String) -> String {
+        let flattened = rawName
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .replacingOccurrences(of: "=", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A leading '#' would make `parse` treat the whole line as a comment.
+        guard flattened.hasPrefix("#") else { return flattened }
+        return String(flattened.drop(while: { $0 == "#" }))
+            .trimmingCharacters(in: .whitespaces)
     }
 
     // Saved SSH targets are limited to hostname / user@host / ssh-config alias
@@ -227,14 +247,35 @@ nonisolated enum TailscaleBridge {
             return "Could not run tailscale: \(error.localizedDescription)"
         }
 
+        // `tailscale up` blocks indefinitely when the node needs interactive
+        // browser re-authentication. Without a watchdog the Connect button in
+        // the Connect to Server window stayed disabled forever and the stray
+        // process leaked. Terminating the child also unblocks the read below.
+        let timedOutFlag = OSAllocatedUnfairLock(initialState: false)
+        let watchdog = DispatchWorkItem {
+            timedOutFlag.withLock { $0 = true }
+            task.terminate()
+        }
+        DispatchQueue.global(qos: .userInitiated)
+            .asyncAfter(deadline: .now() + commandTimeoutSeconds, execute: watchdog)
+
         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
+        watchdog.cancel()
+
         if task.terminationStatus == 0 { return nil }
+        if timedOutFlag.withLock({ $0 }) {
+            return "tailscale \(arguments.joined(separator: " ")) timed out. "
+                + "If this node needs to sign in again, open the Tailscale app."
+        }
 
         let message = String(data: errorData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return message?.isEmpty == false ? message : "tailscale \(arguments.joined(separator: " ")) failed."
     }
+
+    /// Upper bound on a `tailscale up`/`down` run before it is killed.
+    private static let commandTimeoutSeconds: TimeInterval = 20
 
     private static func run(_ path: String, arguments: [String]) -> Data? {
         let task = Process()

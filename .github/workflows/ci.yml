@@ -9,10 +9,16 @@ on:
 permissions:
   contents: read
 
+# Superseded runs for the same ref are pointless once a newer commit exists.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
     name: Build FinderPath macOS
     runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -32,6 +38,11 @@ jobs:
           bash -n script/run_no_xcode.sh
           bash -n script/test_logic.sh
           bash -n script/package_release.sh
+          # `bash -n` cannot see inside a here-document, so the release path's
+          # Python is compiled and executed separately (see Run logic tests).
+          python3 -m py_compile \
+            script/update_public_manifest.py \
+            script/test_release_manifest.py
 
       - name: Run logic tests
         run: ./script/test_logic.sh

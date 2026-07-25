@@ -6,14 +6,16 @@ import CoreText
 // block cursor, and an exit/failure banner. Key events route through
 // TerminalInputEncoder into the session. PTY-driven redraws are coalesced to
 // roughly 60 fps with a dirty flag checked by a main-queue timer that only
-// runs while a session is attached and the view is in a window. Mouse
-// selection and copy live in TerminalViewSelection.swift.
+// runs while a session is attached and the view's window is actually on
+// screen. Mouse selection and copy live in TerminalViewSelection.swift.
 
 final class TerminalView: NSView {
     private static let defaultFontSize: CGFloat = 12
     private static let minimumRows = 2
     private static let minimumColumns = 10
     private static let redrawInterval: DispatchTimeInterval = .milliseconds(16)
+    /// Minimum gap between AX value-changed announcements while output streams.
+    private static let accessibilityPostInterval: TimeInterval = 1.0
     private static let faintAlpha: CGFloat = 0.6
     private static let bannerFontSize: CGFloat = 11
     private static let bannerHeight: CGFloat = 18
@@ -96,6 +98,8 @@ final class TerminalView: NSView {
 
     private var screenDirty = false
     private var redrawTimer: DispatchSourceTimer?
+    private var lastAccessibilityPost = Date.distantPast
+    private var windowVisibilityObserver: NSObjectProtocol?
     private var scrollAccumulator: CGFloat = 0
     private var lastPushedGrid = (rows: 0, columns: 0)
     /// The popover's custom resize grip does not participate in AppKit's window
@@ -123,6 +127,9 @@ final class TerminalView: NSView {
 
     deinit {
         redrawTimer?.cancel()
+        if let windowVisibilityObserver {
+            NotificationCenter.default.removeObserver(windowVisibilityObserver)
+        }
     }
 
     override var wantsUpdateLayer: Bool { false }
@@ -134,6 +141,7 @@ final class TerminalView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        observeWindowVisibility()
         updateRedrawTimer()
         pushGridSizeToSession()
     }
@@ -148,9 +156,16 @@ final class TerminalView: NSView {
     }
 
     /// The coalescing timer runs only while a session is attached and the
-    /// view is in a window; it flushes the dirty flag into needsDisplay.
-    private func updateRedrawTimer() {
-        let shouldRun = session != nil && window != nil
+    /// view's window is actually on screen; it flushes the dirty flag into
+    /// needsDisplay.
+    ///
+    /// The gate used to be `window != nil`, which never went false: hiding the
+    /// panel calls orderOut, and that leaves the view in its window. So once a
+    /// terminal had been opened, this timer woke the main thread ~62 times a
+    /// second for the rest of the app's life. In a menu-bar app expected to sit
+    /// idle all day that measured as ~3% of a CPU core, indefinitely.
+    func updateRedrawTimer() {
+        let shouldRun = session != nil && isWindowOnScreen
         if shouldRun && redrawTimer == nil {
             let timer = DispatchSource.makeTimerSource(queue: .main)
             timer.schedule(deadline: .now() + Self.redrawInterval, repeating: Self.redrawInterval)
@@ -158,13 +173,50 @@ final class TerminalView: NSView {
                 guard let self, self.screenDirty else { return }
                 self.screenDirty = false
                 self.needsDisplay = true
-                NSAccessibility.post(element: self, notification: .valueChanged)
+                self.postAccessibilityValueChangeIfDue()
             }
             timer.resume()
             redrawTimer = timer
+            // Output may have arrived while the timer was stopped.
+            needsDisplay = true
         } else if !shouldRun, let timer = redrawTimer {
             timer.cancel()
             redrawTimer = nil
+        }
+    }
+
+    private var isWindowOnScreen: Bool {
+        guard let window else { return false }
+        return window.isVisible && window.occlusionState.contains(.visible)
+    }
+
+    /// VoiceOver re-reads the whole terminal on every value change, and
+    /// accessibilityValue() returns the entire visible screen. Posting this at
+    /// the 60 Hz redraw rate made streaming output unusable with VoiceOver on,
+    /// so announcements are throttled to a readable cadence.
+    private func postAccessibilityValueChangeIfDue() {
+        let now = Date()
+        guard now.timeIntervalSince(lastAccessibilityPost) >= Self.accessibilityPostInterval else {
+            return
+        }
+        lastAccessibilityPost = now
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    /// Re-evaluates the render gate when the hosting window is shown, hidden,
+    /// or fully covered by another window.
+    private func observeWindowVisibility() {
+        if let windowVisibilityObserver {
+            NotificationCenter.default.removeObserver(windowVisibilityObserver)
+            self.windowVisibilityObserver = nil
+        }
+        guard let window else { return }
+        windowVisibilityObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateRedrawTimer() }
         }
     }
 
