@@ -14,6 +14,7 @@ enum FinderPathPreferences {
     static let showConnectToServerItemKey = "showConnectToServerItem"
     static let remoteConnectionTerminalKey = "remoteConnectionTerminal"
     static let remoteServersKey = "remoteServers"
+    static let showAllTailscaleDevicesKey = "showAllTailscaleDevices"
     static let showCheckForUpdatesItemKey = "showCheckForUpdatesItem"
     static let showQuitItemKey = "showQuitItem"
     static let pathDisplayStyleKey = "pathDisplayStyle"
@@ -58,6 +59,7 @@ enum FinderPathPreferences {
             showConnectToServerItemKey: true,
             remoteConnectionTerminalKey: "ghostty",
             remoteServersKey: "",
+            showAllTailscaleDevicesKey: true,
             showCheckForUpdatesItemKey: true,
             showQuitItemKey: true,
             pathDisplayStyleKey: "full",
@@ -134,6 +136,13 @@ enum FinderPathPreferences {
 
     static var remoteServers: String {
         string(for: remoteServersKey, defaultValue: "")
+    }
+
+    /// The Tailscale device list shows every device by default. It used to be
+    /// filtered to Linux hosts, which hid a tailnet whose servers run another
+    /// operating system — the machine you want is not always a Linux box.
+    static var showAllTailscaleDevices: Bool {
+        bool(for: showAllTailscaleDevicesKey, defaultValue: true)
     }
 
     static var showCheckForUpdatesItem: Bool {
