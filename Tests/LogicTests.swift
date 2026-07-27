@@ -36,6 +36,20 @@ struct FinderPathLogicTests {
         ]
         expect(RemoteServers.parse(RemoteServers.serialize(servers)) == servers, "server persistence should round-trip")
 
+        // The Tailscale device list must show every device by default. Filtering
+        // it to Linux hosts hid every online Windows and macOS server on a real
+        // tailnet, and the toggle was view state that reset on every launch —
+        // so the machines came back hidden after each login.
+        let showAllKey = FinderPathPreferences.showAllTailscaleDevicesKey
+        UserDefaults.standard.removeObject(forKey: showAllKey)
+        FinderPathPreferences.registerDefaults()
+        expect(FinderPathPreferences.showAllTailscaleDevices, "Tailscale devices should default to showing all")
+        UserDefaults.standard.set(false, forKey: showAllKey)
+        expect(!FinderPathPreferences.showAllTailscaleDevices, "an explicit Linux-only choice must persist")
+        UserDefaults.standard.set(true, forKey: showAllKey)
+        expect(FinderPathPreferences.showAllTailscaleDevices, "re-enabling show all must persist")
+        UserDefaults.standard.removeObject(forKey: showAllKey)
+
         // Prerelease builds of the same version must not be treated as equal:
         // UpdateInstaller.verify uses this to gate replacing the running app.
         expect(!UpdateChecker.versionsAreEquivalent("1.7-beta", "1.7-rc"), "different prereleases must not match")

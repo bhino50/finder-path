@@ -31,12 +31,15 @@ final class RemoteConnectionWindowController: NSWindowController {
 struct RemoteConnectionView: View {
     @AppStorage(FinderPathPreferences.remoteServersKey) private var remoteServersText = ""
     @AppStorage(FinderPathPreferences.remoteConnectionTerminalKey) private var remoteConnectionTerminal = "ghostty"
+    // Persisted, not @State: this view is rebuilt on every launch, so a
+    // transient toggle silently re-hid every non-Linux device after each
+    // restart — and FinderPath launches at login.
+    @AppStorage(FinderPathPreferences.showAllTailscaleDevicesKey) private var showAllDevices = true
 
     @State private var selection: String?
     @State private var selectedTarget = ""
     @State private var user = ""
     @State private var tailscale = TailscaleStatus.unavailable
-    @State private var showAllDevices = false
     @State private var isLoadingTailscale = false
     @State private var isTogglingVPN = false
     @State private var isConfirmingVPNDisconnect = false
