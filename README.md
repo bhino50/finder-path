@@ -2,7 +2,13 @@
 
 **See and copy your current Finder folder path from the macOS menu bar. A separate Linux sibling is available at [finderpath-linux](https://github.com/bhino50/finderpath-linux).**
 
-![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple) ![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift) ![Linux sibling](https://img.shields.io/badge/Linux-sibling-2ea44f?logo=linux) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+[![CI](https://github.com/bhino50/finder-path/actions/workflows/ci.yml/badge.svg)](https://github.com/bhino50/finder-path/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/bhino50/finder-path/actions/workflows/codeql.yml/badge.svg)](https://github.com/bhino50/finder-path/actions/workflows/codeql.yml)
+[![Latest release](https://img.shields.io/github/v/release/bhino50/finder-path?display_name=tag&sort=semver)](https://github.com/bhino50/finder-path/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/bhino50/finder-path/total?logo=github)](https://github.com/bhino50/finder-path/releases)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple)
+![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
 
