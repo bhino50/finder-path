@@ -184,6 +184,20 @@ NOTARY_PROFILE="FinderPathNotary" \
 ./script/package_release.sh
 ```
 
+You can also authenticate notarization with an existing App Store Connect API
+key instead of a Keychain profile:
+
+```bash
+DEVELOPER_ID="Developer ID Application: Your Name (TEAMID)" \
+NOTARY_KEY="$HOME/.appstoreconnect/private_keys/AuthKey_KEYID.p8" \
+NOTARY_KEY_ID="KEYID" \
+NOTARY_ISSUER="00000000-0000-0000-0000-000000000000" \
+./script/package_release.sh
+```
+
+Omit `NOTARY_ISSUER` only for an individual API key. Never commit the `.p8`
+private key.
+
 See the `script/` folder for full details. For Developer ID signing and notarization setup, store your credentials once with `xcrun notarytool store-credentials` before running the release script.
 
 ---

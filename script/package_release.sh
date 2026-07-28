@@ -40,8 +40,38 @@ DMG_STAGING_DIR="$ROOT_DIR/.build/dmg-staging"
 VERSION_JSON="$ROOT_DIR/download-site/version.json"
 DOWNLOAD_INDEX="$ROOT_DIR/download-site/index.html"
 
-if [[ -n "${NOTARY_PROFILE:-}" && -z "${DEVELOPER_ID:-}" ]]; then
-  echo "NOTARY_PROFILE requires DEVELOPER_ID; refusing to create an ambiguous artifact." >&2
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+NOTARY_KEY="${NOTARY_KEY:-}"
+NOTARY_KEY_ID="${NOTARY_KEY_ID:-}"
+NOTARY_ISSUER="${NOTARY_ISSUER:-}"
+NOTARY_ARGS=()
+NOTARY_AUTH_DESCRIPTION=""
+
+if [[ -n "$NOTARY_PROFILE" && ( -n "$NOTARY_KEY" || -n "$NOTARY_KEY_ID" || -n "$NOTARY_ISSUER" ) ]]; then
+  echo "Use either NOTARY_PROFILE or NOTARY_KEY/NOTARY_KEY_ID/NOTARY_ISSUER, not both." >&2
+  exit 2
+fi
+if [[ -n "$NOTARY_KEY" || -n "$NOTARY_KEY_ID" || -n "$NOTARY_ISSUER" ]]; then
+  if [[ -z "$NOTARY_KEY" || -z "$NOTARY_KEY_ID" ]]; then
+    echo "API-key notarization requires both NOTARY_KEY and NOTARY_KEY_ID." >&2
+    exit 2
+  fi
+  if [[ ! -f "$NOTARY_KEY" ]]; then
+    echo "Notary API key file does not exist: $NOTARY_KEY" >&2
+    exit 2
+  fi
+  NOTARY_ARGS=(--key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID")
+  if [[ -n "$NOTARY_ISSUER" ]]; then
+    NOTARY_ARGS+=(--issuer "$NOTARY_ISSUER")
+  fi
+  NOTARY_AUTH_DESCRIPTION="App Store Connect API key $NOTARY_KEY_ID"
+elif [[ -n "$NOTARY_PROFILE" ]]; then
+  NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+  NOTARY_AUTH_DESCRIPTION="Keychain profile $NOTARY_PROFILE"
+fi
+
+if (( ${#NOTARY_ARGS[@]} > 0 )) && [[ -z "${DEVELOPER_ID:-}" ]]; then
+  echo "Notary credentials require DEVELOPER_ID; refusing to create an ambiguous artifact." >&2
   exit 2
 fi
 
@@ -50,7 +80,7 @@ PUBLIC_PROMOTION_COMPLETE=false
 NOTARY_CANDIDATE=""
 NOTARY_APP_UPLOAD=""
 APP_ARCHIVE_CANDIDATE=""
-if [[ -n "${DEVELOPER_ID:-}" && -n "${NOTARY_PROFILE:-}" ]]; then
+if [[ -n "${DEVELOPER_ID:-}" ]] && (( ${#NOTARY_ARGS[@]} > 0 )); then
   RELEASE_KIND="public notarized"
   PUBLIC_RELEASE=true
   DMG_PATH="$DIST_DIR/$APP_NAME-$VERSION.dmg"
@@ -156,10 +186,10 @@ if [[ -n "${DEVELOPER_ID:-}" ]] && ! /usr/bin/codesign -dvv "$APP_PATH" 2>&1 | /
 fi
 
 if [[ "$PUBLIC_RELEASE" == true ]]; then
-  echo "Submitting a temporary app ZIP to Apple notarization profile: $NOTARY_PROFILE"
+  echo "Submitting a temporary app ZIP to Apple notarization using $NOTARY_AUTH_DESCRIPTION"
   /usr/bin/ditto -c -k --norsrc --keepParent "$APP_PATH" "$NOTARY_APP_UPLOAD"
   /usr/bin/xcrun notarytool submit "$NOTARY_APP_UPLOAD" \
-    --keychain-profile "$NOTARY_PROFILE" \
+    "${NOTARY_ARGS[@]}" \
     --wait
   rm -f "$NOTARY_APP_UPLOAD"
 
@@ -209,9 +239,9 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
 fi
 
 if [[ "$PUBLIC_RELEASE" == true ]]; then
-  echo "Submitting the DMG itself to Apple notarization profile: $NOTARY_PROFILE"
+  echo "Submitting the DMG itself to Apple notarization using $NOTARY_AUTH_DESCRIPTION"
   /usr/bin/xcrun notarytool submit "$DMG_WORK_PATH" \
-    --keychain-profile "$NOTARY_PROFILE" \
+    "${NOTARY_ARGS[@]}" \
     --wait
 
   echo "Stapling and validating the DMG notarization ticket..."

@@ -1,5 +1,5 @@
 {
-  "version": "1.6",
-  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.6/FinderPath-1.6.dmg",
-  "notes": "FinderPath 1.6 fixes Finder access. Earlier notarized builds were blocked by the Hardened Runtime from asking for Automation permission, so Grant Finder Access never prompted. The app now includes the Apple Events entitlement, so the permission prompt appears and FinderPath shows up under Privacy & Security > Automation."
+  "version": "1.8",
+  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.8/FinderPath-1.8.dmg",
+  "notes": "FinderPath 1.8."
 }
