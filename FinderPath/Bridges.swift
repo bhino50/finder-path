@@ -268,40 +268,20 @@ enum TerminalBridge {
             return
         }
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = [
-            "-n",
-            ghosttyURL.path,
-            "--args",
-            "--working-directory=\(directoryURL.path)",
-            "--window-inherit-working-directory=false",
-            "--tab-inherit-working-directory=false"
-        ]
+        // Ghostty declares public.directory as a document type, so opening the
+        // folder as a document opens a terminal window at that directory in
+        // the already-running instance. The previous
+        // `open -n --args --working-directory=...` launch spawned a whole
+        // second Ghostty instance (duplicate Dock icon and window management)
+        // whenever Ghostty was already running.
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
 
-        let errorPipe = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = errorPipe
-
-        // waitUntilExit blocks, so launch on a background task and report the
-        // result asynchronously instead of stalling the caller's thread. The
-        // completion may run off the main actor; callers hop back for UI work.
-        Task.detached {
-            do {
-                try task.run()
-            } catch {
+        NSWorkspace.shared.open([directoryURL], withApplicationAt: ghosttyURL, configuration: configuration) { _, error in
+            if let error {
                 completion("Could not open Ghostty: \(error.localizedDescription)")
-                return
-            }
-
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-            if task.terminationStatus == 0 {
-                completion(nil)
             } else {
-                let message = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                completion(message?.isEmpty == false ? message : "Could not open Ghostty.")
+                completion(nil)
             }
         }
     }
@@ -419,18 +399,44 @@ enum TerminalBridge {
     /// same approach FinderBridge.fetchCurrentPath already uses, for the same
     /// reason. The completion may run off the main actor, matching the
     /// contract openGhostty/openSSHInGhostty already have.
+    /// Builds the AppleScript that runs `command` in Terminal.app.
+    ///
+    /// Terminal launched cold by an Apple event still opens its startup window
+    /// before servicing `do script`, so an unconditional `do script` produced
+    /// two windows per launch: the idle startup window plus the command
+    /// window. The running state is read outside the tell block — the first
+    /// event inside it would launch Terminal and hide whether the startup
+    /// window is fresh — and a cold launch reuses window 1, falling back to a
+    /// new window when Terminal is configured to start without one. The
+    /// timeout is generous because a cold launch (or the TCC consent prompt)
+    /// can exceed a few seconds, and a premature -1712 surfaced as a spurious
+    /// launch-failure alert while the window went on to open anyway.
+    static func terminalLaunchScriptSource(command: String) -> String {
+        """
+        set launchCommand to "\(escapedAppleScriptString(command))"
+        set terminalWasRunning to application id "com.apple.Terminal" is running
+        with timeout of 30 seconds
+            tell application id "com.apple.Terminal"
+                if terminalWasRunning then
+                    do script launchCommand
+                else
+                    try
+                        do script launchCommand in window 1
+                    on error
+                        do script launchCommand
+                    end try
+                end if
+                activate
+            end tell
+        end timeout
+        """
+    }
+
     private static func runTerminalScript(
         command: String,
         completion: @escaping (String?) -> Void
     ) {
-        let source = """
-        with timeout of 3 seconds
-            tell application "Terminal"
-                activate
-                do script "\(escapedAppleScriptString(command))"
-            end tell
-        end timeout
-        """
+        let source = terminalLaunchScriptSource(command: command)
 
         Task.detached {
             let process = Process()

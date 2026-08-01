@@ -92,6 +92,38 @@ struct FinderPathLogicTests {
             "Terminal AppleScript strings should neutralize CR, LF, quotes, and backslashes"
         )
 
+        // Terminal launched cold by an Apple event still opens its startup
+        // window before servicing `do script`, so an unconditional `do script`
+        // produced two windows per launch. The script must capture the running
+        // state before any event, reuse the startup window on a cold launch,
+        // and fall back to a new window when no startup window exists.
+        let launchScript = TerminalBridge.terminalLaunchScriptSource(command: "echo \"hi\"")
+        expect(
+            launchScript.contains("set launchCommand to \"echo \\\"hi\\\"\""),
+            "the launch command should be AppleScript-escaped into a single variable"
+        )
+        expect(
+            launchScript.components(separatedBy: "echo").count == 2,
+            "the command text should be embedded exactly once"
+        )
+        expect(
+            launchScript.contains("do script launchCommand in window 1"),
+            "a cold launch must reuse Terminal's startup window instead of opening a second one"
+        )
+        expect(
+            launchScript.contains("on error"),
+            "a cold launch without a startup window must fall back to a new window"
+        )
+        if let runningCheck = launchScript.range(of: "is running"),
+           let tellBlock = launchScript.range(of: "tell application") {
+            expect(
+                runningCheck.lowerBound < tellBlock.lowerBound,
+                "the running state must be read before the tell block sends any launching event"
+            )
+        } else {
+            expect(false, "the launch script must check Terminal's running state outside the tell block")
+        }
+
         expect(AgentLauncher.availability(for: "/bin/sh").resolvedPath == "/bin/sh", "absolute executables should resolve")
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")
         expect(!AgentLauncher.availability(for: "finderpath-command-that-does-not-exist").isInstalled, "missing executables should not resolve")
