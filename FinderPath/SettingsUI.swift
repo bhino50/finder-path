@@ -59,6 +59,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.hideUnavailableAgentItemsKey) private var hideUnavailableAgentItems = true
     @AppStorage(FinderPathPreferences.showTerminalsSectionKey) private var showTerminalsSection = true
     @AppStorage(FinderPathPreferences.rightClickOpensTerminalsKey) private var rightClickOpensTerminals = true
+    @AppStorage(FinderPathPreferences.hoverShowsTerminalsKey) private var hoverShowsTerminals = true
     @AppStorage(FinderPathPreferences.terminalFontSizeKey) private var terminalFontSize = 12.0
     @AppStorage(FinderPathPreferences.terminalScrollbackLimitKey) private var terminalScrollbackLimit = 2000
     @AppStorage(FinderPathPreferences.terminalShellOverrideKey) private var terminalShellOverride = ""
@@ -169,6 +170,7 @@ struct SettingsView: View {
             Section("Terminals") {
                 Toggle("Show Terminals menu section", isOn: $showTerminalsSection)
                 Toggle("Right-click opens terminals", isOn: $rightClickOpensTerminals)
+                Toggle("Hovering shows open terminals", isOn: $hoverShowsTerminals)
 
                 LabeledContent("Terminal font size") {
                     HStack {

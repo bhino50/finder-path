@@ -85,6 +85,13 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 
     // MARK: - Presentation
 
+    /// True while either surface (popover or pinned panel) is on screen. The
+    /// hover quick-pick uses this to stay out of the way when the terminal UI
+    /// is already visible.
+    var isPresenting: Bool {
+        popover?.isShown == true || panel?.isVisible == true
+    }
+
     func toggle(relativeTo statusButton: NSStatusBarButton) {
         lastStatusButton = statusButton
         if isPinned {

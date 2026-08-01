@@ -92,6 +92,38 @@ struct FinderPathLogicTests {
             "Terminal AppleScript strings should neutralize CR, LF, quotes, and backslashes"
         )
 
+        // Hovering the status item quick-picks an open terminal session. The
+        // picker must never appear when disabled, when there is nothing to
+        // pick, or when the menu or terminal panel already owns the screen.
+        let hoverKey = FinderPathPreferences.hoverShowsTerminalsKey
+        UserDefaults.standard.removeObject(forKey: hoverKey)
+        FinderPathPreferences.registerDefaults()
+        expect(FinderPathPreferences.hoverShowsTerminals, "hover quick-pick should be enabled by default")
+        UserDefaults.standard.set(false, forKey: hoverKey)
+        expect(!FinderPathPreferences.hoverShowsTerminals, "disabling hover quick-pick must persist")
+        UserDefaults.standard.removeObject(forKey: hoverKey)
+
+        expect(
+            HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 2, isMenuTracking: false, isPanelVisible: false),
+            "hover with open sessions should present the picker"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: false, sessionCount: 2, isMenuTracking: false, isPanelVisible: false),
+            "a disabled picker must never present"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 0, isMenuTracking: false, isPanelVisible: false),
+            "no sessions means nothing to pick"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 1, isMenuTracking: true, isPanelVisible: false),
+            "the status menu owns the screen while tracking"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 1, isMenuTracking: false, isPanelVisible: true),
+            "an open terminal panel already shows the sessions"
+        )
+
         // Terminal launched cold by an Apple event still opens its startup
         // window before servicing `do script`, so an unconditional `do script`
         // produced two windows per launch. The script must capture the running

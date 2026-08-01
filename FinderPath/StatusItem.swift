@@ -21,6 +21,18 @@ final class StatusItemController: NSObject {
     private var isMenuTracking = false
     private var menuOptionHeld = false
     private var harnessMenuItemBindings: [HarnessMenuItemBinding] = []
+    private var hoverDwellTimer: Timer?
+
+    // Hovering the status item quick-picks an open terminal session without a
+    // click. Lazy so the picker only exists once a hover actually qualifies.
+    private lazy var hoverPicker: TerminalHoverPickerController = {
+        let picker = TerminalHoverPickerController(store: .shared)
+        picker.onOpenSession = { [weak self] session in self?.openTerminal(session) }
+        picker.onCloseSession = { [weak self] session in self?.closeTerminal(session) }
+        return picker
+    }()
+
+    private static let hoverDwellSeconds: TimeInterval = 0.45
 
     // Lazy so the panel (and its views) only exist once terminals are used.
     // New sessions start in the current Finder folder when it is a real path,
@@ -45,6 +57,15 @@ final class StatusItemController: NSObject {
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            // Hover detection for the terminal quick-pick. The dwell delay in
+            // scheduleHoverPicker keeps a pointer merely crossing the menu bar
+            // from summoning the popover.
+            button.addTrackingArea(NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            ))
         }
 
         updateStatusItemAppearance()
@@ -65,7 +86,51 @@ final class StatusItemController: NSObject {
         }
     }
 
+    // NSTrackingArea sends mouseEntered:/mouseExited: to its owner even when
+    // the owner is not an NSResponder; the explicit selector names keep the
+    // Swift methods reachable from that dispatch.
+    @objc(mouseEntered:) func mouseEntered(with event: NSEvent) {
+        scheduleHoverPicker()
+    }
+
+    @objc(mouseExited:) func mouseExited(with event: NSEvent) {
+        hoverDwellTimer?.invalidate()
+        hoverDwellTimer = nil
+    }
+
+    private func scheduleHoverPicker() {
+        hoverDwellTimer?.invalidate()
+        let timer = Timer(timeInterval: Self.hoverDwellSeconds, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.presentHoverPickerIfAllowed()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hoverDwellTimer = timer
+    }
+
+    private func presentHoverPickerIfAllowed() {
+        hoverDwellTimer = nil
+        guard let button = statusItem.button else { return }
+        // Session count gates first so an idle hover never lazily builds the
+        // terminal panel just to ask whether it is visible.
+        let sessionCount = TerminalSessionStore.shared.sessions.count
+        guard sessionCount > 0 else { return }
+        guard HoverPickerLogic.shouldPresent(
+            enabled: FinderPathPreferences.hoverShowsTerminals,
+            sessionCount: sessionCount,
+            isMenuTracking: isMenuTracking,
+            isPanelVisible: terminalPanelController.isPresenting || hoverPicker.isShown
+        ) else { return }
+        hoverPicker.present(relativeTo: button)
+    }
+
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        // A click supersedes any hover-summoned quick-pick.
+        hoverDwellTimer?.invalidate()
+        hoverDwellTimer = nil
+        hoverPicker.dismiss()
+
         // Right-click goes straight to the terminal panel (the button sends
         // rightMouseUp); refresh keeps the new-session directory current.
         if FinderPathPreferences.rightClickOpensTerminals,
