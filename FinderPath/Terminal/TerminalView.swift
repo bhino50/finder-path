@@ -507,6 +507,18 @@ final class TerminalView: NSView {
         guard wholeLines != 0 else { return }
         scrollAccumulator -= CGFloat(wholeLines)
 
+        // Alternate-screen apps (agent TUIs, pagers) have no scrollback to
+        // offset into; forward the wheel as arrow keys so they scroll their
+        // own viewport, matching Terminal.app's alternateScroll behavior.
+        if session.screen.usingAlternateScreen {
+            if let presses = TerminalInputEncoder.alternateScrollKeyPresses(wheelLines: wholeLines) {
+                for _ in 0..<presses.count {
+                    session.send(special: presses.key)
+                }
+            }
+            return
+        }
+
         let limit = session.screen.scrollbackCount
         let updated = min(max(scrollbackOffset + wholeLines, 0), limit)
         if updated != scrollbackOffset {

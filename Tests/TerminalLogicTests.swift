@@ -322,6 +322,22 @@ struct FinderPathTerminalTests {
             TerminalInputEncoder.encode(specialKey: .up, applicationCursorKeys: true) == [0x1B, 0x4F, 0x41],
             "application mode up arrow is SS3 A"
         )
+
+        // Wheel scrolling on the alternate screen translates to arrow presses
+        // (xterm alternateScroll); the scrollback is empty there, so without
+        // this a pinned terminal running a TUI cannot scroll at all.
+        let scrollUp = TerminalInputEncoder.alternateScrollKeyPresses(wheelLines: 3)
+        expect(scrollUp?.key == .up && scrollUp?.count == 3, "scrolling up maps to Up arrow presses")
+        let scrollDown = TerminalInputEncoder.alternateScrollKeyPresses(wheelLines: -2)
+        expect(scrollDown?.key == .down && scrollDown?.count == 2, "scrolling down maps to Down arrow presses")
+        expect(
+            TerminalInputEncoder.alternateScrollKeyPresses(wheelLines: 0) == nil,
+            "no wheel movement sends nothing"
+        )
+        expect(
+            TerminalInputEncoder.alternateScrollKeyPresses(wheelLines: -500)?.count == 40,
+            "momentum scrolling is capped so it cannot flood the PTY"
+        )
         expect(
             TerminalInputEncoder.encode(specialKey: .backspace, applicationCursorKeys: false) == [0x7F],
             "backspace sends DEL"
