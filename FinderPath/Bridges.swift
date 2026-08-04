@@ -268,40 +268,20 @@ enum TerminalBridge {
             return
         }
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = [
-            "-n",
-            ghosttyURL.path,
-            "--args",
-            "--working-directory=\(directoryURL.path)",
-            "--window-inherit-working-directory=false",
-            "--tab-inherit-working-directory=false"
-        ]
+        // Ghostty declares public.directory as a document type, so opening the
+        // folder as a document opens a terminal window at that directory in
+        // the already-running instance. The previous
+        // `open -n --args --working-directory=...` launch spawned a whole
+        // second Ghostty instance (duplicate Dock icon and window management)
+        // whenever Ghostty was already running.
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
 
-        let errorPipe = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = errorPipe
-
-        // waitUntilExit blocks, so launch on a background task and report the
-        // result asynchronously instead of stalling the caller's thread. The
-        // completion may run off the main actor; callers hop back for UI work.
-        Task.detached {
-            do {
-                try task.run()
-            } catch {
+        NSWorkspace.shared.open([directoryURL], withApplicationAt: ghosttyURL, configuration: configuration) { _, error in
+            if let error {
                 completion("Could not open Ghostty: \(error.localizedDescription)")
-                return
-            }
-
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-            if task.terminationStatus == 0 {
-                completion(nil)
             } else {
-                let message = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                completion(message?.isEmpty == false ? message : "Could not open Ghostty.")
+                completion(nil)
             }
         }
     }
@@ -363,41 +343,98 @@ enum TerminalBridge {
         }
     }
 
+    private static let sshScriptDirectoryPrefix = "FinderPathSSH-"
+    /// Long enough for Ghostty to have opened and read the script. Deleting it
+    /// from inside the script would race `sh`, which reads the file as it runs.
+    private static let sshScriptLifetime: TimeInterval = 20
+    private static let sshScriptStaleAge: TimeInterval = 300
+
+    /// Body of the throwaway script Ghostty opens as a document. Split out so
+    /// the logic tests can assert the host stays shell-quoted.
+    static func sshLaunchScriptSource(host: String) -> String {
+        """
+        #!/bin/sh
+        exec ssh -- \(ShellCommand.argument(host))
+        """
+    }
+
     private static func openSSHInGhostty(host: String, completion: @escaping (String?) -> Void) {
         guard let ghosttyURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: ghosttyBundleIdentifier) else {
             completion("Ghostty.app was not found. Choose a different SSH terminal in Settings.")
             return
         }
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        // Ghostty runs `-e <command>` directly without a shell, so the host is
-        // passed as its own argument and needs no shell quoting. `--` ends ssh
-        // option parsing so the host is always treated as a positional argument.
-        task.arguments = ["-n", ghosttyURL.path, "--args", "-e", "ssh", "--", host]
+        let script: URL
+        do {
+            script = try writeSSHLaunchScript(host: host)
+        } catch {
+            completion("Could not prepare the SSH session: \(error.localizedDescription)")
+            return
+        }
 
-        let errorPipe = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = errorPipe
+        // `open -n ... --args -e ssh` was the only documented way to hand
+        // Ghostty a command on macOS, but -n always spawns a second Ghostty
+        // process (verified: instance count goes 1 -> 2) — the same duplicate
+        // instance openGhostty was fixed for. Ghostty also declares shell
+        // scripts as a document type, so opening one runs it in the instance
+        // that is already up, exactly like the folder path above. Ghostty's
+        // +new-window action would be tidier but is Linux-only.
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
 
-        // Same pattern as openGhostty: never block the caller on waitUntilExit.
-        Task.detached {
-            do {
-                try task.run()
-            } catch {
+        NSWorkspace.shared.open([script], withApplicationAt: ghosttyURL, configuration: configuration) { _, error in
+            scheduleSSHScriptCleanup(at: script.deletingLastPathComponent())
+            if let error {
                 completion("Could not open Ghostty: \(error.localizedDescription)")
-                return
-            }
-
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-            if task.terminationStatus == 0 {
-                completion(nil)
             } else {
-                let message = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                completion(message?.isEmpty == false ? message : "Could not start the SSH session in Ghostty.")
+                completion(nil)
             }
+        }
+    }
+
+    /// Writes the launch script into a private per-launch directory. The host
+    /// is already validated by openSSH and is shell-quoted into the body, so
+    /// the script cannot run anything but ssh against that host.
+    private static func writeSSHLaunchScript(host: String) throws -> URL {
+        removeStaleSSHScriptDirectories()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(sshScriptDirectoryPrefix + UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        // `.command` is one of Ghostty's declared terminal-script extensions.
+        let script = directory.appendingPathComponent("ssh.command")
+        try sshLaunchScriptSource(host: host).write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        return script
+    }
+
+    private static func scheduleSSHScriptCleanup(at directory: URL) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + sshScriptLifetime) {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    /// A crash or a forced quit between writing and cleanup would strand a
+    /// script, so each launch also sweeps directories older than the stale age.
+    private static func removeStaleSSHScriptDirectories() {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: fileManager.temporaryDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let cutoff = Date().addingTimeInterval(-sshScriptStaleAge)
+        for entry in entries where entry.lastPathComponent.hasPrefix(sshScriptDirectoryPrefix) {
+            let modified = try? entry.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate
+            guard let modified, modified <= cutoff else { continue }
+            try? fileManager.removeItem(at: entry)
         }
     }
 
@@ -419,18 +456,44 @@ enum TerminalBridge {
     /// same approach FinderBridge.fetchCurrentPath already uses, for the same
     /// reason. The completion may run off the main actor, matching the
     /// contract openGhostty/openSSHInGhostty already have.
+    /// Builds the AppleScript that runs `command` in Terminal.app.
+    ///
+    /// Terminal launched cold by an Apple event still opens its startup window
+    /// before servicing `do script`, so an unconditional `do script` produced
+    /// two windows per launch: the idle startup window plus the command
+    /// window. The running state is read outside the tell block — the first
+    /// event inside it would launch Terminal and hide whether the startup
+    /// window is fresh — and a cold launch reuses window 1, falling back to a
+    /// new window when Terminal is configured to start without one. The
+    /// timeout is generous because a cold launch (or the TCC consent prompt)
+    /// can exceed a few seconds, and a premature -1712 surfaced as a spurious
+    /// launch-failure alert while the window went on to open anyway.
+    static func terminalLaunchScriptSource(command: String) -> String {
+        """
+        set launchCommand to "\(escapedAppleScriptString(command))"
+        set terminalWasRunning to application id "com.apple.Terminal" is running
+        with timeout of 30 seconds
+            tell application id "com.apple.Terminal"
+                if terminalWasRunning then
+                    do script launchCommand
+                else
+                    try
+                        do script launchCommand in window 1
+                    on error
+                        do script launchCommand
+                    end try
+                end if
+                activate
+            end tell
+        end timeout
+        """
+    }
+
     private static func runTerminalScript(
         command: String,
         completion: @escaping (String?) -> Void
     ) {
-        let source = """
-        with timeout of 3 seconds
-            tell application "Terminal"
-                activate
-                do script "\(escapedAppleScriptString(command))"
-            end tell
-        end timeout
-        """
+        let source = terminalLaunchScriptSource(command: command)
 
         Task.detached {
             let process = Process()
@@ -489,11 +552,18 @@ enum TerminalBridge {
         return URL(fileURLWithPath: path).deletingLastPathComponent()
     }
 
+    /// AppleScript string literals cannot span raw newlines, but they do
+    /// understand `\n` and `\r` escapes. Replacing the characters with spaces
+    /// (as this used to) silently rewrote the command: a folder whose name
+    /// contains a newline — legal on APFS — turned `cd '/tmp/a<LF>b'` into
+    /// `cd '/tmp/a b'`, so the launch landed in the wrong directory or failed.
+    /// Emitting the escape preserves the byte. Backslash is escaped first so
+    /// the escapes added below are not themselves doubled.
     static func escapedAppleScriptString(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
     }
 }

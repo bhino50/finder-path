@@ -41,6 +41,17 @@ enum TerminalInputEncoder {
         (meta ? [esc] : []) + Array(text.utf8)
     }
 
+    /// Alternate-screen apps (pagers, editors, agent TUIs) own their viewport
+    /// and the scrollback is empty while they run, so wheel scrolling maps to
+    /// arrow-key presses instead — xterm's alternateScroll behavior, which
+    /// Terminal.app and iTerm apply by default. Positive lines scroll up. The
+    /// count is capped so a momentum fling cannot flood the PTY with input.
+    static func alternateScrollKeyPresses(wheelLines: Int) -> (key: SpecialKey, count: Int)? {
+        guard wheelLines != 0 else { return nil }
+        let cappedPressCount = min(abs(wheelLines), 40)
+        return (wheelLines > 0 ? .up : .down, cappedPressCount)
+    }
+
     static func encode(
         specialKey: SpecialKey,
         modifiers: Modifiers = [],

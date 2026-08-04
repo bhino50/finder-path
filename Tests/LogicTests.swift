@@ -88,9 +88,91 @@ struct FinderPathLogicTests {
         )
         expect(
             TerminalBridge.escapedAppleScriptString("one\rtwo\n\"three\"\\four")
-                == "one two \\\"three\\\"\\\\four",
-            "Terminal AppleScript strings should neutralize CR, LF, quotes, and backslashes"
+                == "one\\rtwo\\n\\\"three\\\"\\\\four",
+            "Terminal AppleScript strings should escape CR, LF, quotes, and backslashes"
         )
+        // Folder names may legally contain a newline. Collapsing it to a space
+        // rewrote the cd target, so the escape has to preserve the byte.
+        expect(
+            TerminalBridge.escapedAppleScriptString("/tmp/a\nb") == "/tmp/a\\nb",
+            "a newline in a folder path should escape rather than collapse to a space"
+        )
+
+        // The Ghostty SSH path opens a throwaway script as a document so the
+        // running instance is reused; the host must stay shell-quoted in it.
+        expect(
+            TerminalBridge.sshLaunchScriptSource(host: "user@host")
+                == "#!/bin/sh\nexec ssh -- 'user@host'",
+            "the Ghostty SSH launch script should exec ssh against the quoted host"
+        )
+        expect(
+            TerminalBridge.sshLaunchScriptSource(host: "a'b").contains("'a'\\''b'"),
+            "a host containing a quote should stay inside single quotes"
+        )
+
+        // Hovering the status item quick-picks an open terminal session. The
+        // picker must never appear when disabled, when there is nothing to
+        // pick, or when the menu or terminal panel already owns the screen.
+        let hoverKey = FinderPathPreferences.hoverShowsTerminalsKey
+        UserDefaults.standard.removeObject(forKey: hoverKey)
+        FinderPathPreferences.registerDefaults()
+        expect(FinderPathPreferences.hoverShowsTerminals, "hover quick-pick should be enabled by default")
+        UserDefaults.standard.set(false, forKey: hoverKey)
+        expect(!FinderPathPreferences.hoverShowsTerminals, "disabling hover quick-pick must persist")
+        UserDefaults.standard.removeObject(forKey: hoverKey)
+
+        expect(
+            HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 2, isMenuTracking: false, isPanelVisible: false),
+            "hover with open sessions should present the picker"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: false, sessionCount: 2, isMenuTracking: false, isPanelVisible: false),
+            "a disabled picker must never present"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 0, isMenuTracking: false, isPanelVisible: false),
+            "no sessions means nothing to pick"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 1, isMenuTracking: true, isPanelVisible: false),
+            "the status menu owns the screen while tracking"
+        )
+        expect(
+            !HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 1, isMenuTracking: false, isPanelVisible: true),
+            "an open terminal panel already shows the sessions"
+        )
+
+        // Terminal launched cold by an Apple event still opens its startup
+        // window before servicing `do script`, so an unconditional `do script`
+        // produced two windows per launch. The script must capture the running
+        // state before any event, reuse the startup window on a cold launch,
+        // and fall back to a new window when no startup window exists.
+        let launchScript = TerminalBridge.terminalLaunchScriptSource(command: "echo \"hi\"")
+        expect(
+            launchScript.contains("set launchCommand to \"echo \\\"hi\\\"\""),
+            "the launch command should be AppleScript-escaped into a single variable"
+        )
+        expect(
+            launchScript.components(separatedBy: "echo").count == 2,
+            "the command text should be embedded exactly once"
+        )
+        expect(
+            launchScript.contains("do script launchCommand in window 1"),
+            "a cold launch must reuse Terminal's startup window instead of opening a second one"
+        )
+        expect(
+            launchScript.contains("on error"),
+            "a cold launch without a startup window must fall back to a new window"
+        )
+        if let runningCheck = launchScript.range(of: "is running"),
+           let tellBlock = launchScript.range(of: "tell application") {
+            expect(
+                runningCheck.lowerBound < tellBlock.lowerBound,
+                "the running state must be read before the tell block sends any launching event"
+            )
+        } else {
+            expect(false, "the launch script must check Terminal's running state outside the tell block")
+        }
 
         expect(AgentLauncher.availability(for: "/bin/sh").resolvedPath == "/bin/sh", "absolute executables should resolve")
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")

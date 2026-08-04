@@ -38,6 +38,7 @@ enum FinderPathPreferences {
     static let terminalShellOverrideKey = "terminalShellOverride"
     static let terminalOptionAsMetaKey = "terminalOptionAsMeta"
     static let rightClickOpensTerminalsKey = "rightClickOpensTerminals"
+    static let hoverShowsTerminalsKey = "hoverShowsTerminals"
     static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
 
     static var completedWelcome: Bool {
@@ -82,6 +83,7 @@ enum FinderPathPreferences {
             terminalShellOverrideKey: "",
             terminalOptionAsMetaKey: false,
             rightClickOpensTerminalsKey: true,
+            hoverShowsTerminalsKey: true,
             completedWelcomeKey: false
         ])
     }
@@ -254,6 +256,10 @@ enum FinderPathPreferences {
 
     static var rightClickOpensTerminals: Bool {
         bool(for: rightClickOpensTerminalsKey, defaultValue: true)
+    }
+
+    static var hoverShowsTerminals: Bool {
+        bool(for: hoverShowsTerminalsKey, defaultValue: true)
     }
 
     static func displayPath(for path: String) -> String {
