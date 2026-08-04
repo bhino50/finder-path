@@ -88,8 +88,26 @@ struct FinderPathLogicTests {
         )
         expect(
             TerminalBridge.escapedAppleScriptString("one\rtwo\n\"three\"\\four")
-                == "one two \\\"three\\\"\\\\four",
-            "Terminal AppleScript strings should neutralize CR, LF, quotes, and backslashes"
+                == "one\\rtwo\\n\\\"three\\\"\\\\four",
+            "Terminal AppleScript strings should escape CR, LF, quotes, and backslashes"
+        )
+        // Folder names may legally contain a newline. Collapsing it to a space
+        // rewrote the cd target, so the escape has to preserve the byte.
+        expect(
+            TerminalBridge.escapedAppleScriptString("/tmp/a\nb") == "/tmp/a\\nb",
+            "a newline in a folder path should escape rather than collapse to a space"
+        )
+
+        // The Ghostty SSH path opens a throwaway script as a document so the
+        // running instance is reused; the host must stay shell-quoted in it.
+        expect(
+            TerminalBridge.sshLaunchScriptSource(host: "user@host")
+                == "#!/bin/sh\nexec ssh -- 'user@host'",
+            "the Ghostty SSH launch script should exec ssh against the quoted host"
+        )
+        expect(
+            TerminalBridge.sshLaunchScriptSource(host: "a'b").contains("'a'\\''b'"),
+            "a host containing a quote should stay inside single quotes"
         )
 
         // Hovering the status item quick-picks an open terminal session. The

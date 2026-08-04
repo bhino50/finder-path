@@ -18,6 +18,7 @@ final class TerminalHoverPickerController {
     private let store: TerminalSessionStore
     private var popover: NSPopover?
     private var proximityTimer: Timer?
+    private var escapeMonitor: Any?
     private var missedProximityChecks = 0
     private weak var anchorButton: NSStatusBarButton?
 
@@ -25,6 +26,7 @@ final class TerminalHoverPickerController {
     private static let width: CGFloat = 280
     private static let verticalPadding: CGFloat = 8
     private static let proximityInterval: TimeInterval = 0.25
+    private static let escapeKeyCode: UInt16 = 53
     // Two consecutive misses (~0.5s) tolerate the gap the pointer crosses
     // between the menu bar and the popover without flickering it away.
     private static let allowedMissedChecks = 2
@@ -50,14 +52,38 @@ final class TerminalHoverPickerController {
         popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
         self.popover = popover
         startProximityTimer()
+        startEscapeMonitor()
     }
 
     func dismiss() {
         proximityTimer?.invalidate()
         proximityTimer = nil
         missedProximityChecks = 0
+        stopEscapeMonitor()
         popover?.performClose(nil)
         popover = nil
+    }
+
+    /// Escape closes the picker, matching every other transient macOS popover.
+    /// A local monitor only sees events while FinderPath is active, which is
+    /// the case whenever the popover has taken focus; the proximity timer stays
+    /// the fallback for a hover that never activated the app. A global monitor
+    /// would cover that too, but only by asking for Accessibility access, which
+    /// is far too much to request for one dismissal shortcut.
+    private func startEscapeMonitor() {
+        stopEscapeMonitor()
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == Self.escapeKeyCode else { return event }
+            self?.dismiss()
+            return nil
+        }
+    }
+
+    private func stopEscapeMonitor() {
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+        }
+        escapeMonitor = nil
     }
 
     private func makeContentController(sessions: [TerminalSession]) -> NSViewController {
@@ -65,6 +91,11 @@ final class TerminalHoverPickerController {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 0
+        // Without this the popover is an unlabelled container to VoiceOver;
+        // the rows inside it carry their own labels from TerminalMenuRowView.
+        stack.setAccessibilityElement(true)
+        stack.setAccessibilityRole(.group)
+        stack.setAccessibilityLabel("Open terminals")
         stack.edgeInsets = NSEdgeInsets(
             top: Self.verticalPadding, left: 0, bottom: Self.verticalPadding, right: 0
         )

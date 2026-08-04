@@ -29,8 +29,9 @@ final class PTYProcess: @unchecked Sendable {
 
     // MARK: - Queue-confined state
 
-    /// Guards every var below. Code already running on this queue must use
-    /// the backing storage directly; the public accessors would deadlock.
+    /// Guards every var below except outputHandler, which has its own lock.
+    /// Code already running on this queue must use the backing storage
+    /// directly; the public accessors would deadlock.
     private let stateQueue = DispatchQueue(label: PTYProcess.queueLabel + ".state")
     private let readQueue = DispatchQueue(label: PTYProcess.queueLabel + ".read")
     // Writes run on their own queue and poll a nonblocking descriptor. They
@@ -38,7 +39,10 @@ final class PTYProcess: @unchecked Sendable {
     // resize, and termination.
     private let writeQueue = DispatchQueue(label: PTYProcess.queueLabel + ".write")
 
+    /// The one piece of state deliberately outside stateQueue — see onOutput.
+    private let outputHandlerLock = NSLock()
     private var outputHandler: (([UInt8]) -> Void)?
+
     private var exitHandler: ((Int32) -> Void)?
     private var runningFlag = false
     private var terminatingFlag = false
@@ -54,9 +58,15 @@ final class PTYProcess: @unchecked Sendable {
     // MARK: - Public surface
 
     /// Fires on a background queue with each chunk read from the PTY.
+    ///
+    /// Guarded by its own lock rather than stateQueue: the read source looks
+    /// this up once per 4 KB chunk, and routing that through stateQueue made
+    /// every chunk wait behind whatever else held it — including the openpty
+    /// and posix_spawn inside launch(). An uncontended lock keeps the drain
+    /// path independent of lifecycle work.
     var onOutput: (([UInt8]) -> Void)? {
-        get { stateQueue.sync { outputHandler } }
-        set { stateQueue.sync { outputHandler = newValue } }
+        get { outputHandlerLock.withLock { outputHandler } }
+        set { outputHandlerLock.withLock { outputHandler = newValue } }
     }
 
     /// Fires once on a background queue with the child's exit code
