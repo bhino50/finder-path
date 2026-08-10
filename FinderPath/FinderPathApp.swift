@@ -80,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Restore stored terminal sessions (metadata only; shells relaunch
         // lazily) before the menu builds so the Terminals section is complete.
         TerminalSessionStore.shared.loadPersistedSessions()
+        RecentPathsStore.shared.load()
         NSApp.setActivationPolicy(.accessory)
         statusItemController = StatusItemController()
         statusItemController?.onOpenWelcomeGuide = { [weak self] in
@@ -241,88 +242,74 @@ final class FinderPathState {
             let result = await FinderBridge.fetchCurrentPath()
             guard let self, generation == self.refreshGeneration else { return }
             self.currentPath = result.path
+            // Only folders that were genuinely open in a Finder window are worth
+            // remembering. The desktop substitution would otherwise dominate the
+            // history, because opening the menu to reach Settings or a terminal
+            // returns it every time.
+            if !result.isFallback, self.hasCopyablePath {
+                RecentPathsStore.shared.record(result.path)
+            }
             onChange?()
         }
     }
 
-    func copyCurrentPath() {
-        guard hasCopyablePath else { return }
+    func copyCurrentPath(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        copyToPasteboard(currentPath)
+        copyToPasteboard(target)
     }
 
-    func copyChangeDirectoryCommand() {
-        guard hasCopyablePath else { return }
+    func copyChangeDirectoryCommand(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        copyToPasteboard("cd \(ShellCommand.argument(currentPath, quoteStyle: FinderPathPreferences.cdQuoteStyle))")
+        copyToPasteboard("cd \(ShellCommand.argument(target, quoteStyle: FinderPathPreferences.cdQuoteStyle))")
     }
 
-    func openInTerminal() {
-        guard hasCopyablePath else { return }
+    func openInTerminal(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.open(at: currentPath) { error in
+        TerminalBridge.open(at: target) { error in
             self.presentLaunchFailure(error, displayName: "Terminal")
         }
     }
 
-    func openInGhostty() {
-        guard hasCopyablePath else { return }
+    func openInGhostty(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.openGhostty(at: currentPath) { error in
+        TerminalBridge.openGhostty(at: target) { error in
             self.presentLaunchFailure(error, displayName: "Ghostty")
         }
     }
 
-    func openInCmux() {
-        guard hasCopyablePath else { return }
+    func openInCmux(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.openCmux(at: currentPath) { error in
+        TerminalBridge.openCmux(at: target) { error in
             self.presentLaunchFailure(error, displayName: "cmux")
         }
     }
 
-    func openWithCodex() {
-        guard hasCopyablePath else { return }
+    /// Opens the folder in Finder. Passing nil for the file selects nothing and
+    /// simply reveals the folder itself.
+    func revealInFinder(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.codexExecutable)
-            .resolvedPath ?? FinderPathPreferences.codexExecutable
-
-        TerminalBridge.openAgent(
-            displayName: "Codex",
-            executable: executable,
-            at: currentPath
-        ) { error in
-            self.presentLaunchFailure(error, displayName: "Codex")
-        }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: target)
     }
 
-    func openWithClaude() {
-        guard hasCopyablePath else { return }
+    /// One launcher for all three agents: the three previous methods differed
+    /// only in which preference they read and which name they reported.
+    func openWithAgent(named name: String, executable: String, at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.claudeExecutable)
-            .resolvedPath ?? FinderPathPreferences.claudeExecutable
-
-        TerminalBridge.openAgent(
-            displayName: "Claude",
-            executable: executable,
-            at: currentPath
-        ) { error in
-            self.presentLaunchFailure(error, displayName: "Claude")
-        }
-    }
-
-    func openWithHermes() {
-        guard hasCopyablePath else { return }
-
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
-            .resolvedPath ?? FinderPathPreferences.hermesExecutable
+        let resolvedExecutable = AgentLauncher.availability(for: executable).resolvedPath ?? executable
 
         TerminalBridge.openAgent(
-            displayName: "Hermes",
-            executable: executable,
-            at: currentPath
+            displayName: name,
+            executable: resolvedExecutable,
+            at: target
         ) { error in
-            self.presentLaunchFailure(error, displayName: "Hermes")
+            self.presentLaunchFailure(error, displayName: name)
         }
     }
 
@@ -341,6 +328,14 @@ final class FinderPathState {
 
     var hasCopyablePath: Bool {
         !currentPath.isEmpty && !currentPath.hasPrefix("Finder AppleScript error:")
+    }
+
+    /// Recent-path rows pass an explicit folder; every other caller acts on the
+    /// live Finder path. A nil argument therefore means "whatever Finder is
+    /// showing", and yields nil when there is nothing usable to act on.
+    private func resolvedTarget(_ path: String?) -> String? {
+        if let path, !path.isEmpty { return path }
+        return hasCopyablePath ? currentPath : nil
     }
 
     private func copyToPasteboard(_ string: String) {

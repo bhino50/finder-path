@@ -523,15 +523,15 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func openWithCodexMenuItem() {
-        state.openWithCodex()
+        state.openWithAgent(named: "Codex", executable: FinderPathPreferences.codexExecutable)
     }
 
     @objc private func openWithClaudeMenuItem() {
-        state.openWithClaude()
+        state.openWithAgent(named: "Claude", executable: FinderPathPreferences.claudeExecutable)
     }
 
     @objc private func openWithHermesMenuItem() {
-        state.openWithHermes()
+        state.openWithAgent(named: "Hermes", executable: FinderPathPreferences.hermesExecutable)
     }
 
     // Clicking a terminal row opens it directly; the row's trailing button
