@@ -296,6 +296,80 @@ struct FinderPathLogicTests {
             "a stalled Finder is a fallback, never a recordable path"
         )
 
+        // Recent Paths remembers the folders FinderPath saw. Order is recency,
+        // so the list logic is pure and lives outside the @MainActor store.
+        let visitDate = Date(timeIntervalSinceReferenceDate: 776_000_000)
+
+        let seeded = RecentPathsLogic.recording("/tmp/one", into: [], at: visitDate)
+        expect(seeded.map(\.path) == ["/tmp/one"], "recording seeds an empty list")
+
+        let two = RecentPathsLogic.recording("/tmp/two", into: seeded, at: visitDate)
+        expect(two.map(\.path) == ["/tmp/two", "/tmp/one"], "the newest path goes to the front")
+
+        let promoted = RecentPathsLogic.recording("/tmp/one", into: two, at: visitDate)
+        expect(promoted.map(\.path) == ["/tmp/one", "/tmp/two"], "revisiting promotes instead of duplicating")
+
+        expect(
+            RecentPathsLogic.recording("/tmp/one/", into: promoted, at: visitDate).count == 2,
+            "a trailing slash is the same folder, not a second entry"
+        )
+
+        // An error string is not a path and must never enter the history.
+        expect(
+            RecentPathsLogic.recording(
+                FinderBridge.permissionDeniedMessage,
+                into: seeded,
+                at: visitDate
+            ).count == 1,
+            "an error message is never recorded as a path"
+        )
+        expect(
+            RecentPathsLogic.recording("", into: seeded, at: visitDate).count == 1,
+            "an empty path is ignored"
+        )
+        expect(
+            RecentPathsLogic.recording("relative/path", into: seeded, at: visitDate).count == 1,
+            "a relative path is ignored"
+        )
+
+        var capped: [RecentPath] = []
+        for index in 0..<(RecentPathsLogic.limit + 2) {
+            capped = RecentPathsLogic.recording("/tmp/folder\(index)", into: capped, at: visitDate)
+        }
+        expect(capped.count == RecentPathsLogic.limit, "the history is capped")
+        expect(
+            capped.first?.path == "/tmp/folder\(RecentPathsLogic.limit + 1)",
+            "the newest entry survives the cap"
+        )
+        expect(!capped.contains { $0.path == "/tmp/folder0" }, "the oldest entry is dropped by the cap")
+
+        // A bare folder name is ambiguous when two entries share it.
+        let uniqueNames = [
+            RecentPath(path: "/tmp/api", lastVisited: visitDate),
+            RecentPath(path: "/tmp/web", lastVisited: visitDate)
+        ]
+        expect(
+            RecentPathsLogic.menuTitles(for: uniqueNames) == ["api", "web"],
+            "unique folder names stay bare"
+        )
+
+        let clashingNames = [
+            RecentPath(path: "/tmp/api/src", lastVisited: visitDate),
+            RecentPath(path: "/tmp/web/src", lastVisited: visitDate),
+            RecentPath(path: "/tmp/docs", lastVisited: visitDate)
+        ]
+        expect(
+            RecentPathsLogic.menuTitles(for: clashingNames) == ["api/src", "web/src", "docs"],
+            "clashing names gain their parent on every occurrence, others stay bare"
+        )
+
+        expect(RecentPathsLogic.decode(Data("not json".utf8)).isEmpty, "corrupt history decodes to empty")
+        expect(RecentPathsLogic.decode(Data()).isEmpty, "an empty file decodes to empty")
+        expect(
+            RecentPathsLogic.decode(RecentPathsLogic.encode(clashingNames)) == clashingNames,
+            "history round-trips through the codec"
+        )
+
         if failures.isEmpty {
             print("FinderPath logic tests passed (\(assertionCount) assertions).")
             return
