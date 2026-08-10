@@ -34,6 +34,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showRefreshItemKey) private var showRefreshItem = true
     @AppStorage(FinderPathPreferences.showCopyPathItemKey) private var showCopyPathItem = true
     @AppStorage(FinderPathPreferences.showCopyCDItemKey) private var showCopyCDItem = true
+    @AppStorage(FinderPathPreferences.showRecentPathsItemKey) private var showRecentPathsItem = true
     @AppStorage(FinderPathPreferences.showOpenTerminalItemKey) private var showOpenTerminalItem = true
     @AppStorage(FinderPathPreferences.showOpenGhosttyItemKey) private var showOpenGhosttyItem = true
     @AppStorage(FinderPathPreferences.showOpenWithCodexItemKey) private var showOpenWithCodexItem = true
@@ -94,6 +95,7 @@ struct SettingsView: View {
                 Toggle("Show Refresh", isOn: $showRefreshItem)
                 Toggle("Show Copy Path", isOn: $showCopyPathItem)
                 Toggle("Show Copy cd Command", isOn: $showCopyCDItem)
+                Toggle("Show Recent Paths", isOn: $showRecentPathsItem)
                 Toggle("Show Open in cmux", isOn: $showOpenCmuxItem)
                 Toggle("Show Open in Ghostty", isOn: $showOpenGhosttyItem)
                 Toggle("Show Open in Terminal", isOn: $showOpenTerminalItem)
@@ -304,6 +306,7 @@ struct SettingsView: View {
         showRefreshItem = true
         showCopyPathItem = true
         showCopyCDItem = true
+        showRecentPathsItem = true
         showOpenTerminalItem = true
         showOpenGhosttyItem = true
         showOpenWithCodexItem = true

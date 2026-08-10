@@ -121,6 +121,16 @@ struct FinderPathLogicTests {
         expect(!FinderPathPreferences.hoverShowsTerminals, "disabling hover quick-pick must persist")
         UserDefaults.standard.removeObject(forKey: hoverKey)
 
+        // Every menu row has a visibility toggle; Recent Paths follows suit and
+        // ships on, with an explicit off choice surviving relaunch.
+        let recentPathsKey = FinderPathPreferences.showRecentPathsItemKey
+        UserDefaults.standard.removeObject(forKey: recentPathsKey)
+        FinderPathPreferences.registerDefaults()
+        expect(FinderPathPreferences.showRecentPathsItem, "Recent Paths should be shown by default")
+        UserDefaults.standard.set(false, forKey: recentPathsKey)
+        expect(!FinderPathPreferences.showRecentPathsItem, "hiding Recent Paths must persist")
+        UserDefaults.standard.removeObject(forKey: recentPathsKey)
+
         expect(
             HoverPickerLogic.shouldPresent(enabled: true, sessionCount: 2, isMenuTracking: false, isPanelVisible: false),
             "hover with open sessions should present the picker"

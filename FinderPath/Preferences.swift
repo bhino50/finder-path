@@ -5,6 +5,7 @@ enum FinderPathPreferences {
     static let showRefreshItemKey = "showRefreshItem"
     static let showCopyPathItemKey = "showCopyPathItem"
     static let showCopyCDItemKey = "showCopyCDItem"
+    static let showRecentPathsItemKey = "showRecentPathsItem"
     static let showOpenTerminalItemKey = "showOpenTerminalItem"
     static let showOpenGhosttyItemKey = "showOpenGhosttyItem"
     static let showOpenWithCodexItemKey = "showOpenWithCodexItem"
@@ -51,6 +52,7 @@ enum FinderPathPreferences {
             showRefreshItemKey: true,
             showCopyPathItemKey: true,
             showCopyCDItemKey: true,
+            showRecentPathsItemKey: true,
             showOpenTerminalItemKey: true,
             showOpenGhosttyItemKey: true,
             showOpenWithCodexItemKey: true,
@@ -102,6 +104,10 @@ enum FinderPathPreferences {
 
     static var showCopyCDItem: Bool {
         bool(for: showCopyCDItemKey, defaultValue: true)
+    }
+
+    static var showRecentPathsItem: Bool {
+        bool(for: showRecentPathsItemKey, defaultValue: true)
     }
 
     static var showOpenTerminalItem: Bool {
