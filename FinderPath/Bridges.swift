@@ -1,6 +1,16 @@
 import AppKit
 import os
 
+/// The outcome of one Finder query. `isFallback` is true whenever the path did
+/// not come from a real Finder window — an error, a timeout, or the desktop
+/// substitution the script makes when no window is open. Recent Paths records
+/// only non-fallback results, so opening the menu without a Finder window does
+/// not bury the history under repeated Desktop entries.
+nonisolated struct FinderPathQueryResult: Equatable, Sendable {
+    let path: String
+    let isFallback: Bool
+}
+
 nonisolated enum FinderBridge {
     // AppleScript error -1743 (errAEEventNotPermitted): the user declined the
     // Automation prompt, or FinderPath was switched off later under
@@ -20,6 +30,12 @@ nonisolated enum FinderBridge {
 
     // Some Finder windows, such as the Computer view, report a target that
     // cannot be coerced to a file alias. Treat those like no-window cases.
+    //
+    // The answer is prefixed with a status line so the caller can tell a folder
+    // the user actually had open ("window") from the desktop the script
+    // substitutes when there is nothing open ("fallback"). Tagging only the
+    // final desktop branch would not work: `insertion location` itself returns
+    // the desktop when no window exists, so that branch is a fallback too.
     private static let pathQuerySource = """
     with timeout of 3 seconds
         tell application "Finder"
@@ -29,15 +45,16 @@ nonisolated enum FinderBridge {
                     set finderPath to POSIX path of (target of front Finder window as alias)
                 end try
             end if
-            if finderPath is missing value then
-                try
-                    set finderPath to POSIX path of (insertion location as alias)
-                end try
+            if finderPath is not missing value then
+                return "window" & linefeed & finderPath
             end if
+            try
+                set finderPath to POSIX path of (insertion location as alias)
+            end try
             if finderPath is missing value then
-                return POSIX path of (path to desktop folder as alias)
+                set finderPath to POSIX path of (path to desktop folder as alias)
             end if
-            return finderPath
+            return "fallback" & linefeed & finderPath
         end tell
     end timeout
     """
@@ -55,7 +72,7 @@ nonisolated enum FinderBridge {
     /// thread. The AppleScript runs in an osascript subprocess (NSAppleScript
     /// is main-thread-only) on a background queue, and a watchdog kills the
     /// query when Finder is beachballed — e.g. by a stalled network volume.
-    static func fetchCurrentPath() async -> String {
+    static func fetchCurrentPath() async -> FinderPathQueryResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: executePathQuery())
@@ -63,7 +80,7 @@ nonisolated enum FinderBridge {
         }
     }
 
-    private static func executePathQuery() -> String {
+    private static func executePathQuery() -> FinderPathQueryResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", pathQuerySource]
@@ -75,7 +92,10 @@ nonisolated enum FinderBridge {
         do {
             try process.run()
         } catch {
-            return "Finder AppleScript error: \(error.localizedDescription)"
+            return FinderPathQueryResult(
+                path: "Finder AppleScript error: \(error.localizedDescription)",
+                isFallback: true
+            )
         }
 
         // Terminating the child closes its pipe ends, so the reads below also
@@ -110,27 +130,54 @@ nonisolated enum FinderBridge {
         timedOut: Bool,
         stdout: String,
         stderr: String
-    ) -> String {
-        let path = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if terminationStatus == 0, !path.isEmpty {
-            return path
+    ) -> FinderPathQueryResult {
+        let output = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if terminationStatus == 0, !output.isEmpty {
+            let parsed = parseTaggedOutput(output)
+            if !parsed.path.isEmpty {
+                return parsed
+            }
         }
         if timedOut {
-            return finderStalledMessage
+            return FinderPathQueryResult(path: finderStalledMessage, isFallback: true)
         }
         let errorText = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if errorText.contains(automationDeniedErrorCode) {
-            return permissionDeniedMessage
+            return FinderPathQueryResult(path: permissionDeniedMessage, isFallback: true)
         }
         if terminationStatus != 0 {
             let detail = errorText.isEmpty
                 ? "The Finder query failed (status \(terminationStatus))."
                 : errorText
-            return "Finder AppleScript error: \(detail)"
+            return FinderPathQueryResult(
+                path: "Finder AppleScript error: \(detail)",
+                isFallback: true
+            )
         }
-        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)
             .first?
             .path ?? NSHomeDirectory()
+        return FinderPathQueryResult(path: desktop, isFallback: true)
+    }
+
+    /// Splits the script's status line from the path. Only the FIRST newline
+    /// separates them: a folder name may legally contain a newline on APFS, and
+    /// splitting on every newline would truncate such a path. Output carrying no
+    /// recognized tag is read as a plain path so this stays correct if the
+    /// script is ever replaced or bypassed.
+    private static func parseTaggedOutput(_ output: String) -> FinderPathQueryResult {
+        guard let newline = output.firstIndex(of: "\n") else {
+            return FinderPathQueryResult(path: output, isFallback: false)
+        }
+        let path = String(output[output.index(after: newline)...])
+        switch output[..<newline] {
+        case "window":
+            return FinderPathQueryResult(path: path, isFallback: false)
+        case "fallback":
+            return FinderPathQueryResult(path: path, isFallback: true)
+        default:
+            return FinderPathQueryResult(path: output, isFallback: false)
+        }
     }
 }
 

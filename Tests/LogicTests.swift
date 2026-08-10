@@ -194,7 +194,7 @@ struct FinderPathLogicTests {
                 timedOut: false,
                 stdout: "/Users/demo/Documents\n",
                 stderr: ""
-            ) == "/Users/demo/Documents",
+            ).path == "/Users/demo/Documents",
             "successful query should return the trimmed path"
         )
         expect(
@@ -203,7 +203,7 @@ struct FinderPathLogicTests {
                 timedOut: true,
                 stdout: "/tmp\n",
                 stderr: ""
-            ) == "/tmp",
+            ).path == "/tmp",
             "a completed query should win over a racing timeout"
         )
         expect(
@@ -212,7 +212,7 @@ struct FinderPathLogicTests {
                 timedOut: false,
                 stdout: "",
                 stderr: "execution error: Not authorized to send Apple events to Finder. (-1743)"
-            ) == FinderBridge.permissionDeniedMessage,
+            ).path == FinderBridge.permissionDeniedMessage,
             "automation denial should map to the permission message"
         )
         expect(
@@ -221,7 +221,7 @@ struct FinderPathLogicTests {
                 timedOut: true,
                 stdout: "",
                 stderr: ""
-            ) == FinderBridge.finderStalledMessage,
+            ).path == FinderBridge.finderStalledMessage,
             "a watchdog kill should report Finder as not responding"
         )
         expect(
@@ -230,7 +230,7 @@ struct FinderPathLogicTests {
                 timedOut: false,
                 stdout: "",
                 stderr: "execution error: Finder got an error: AppleEvent timed out. (-1712)"
-            ).hasPrefix("Finder AppleScript error:"),
+            ).path.hasPrefix("Finder AppleScript error:"),
             "other script failures should surface as error strings"
         )
         expect(
@@ -239,8 +239,61 @@ struct FinderPathLogicTests {
                 timedOut: false,
                 stdout: "",
                 stderr: ""
-            ).hasPrefix("/"),
+            ).path.hasPrefix("/"),
             "empty output should fall back to a local folder"
+        )
+
+        // The query script tags its answer so the recent-paths history can tell
+        // a folder the user actually had open from the desktop substitution.
+        let windowResult = FinderBridge.interpretScriptResult(
+            terminationStatus: 0,
+            timedOut: false,
+            stdout: "window\n/Users/demo/Documents\n",
+            stderr: ""
+        )
+        expect(windowResult.path == "/Users/demo/Documents", "a window-tagged result returns the path")
+        expect(!windowResult.isFallback, "a real Finder window is not a fallback")
+
+        let fallbackResult = FinderBridge.interpretScriptResult(
+            terminationStatus: 0,
+            timedOut: false,
+            stdout: "fallback\n/Users/demo/Desktop\n",
+            stderr: ""
+        )
+        expect(fallbackResult.path == "/Users/demo/Desktop", "a fallback-tagged result still returns the path")
+        expect(fallbackResult.isFallback, "a desktop substitution is marked as a fallback")
+
+        // Output with no tag must still work, so the function stays correct if
+        // the script is ever replaced or bypassed.
+        let untaggedResult = FinderBridge.interpretScriptResult(
+            terminationStatus: 0,
+            timedOut: false,
+            stdout: "/Users/demo/Documents\n",
+            stderr: ""
+        )
+        expect(untaggedResult.path == "/Users/demo/Documents", "untagged output is read as a plain path")
+        expect(!untaggedResult.isFallback, "untagged output is not treated as a fallback")
+
+        // A folder name may legally contain a newline on APFS, so only the
+        // FIRST newline separates the tag from the path.
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: false,
+                stdout: "window\n/tmp/a\nb",
+                stderr: ""
+            ).path == "/tmp/a\nb",
+            "only the first newline splits the tag from the path"
+        )
+
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 15,
+                timedOut: true,
+                stdout: "",
+                stderr: ""
+            ).isFallback,
+            "a stalled Finder is a fallback, never a recordable path"
         )
 
         if failures.isEmpty {

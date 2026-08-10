@@ -581,7 +581,7 @@ struct WelcomeView: View {
         NSApp.activate(ignoringOtherApps: true)
         isCheckingFinder = true
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath()
+            finderPath = await FinderBridge.fetchCurrentPath().path
             isCheckingFinder = false
             if !finderAccessGranted {
                 FinderBridge.openAutomationSettings()
@@ -591,7 +591,7 @@ struct WelcomeView: View {
 
     private func refreshFinderAccess() {
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath()
+            finderPath = await FinderBridge.fetchCurrentPath().path
         }
     }
 }

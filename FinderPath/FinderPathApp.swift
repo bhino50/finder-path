@@ -165,13 +165,13 @@ final class FinderPathActionRouter {
             onOpenConnectWindow?()
         case "open-ghostty", "ghostty":
             Task { @MainActor in
-                let path = await FinderBridge.fetchCurrentPath()
-                guard !path.hasPrefix("Finder AppleScript error:") else {
-                    self.presentFailure(path, displayName: "Ghostty")
+                let result = await FinderBridge.fetchCurrentPath()
+                guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.presentFailure(result.path, displayName: "Ghostty")
                     return
                 }
 
-                TerminalBridge.openGhostty(at: path) { error in
+                TerminalBridge.openGhostty(at: result.path) { error in
                     guard let error else { return }
                     Task { @MainActor in
                         self.presentFailure(error, displayName: "Ghostty")
@@ -180,13 +180,13 @@ final class FinderPathActionRouter {
             }
         case "open-cmux", "cmux":
             Task { @MainActor in
-                let path = await FinderBridge.fetchCurrentPath()
-                guard !path.hasPrefix("Finder AppleScript error:") else {
-                    self.presentFailure(path, displayName: "cmux")
+                let result = await FinderBridge.fetchCurrentPath()
+                guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.presentFailure(result.path, displayName: "cmux")
                     return
                 }
 
-                TerminalBridge.openCmux(at: path) { error in
+                TerminalBridge.openCmux(at: result.path) { error in
                     guard let error else { return }
                     Task { @MainActor in
                         self.presentFailure(error, displayName: "cmux")
@@ -238,9 +238,9 @@ final class FinderPathState {
         refreshGeneration += 1
         let generation = refreshGeneration
         Task { @MainActor [weak self] in
-            let path = await FinderBridge.fetchCurrentPath()
+            let result = await FinderBridge.fetchCurrentPath()
             guard let self, generation == self.refreshGeneration else { return }
-            self.currentPath = path
+            self.currentPath = result.path
             onChange?()
         }
     }
