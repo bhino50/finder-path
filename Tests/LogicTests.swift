@@ -20,6 +20,55 @@ struct FinderPathLogicTests {
         expect(!UpdateChecker.versionsAreEquivalent("", "0"), "empty versions must not match")
         expect(!UpdateChecker.versionsAreEquivalent("release", "0"), "nonnumeric versions must not match")
 
+        // Extraction is monitored before an update bundle is trusted. Exercise
+        // each quota against a tiny temporary tree rather than installing.
+        let quotaRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FinderPathQuotaTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: quotaRoot) }
+        try? FileManager.default.createDirectory(at: quotaRoot, withIntermediateDirectories: true)
+        let quotaFile = quotaRoot.appendingPathComponent("payload")
+        try? Data(repeating: 0x41, count: 32).write(to: quotaFile)
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot,
+                maximumSize: 64,
+                maximumEntries: 10,
+                maximumDepth: 4
+            ) == nil,
+            "a small extracted update stays within its quotas"
+        )
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot,
+                maximumSize: 16,
+                maximumEntries: 10,
+                maximumDepth: 4
+            ) != nil,
+            "expanded update bytes are capped"
+        )
+        let secondQuotaFile = quotaRoot.appendingPathComponent("second")
+        try? Data([0x42]).write(to: secondQuotaFile)
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot,
+                maximumSize: 64,
+                maximumEntries: 1,
+                maximumDepth: 4
+            ) != nil,
+            "expanded update entry count is capped"
+        )
+        let deepQuotaDirectory = quotaRoot.appendingPathComponent("one/two")
+        try? FileManager.default.createDirectory(at: deepQuotaDirectory, withIntermediateDirectories: true)
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot,
+                maximumSize: 64,
+                maximumEntries: 10,
+                maximumDepth: 1
+            ) != nil,
+            "expanded update path depth is capped"
+        )
+
         expect(RemoteServers.normalizedTarget("ssh user@example.com") == "user@example.com", "ssh prefix should normalize")
         expect(RemoteServers.normalizedTarget("ssh -- example.com") == "example.com", "ssh -- prefix should normalize")
         expect(RemoteServers.normalizedTarget("'example.com'") == "example.com", "matching quotes should normalize")
@@ -56,6 +105,10 @@ struct FinderPathLogicTests {
         expect(UpdateChecker.versionsAreEquivalent("1.7-beta", "v1.7-BETA"), "the same prerelease still matches")
         expect(!UpdateChecker.versionsAreEquivalent("1.7", "1.7-beta"), "a prerelease must not match the release")
         expect(UpdateChecker.versionsAreEquivalent("v1.7", "1.7.0"), "plain releases still match across padding")
+        expect(
+            !UpdateChecker.versionsAreEquivalent("1.7-dev", "1.7-de"),
+            "a v inside a prerelease suffix must not be stripped during verification"
+        )
         // Ordering deliberately keeps ignoring suffixes.
         expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "ordering still ignores prerelease suffixes")
 
@@ -120,6 +173,16 @@ struct FinderPathLogicTests {
         UserDefaults.standard.set(false, forKey: hoverKey)
         expect(!FinderPathPreferences.hoverShowsTerminals, "disabling hover quick-pick must persist")
         UserDefaults.standard.removeObject(forKey: hoverKey)
+
+        // Process-launching custom URLs are callable by any local process, so
+        // they remain off until the user explicitly trusts a shortcut tool.
+        let externalLaunchURLsKey = FinderPathPreferences.allowExternalLaunchURLsKey
+        UserDefaults.standard.removeObject(forKey: externalLaunchURLsKey)
+        FinderPathPreferences.registerDefaults()
+        expect(!FinderPathPreferences.allowExternalLaunchURLs, "external launch URLs default to disabled")
+        UserDefaults.standard.set(true, forKey: externalLaunchURLsKey)
+        expect(FinderPathPreferences.allowExternalLaunchURLs, "external launch URL opt-in persists")
+        UserDefaults.standard.removeObject(forKey: externalLaunchURLsKey)
 
         // Every menu row has a visibility toggle; Recent Paths follows suit and
         // ships on, with an explicit off choice surviving relaunch.
@@ -205,7 +268,7 @@ struct FinderPathLogicTests {
                 stdout: "/Users/demo/Documents\n",
                 stderr: ""
             ).path == "/Users/demo/Documents",
-            "successful query should return the trimmed path"
+            "successful query should remove the osascript record terminator"
         )
         expect(
             FinderBridge.interpretScriptResult(
@@ -295,6 +358,24 @@ struct FinderPathLogicTests {
             ).path == "/tmp/a\nb",
             "only the first newline splits the tag from the path"
         )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: false,
+                stdout: "window\n/tmp/trailing-newline\n\n",
+                stderr: ""
+            ).path == "/tmp/trailing-newline\n",
+            "only osascript's final terminator is removed from a path ending in a newline"
+        )
+        expect(
+            FinderBridge.interpretScriptResult(
+                terminationStatus: 0,
+                timedOut: false,
+                stdout: "window\n/tmp/trailing-space \n",
+                stderr: ""
+            ).path == "/tmp/trailing-space ",
+            "a legal trailing space in a folder name is preserved"
+        )
 
         expect(
             FinderBridge.interpretScriptResult(
@@ -322,6 +403,20 @@ struct FinderPathLogicTests {
         expect(
             RecentPathsLogic.recording("/tmp/one/", into: promoted, at: visitDate).count == 2,
             "a trailing slash is the same folder, not a second entry"
+        )
+        expect(
+            RecentPathsLogic.recording("/tmp/trailing-space ", into: [], at: visitDate).first?.path
+                == "/tmp/trailing-space ",
+            "recording preserves a legal trailing space"
+        )
+        expect(
+            RecentPathsLogic.recording("/tmp/trailing-newline\n", into: [], at: visitDate).first?.path
+                == "/tmp/trailing-newline\n",
+            "recording preserves a legal trailing newline"
+        )
+        expect(
+            RecentPathsLogic.recording("/tmp/ignored", into: seeded, at: visitDate, limit: -1).isEmpty,
+            "a defensive negative limit cannot trap"
         )
 
         // An error string is not a path and must never enter the history.
@@ -378,6 +473,23 @@ struct FinderPathLogicTests {
         expect(
             RecentPathsLogic.decode(RecentPathsLogic.encode(clashingNames)) == clashingNames,
             "history round-trips through the codec"
+        )
+
+        let oversizedHistory = (0..<(RecentPathsLogic.limit + 3)).map {
+            RecentPath(path: "/tmp/history\($0)", lastVisited: visitDate)
+        } + [
+            RecentPath(path: "relative/history", lastVisited: visitDate),
+            RecentPath(path: "/tmp/history0/", lastVisited: visitDate)
+        ]
+        let sanitizedHistory = RecentPathsLogic.decode(RecentPathsLogic.encode(oversizedHistory))
+        expect(sanitizedHistory.count == RecentPathsLogic.limit, "decoded history is capped")
+        expect(
+            sanitizedHistory.allSatisfy { $0.path.hasPrefix("/") },
+            "decoded history drops non-absolute entries"
+        )
+        expect(
+            Set(sanitizedHistory.map(\.path)).count == sanitizedHistory.count,
+            "decoded history removes standardized duplicates"
         )
 
         if failures.isEmpty {

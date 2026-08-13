@@ -61,6 +61,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showTerminalsSectionKey) private var showTerminalsSection = true
     @AppStorage(FinderPathPreferences.rightClickOpensTerminalsKey) private var rightClickOpensTerminals = true
     @AppStorage(FinderPathPreferences.hoverShowsTerminalsKey) private var hoverShowsTerminals = true
+    @AppStorage(FinderPathPreferences.allowExternalLaunchURLsKey) private var allowExternalLaunchURLs = false
     @AppStorage(FinderPathPreferences.terminalFontSizeKey) private var terminalFontSize = 12.0
     @AppStorage(FinderPathPreferences.terminalScrollbackLimitKey) private var terminalScrollbackLimit = 2000
     @AppStorage(FinderPathPreferences.terminalShellOverrideKey) private var terminalShellOverride = ""
@@ -82,6 +83,12 @@ struct SettingsView: View {
         Form {
             Section("General") {
                 Toggle("Launch FinderPath at login", isOn: $launchAtLogin)
+
+                Toggle("Allow shortcut URLs to launch terminal apps", isOn: $allowExternalLaunchURLs)
+
+                Text("Enables finderpath://open-ghostty and finderpath://open-cmux for trusted keyboard tools. Leave this off unless you use those shortcuts; finderpath://connect remains available.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
 
                 if let launchAtLoginError {
                     Text(launchAtLoginError)
@@ -336,6 +343,7 @@ struct SettingsView: View {
         terminalScrollbackLimit = 2000
         terminalShellOverride = ""
         terminalOptionAsMeta = false
+        allowExternalLaunchURLs = false
         updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
         scheduleAgentAvailabilityCheck()
     }

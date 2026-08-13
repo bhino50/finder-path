@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import os
 
 /// The outcome of one Finder query. `isFallback` is true whenever the path did
@@ -101,25 +102,50 @@ nonisolated enum FinderBridge {
         // Terminating the child closes its pipe ends, so the reads below also
         // unblock when the watchdog fires.
         let timedOutFlag = OSAllocatedUnfairLock(initialState: false)
+        let forceKill = DispatchWorkItem {
+            if process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
         let watchdog = DispatchWorkItem {
             timedOutFlag.withLock { $0 = true }
             process.terminate()
+            // SIGTERM should be enough for osascript, but a wedged child must
+            // not turn an advertised eight-second timeout into an infinite one.
+            DispatchQueue.global(qos: .userInitiated)
+                .asyncAfter(deadline: .now() + 1, execute: forceKill)
         }
         DispatchQueue.global(qos: .userInitiated)
             .asyncAfter(deadline: .now() + queryTimeoutSeconds, execute: watchdog)
 
-        // Drain both pipes before waiting so a full pipe buffer can never
-        // deadlock against process exit.
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        // Drain both pipes concurrently. Reading stdout to EOF and only then
+        // reading stderr can still deadlock when the child fills stderr while
+        // the parent is waiting for stdout to close.
+        let reads = DispatchGroup()
+        let stdoutData = OSAllocatedUnfairLock(initialState: Data())
+        let stderrData = OSAllocatedUnfairLock(initialState: Data())
+        reads.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            stdoutData.withLock { $0 = data }
+            reads.leave()
+        }
+        reads.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrData.withLock { $0 = data }
+            reads.leave()
+        }
         process.waitUntilExit()
         watchdog.cancel()
+        forceKill.cancel()
+        reads.wait()
 
         return interpretScriptResult(
             terminationStatus: process.terminationStatus,
             timedOut: timedOutFlag.withLock { $0 },
-            stdout: String(decoding: stdoutData, as: UTF8.self),
-            stderr: String(decoding: stderrData, as: UTF8.self)
+            stdout: String(decoding: stdoutData.withLock { $0 }, as: UTF8.self),
+            stderr: String(decoding: stderrData.withLock { $0 }, as: UTF8.self)
         )
     }
 
@@ -131,7 +157,10 @@ nonisolated enum FinderBridge {
         stdout: String,
         stderr: String
     ) -> FinderPathQueryResult {
-        let output = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        // osascript appends one record terminator to a returned string. Remove
+        // exactly that terminator instead of trimming arbitrary whitespace:
+        // spaces and newlines are legal characters at the end of APFS names.
+        let output = removingProcessLineTerminator(from: stdout)
         if terminationStatus == 0, !output.isEmpty {
             let parsed = parseTaggedOutput(output)
             if !parsed.path.isEmpty {
@@ -178,6 +207,16 @@ nonisolated enum FinderBridge {
         default:
             return FinderPathQueryResult(path: output, isFallback: false)
         }
+    }
+
+    private static func removingProcessLineTerminator(from output: String) -> String {
+        if output.hasSuffix("\r\n") {
+            return String(output.dropLast(2))
+        }
+        if output.hasSuffix("\n") {
+            return String(output.dropLast())
+        }
+        return output
     }
 }
 

@@ -157,6 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class FinderPathActionRouter {
     var onOpenConnectWindow: (() -> Void)?
+    private var launchesInFlight: Set<String> = []
+    private var lastLaunchAt: [String: Date] = [:]
+    private static let minimumLaunchInterval: TimeInterval = 2
 
     func handle(url: URL) {
         guard url.scheme?.lowercased() == "finderpath" else { return }
@@ -165,38 +168,65 @@ final class FinderPathActionRouter {
         case "connect", "connect-to-server":
             onOpenConnectWindow?()
         case "open-ghostty", "ghostty":
+            let action = "ghostty"
+            guard FinderPathPreferences.allowExternalLaunchURLs,
+                  beginExternalLaunch(action) else { return }
             Task { @MainActor in
                 let result = await FinderBridge.fetchCurrentPath()
                 guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.finishExternalLaunch(action)
                     self.presentFailure(result.path, displayName: "Ghostty")
                     return
                 }
 
                 TerminalBridge.openGhostty(at: result.path) { error in
-                    guard let error else { return }
                     Task { @MainActor in
-                        self.presentFailure(error, displayName: "Ghostty")
+                        self.finishExternalLaunch(action)
+                        if let error {
+                            self.presentFailure(error, displayName: "Ghostty")
+                        }
                     }
                 }
             }
         case "open-cmux", "cmux":
+            let action = "cmux"
+            guard FinderPathPreferences.allowExternalLaunchURLs,
+                  beginExternalLaunch(action) else { return }
             Task { @MainActor in
                 let result = await FinderBridge.fetchCurrentPath()
                 guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.finishExternalLaunch(action)
                     self.presentFailure(result.path, displayName: "cmux")
                     return
                 }
 
                 TerminalBridge.openCmux(at: result.path) { error in
-                    guard let error else { return }
                     Task { @MainActor in
-                        self.presentFailure(error, displayName: "cmux")
+                        self.finishExternalLaunch(action)
+                        if let error {
+                            self.presentFailure(error, displayName: "cmux")
+                        }
                     }
                 }
             }
         default:
             break
         }
+    }
+
+    private func beginExternalLaunch(_ action: String, now: Date = Date()) -> Bool {
+        guard !launchesInFlight.contains(action) else { return false }
+        if let previous = lastLaunchAt[action],
+           now.timeIntervalSince(previous) < Self.minimumLaunchInterval {
+            return false
+        }
+        launchesInFlight.insert(action)
+        lastLaunchAt[action] = now
+        return true
+    }
+
+    private func finishExternalLaunch(_ action: String) {
+        launchesInFlight.remove(action)
     }
 
     private func actionName(for url: URL) -> String {

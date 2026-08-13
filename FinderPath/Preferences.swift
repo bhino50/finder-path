@@ -40,6 +40,7 @@ enum FinderPathPreferences {
     static let terminalOptionAsMetaKey = "terminalOptionAsMeta"
     static let rightClickOpensTerminalsKey = "rightClickOpensTerminals"
     static let hoverShowsTerminalsKey = "hoverShowsTerminals"
+    static let allowExternalLaunchURLsKey = "allowExternalLaunchURLs"
     static let defaultUpdateManifestURL = "https://api.github.com/repos/bhino50/finder-path/releases/latest"
 
     static var completedWelcome: Bool {
@@ -86,6 +87,7 @@ enum FinderPathPreferences {
             terminalOptionAsMetaKey: false,
             rightClickOpensTerminalsKey: true,
             hoverShowsTerminalsKey: true,
+            allowExternalLaunchURLsKey: false,
             completedWelcomeKey: false
         ])
     }
@@ -266,6 +268,13 @@ enum FinderPathPreferences {
 
     static var hoverShowsTerminals: Bool {
         bool(for: hoverShowsTerminalsKey, defaultValue: true)
+    }
+
+    /// Opening an app through a custom URL is convenient for keyboard tools,
+    /// but any local process can dispatch that URL. Keep process-launching URL
+    /// actions opt-in; the connect URL only presents FinderPath's own window.
+    static var allowExternalLaunchURLs: Bool {
+        bool(for: allowExternalLaunchURLsKey, defaultValue: false)
     }
 
     static func displayPath(for path: String) -> String {

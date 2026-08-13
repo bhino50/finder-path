@@ -322,17 +322,39 @@ final class TerminalSession: Identifiable {
 /// Coalesces PTY reads so a burst of output costs one main-queue hop instead
 /// of one per 4 KB chunk. The read source delivers on a serial queue and the
 /// drain runs on the serial main queue, so byte order is preserved end to end.
-private final class PTYOutputBuffer: @unchecked Sendable {
+/// A noisy command must not allocate without bound while the UI is busy, so
+/// bytes beyond the high-water mark are dropped until the scheduled drain.
+final class PTYOutputBuffer: @unchecked Sendable {
+    static let maximumPendingBytes = 1_024 * 1_024
     private let lock = NSLock()
     private var pending: [UInt8] = []
     private var drainScheduled = false
+    private var totalDropped = 0
+
+    var bufferedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.count
+    }
+
+    var droppedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalDropped
+    }
 
     /// Appends bytes and reports whether the caller now owns scheduling the
     /// drain. Only one drain is ever outstanding, however fast output arrives.
     func appendAndClaimDrain(_ bytes: [UInt8]) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        pending.append(contentsOf: bytes)
+        let available = max(Self.maximumPendingBytes - pending.count, 0)
+        if available > 0 {
+            pending.append(contentsOf: bytes.prefix(available))
+        }
+        let dropped = max(bytes.count - available, 0)
+        let (newTotal, overflow) = totalDropped.addingReportingOverflow(dropped)
+        totalDropped = overflow ? Int.max : newTotal
         guard !drainScheduled else { return false }
         drainScheduled = true
         return true

@@ -38,6 +38,46 @@ enum UpdateCheckResult {
 }
 
 enum UpdateChecker {
+    private static let maximumManifestSize: Int64 = 1_024 * 1_024
+
+    private final class ManifestSizeLimiter: NSObject, URLSessionDownloadDelegate {
+        private let maximumSize: Int64
+        private let lock = NSLock()
+        private var exceeded = false
+
+        init(maximumSize: Int64) {
+            self.maximumSize = maximumSize
+        }
+
+        var didExceedLimit: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return exceeded
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard totalBytesWritten > maximumSize || totalBytesExpectedToWrite > maximumSize else {
+                return
+            }
+            lock.lock()
+            exceeded = true
+            lock.unlock()
+            downloadTask.cancel()
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {}
+    }
+
     static func check(manifestURL: String, completion: @escaping (UpdateCheckResult) -> Void) {
         let trimmed = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed), isHTTPSWebURL(url) else {
@@ -58,21 +98,57 @@ enum UpdateChecker {
         // the request negotiates over TCP. The shared session's cached HTTP/3
         // mappings make it attempt QUIC, which stalls for the full timeout on
         // networks that silently drop UDP 443.
-        let session = URLSession(configuration: .ephemeral)
-        session.dataTask(with: request) { data, response, error in
+        let sizeLimiter = ManifestSizeLimiter(maximumSize: maximumManifestSize)
+        let session = URLSession(
+            configuration: .ephemeral,
+            delegate: sizeLimiter,
+            delegateQueue: nil
+        )
+        session.downloadTask(with: request) { location, response, error in
             defer { session.finishTasksAndInvalidate() }
             if let error {
+                if sizeLimiter.didExceedLimit {
+                    completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
+                    return
+                }
                 completion(.failed(message: "Could not reach the update server: \(error.localizedDescription)"))
                 return
             }
 
-            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            guard let http = response as? HTTPURLResponse else {
+                completion(.failed(message: "The update server returned an invalid response."))
+                return
+            }
+            guard (200...299).contains(http.statusCode) else {
                 completion(.failed(message: "Update server returned HTTP \(http.statusCode)."))
                 return
             }
+            guard let finalURL = http.url, isHTTPSWebURL(finalURL) else {
+                completion(.failed(message: "The update manifest redirected to a non-HTTPS location."))
+                return
+            }
+            guard http.expectedContentLength <= maximumManifestSize else {
+                completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
+                return
+            }
 
-            guard let data else {
+            guard let location else {
                 completion(.failed(message: "Update server returned no data."))
+                return
+            }
+
+            let responseSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                .map(Int64.init) ?? 0
+            guard responseSize > 0 else {
+                completion(.failed(message: "Update server returned no data."))
+                return
+            }
+            guard responseSize <= maximumManifestSize else {
+                completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
+                return
+            }
+            guard let data = try? Data(contentsOf: location, options: .mappedIfSafe) else {
+                completion(.failed(message: "Could not read the update manifest."))
                 return
             }
 
@@ -223,7 +299,7 @@ enum UpdateChecker {
     private static func prereleaseSuffix(_ version: String) -> String {
         let cleaned = version
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "v", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
         let numericPrefix = cleaned.prefix { $0.isNumber || $0 == "." }
         return String(cleaned.dropFirst(numericPrefix.count)).lowercased()
     }
@@ -231,7 +307,7 @@ enum UpdateChecker {
     private static func numericComponents(_ version: String) -> [Int] {
         let cleaned = version
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "v", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
 
         return cleaned
             .split(separator: ".")

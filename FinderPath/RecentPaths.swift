@@ -28,13 +28,15 @@ nonisolated enum RecentPathsLogic {
         at date: Date,
         limit: Int = limit
     ) -> [RecentPath] {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("/") else { return list }
+        // Do not trim the path: spaces and newlines are legal filename bytes.
+        // Absolute-path validation is enough to reject empty strings and every
+        // Finder error message without rewriting a real folder name.
+        guard path.hasPrefix("/") else { return list }
 
-        let key = standardized(trimmed)
+        let key = standardized(path)
         let remaining = list.filter { standardized($0.path) != key }
         let updated = [RecentPath(path: key, lastVisited: date)] + remaining
-        return Array(updated.prefix(limit))
+        return Array(updated.prefix(max(0, limit)))
     }
 
     /// Menu titles are the folder name alone, which is ambiguous when two entries
@@ -62,7 +64,16 @@ nonisolated enum RecentPathsLogic {
     static func decode(_ data: Data) -> [RecentPath] {
         guard !data.isEmpty else { return [] }
         do {
-            return try JSONDecoder().decode([RecentPath].self, from: data)
+            let decoded = try JSONDecoder().decode([RecentPath].self, from: data)
+            var seen = Set<String>()
+            var sanitized: [RecentPath] = []
+            for entry in decoded where entry.path.hasPrefix("/") {
+                let path = standardized(entry.path)
+                guard seen.insert(path).inserted else { continue }
+                sanitized.append(RecentPath(path: path, lastVisited: entry.lastVisited))
+                if sanitized.count == limit { break }
+            }
+            return sanitized
         } catch {
             NSLog("RecentPathsStore: ignoring unreadable history: %@", error.localizedDescription)
             return []

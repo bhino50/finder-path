@@ -935,6 +935,32 @@ struct FinderPathTerminalTests {
         expect(screen.lineText(0).hasPrefix("é"), "a combining mark merges onto an ASCII base")
         expect(screen.cursorColumn == 1, "a merged combining mark does not advance the cursor")
 
+        // A hostile process can emit combining marks forever. The rendered
+        // grapheme must remain bounded instead of retaining every scalar in a
+        // single cell.
+        for _ in 0..<(TerminalScreen.maximumScalarsPerCell * 3) {
+            screen.apply(.print("\u{0301}"))
+        }
+        expect(
+            screen.cell(atRow: 0, column: 0).character.unicodeScalars.count
+                <= TerminalScreen.maximumScalarsPerCell,
+            "one terminal cell caps an unbounded combining-mark stream"
+        )
+        expect(screen.cursorColumn == 1, "discarded combining marks do not advance the cursor")
+
+        // The read queue can outrun the main actor. Coalescing stays bounded
+        // and records the overflow while preserving the accepted prefix.
+        let outputBuffer = PTYOutputBuffer()
+        let oversizedOutput = Array(repeating: UInt8(ascii: "x"), count: PTYOutputBuffer.maximumPendingBytes + 4_096)
+        expect(outputBuffer.appendAndClaimDrain(oversizedOutput), "the first PTY burst claims one drain")
+        expect(
+            outputBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
+            "PTY buffering stops at its high-water mark"
+        )
+        expect(outputBuffer.droppedByteCount == 4_096, "PTY overflow is counted")
+        expect(outputBuffer.takeAll().count == PTYOutputBuffer.maximumPendingBytes, "the bounded PTY prefix drains")
+        expect(outputBuffer.bufferedByteCount == 0, "draining releases buffered PTY memory")
+
         // MARK: - Result
 
         if failures.isEmpty {

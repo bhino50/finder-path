@@ -5,6 +5,10 @@ import Foundation
 // scrollback ring. Applies parsed TerminalActions; pure logic, no AppKit.
 
 struct TerminalScreen {
+    /// Complex graphemes are useful, but an endless combining-mark stream can
+    /// otherwise grow one terminal cell forever. Real-world emoji sequences
+    /// are comfortably below this defensive ceiling.
+    static let maximumScalarsPerCell = 64
     private(set) var rows: Int
     private(set) var columns: Int
     private(set) var cursorRow = 0
@@ -343,6 +347,11 @@ struct TerminalScreen {
     private mutating func appendToPreviousCell(_ character: Character) -> Bool {
         guard let column = previousBaseColumn() else { return false }
         let existing = grid[cursorRow][column].character
+        if existing.unicodeScalars.count + character.unicodeScalars.count > Self.maximumScalarsPerCell {
+            // Treat the extender as consumed so a wide ZWJ component cannot
+            // spill into a new cell after the cap is reached.
+            return true
+        }
         let combinedText = String(existing) + String(character)
         guard combinedText.count == 1, let combined = combinedText.first else { return false }
 

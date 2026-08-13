@@ -1,4 +1,6 @@
 import AppKit
+import Darwin
+import os
 
 // Installs an update archive in place and relaunches the app.
 //
@@ -11,6 +13,10 @@ enum UpdateInstaller {
     static let expectedBundleID = "io.github.bhino50.FinderPath"
     static let expectedTeamID = "VJPMCBH6NX"
     private static let maximumArchiveSize: Int64 = 256 * 1_024 * 1_024
+    private static let maximumExpandedSize: Int64 = 1_024 * 1_024 * 1_024
+    private static let maximumExpandedEntryCount = 50_000
+    private static let maximumExpandedPathDepth = 64
+    private static let extractionTimeout: TimeInterval = 120
 
     /// Cancels an oversized update while bytes are still arriving. The final
     /// file-size check remains as a second line of defense for responses whose
@@ -188,10 +194,19 @@ enum UpdateInstaller {
         if archive.pathExtension.lowercased() == "dmg" {
             try extractFromDiskImage(archive, into: extractDir)
         } else {
-            let result = run("/usr/bin/ditto", ["-xk", archive.path, extractDir.path])
+            let result = run(
+                "/usr/bin/ditto",
+                ["-xk", archive.path, extractDir.path],
+                timeout: extractionTimeout,
+                expansionRoot: extractDir
+            )
             guard result.status == 0 else {
                 throw InstallError.extractionFailed(result.errorOutput)
             }
+        }
+
+        if let violation = expandedContentsViolation(at: extractDir) {
+            throw InstallError.extractionFailed(violation)
         }
 
         guard let app = try findApp(in: extractDir) else {
@@ -203,11 +218,15 @@ enum UpdateInstaller {
     private static func extractFromDiskImage(_ image: URL, into extractDir: URL) throws {
         let mountPoint = extractDir.deletingLastPathComponent()
             .appendingPathComponent("mount")
-        let attach = run("/usr/bin/hdiutil", [
-            "attach", image.path,
-            "-nobrowse", "-readonly", "-noautoopen",
-            "-mountpoint", mountPoint.path
-        ])
+        let attach = run(
+            "/usr/bin/hdiutil",
+            [
+                "attach", image.path,
+                "-nobrowse", "-readonly", "-noautoopen",
+                "-mountpoint", mountPoint.path
+            ],
+            timeout: 30
+        )
         guard attach.status == 0 else {
             throw InstallError.extractionFailed(attach.errorOutput)
         }
@@ -217,7 +236,12 @@ enum UpdateInstaller {
             throw InstallError.appNotFoundInArchive
         }
         let copied = extractDir.appendingPathComponent(mountedApp.lastPathComponent)
-        let copy = run("/usr/bin/ditto", [mountedApp.path, copied.path])
+        let copy = run(
+            "/usr/bin/ditto",
+            [mountedApp.path, copied.path],
+            timeout: extractionTimeout,
+            expansionRoot: extractDir
+        )
         guard copy.status == 0 else {
             throw InstallError.extractionFailed(copy.errorOutput)
         }
@@ -342,7 +366,12 @@ enum UpdateInstaller {
         let errorOutput: String
     }
 
-    private static func run(_ executable: String, _ arguments: [String]) -> CommandResult {
+    private static func run(
+        _ executable: String,
+        _ arguments: [String],
+        timeout: TimeInterval? = nil,
+        expansionRoot: URL? = nil
+    ) -> CommandResult {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: executable)
         task.arguments = arguments
@@ -357,10 +386,123 @@ enum UpdateInstaller {
             return CommandResult(status: -1, errorOutput: error.localizedDescription)
         }
 
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        // Drain stderr while the child runs. A command that fills the pipe must
+        // not deadlock before the timeout or expansion monitor can stop it.
+        let reads = DispatchGroup()
+        let errorData = OSAllocatedUnfairLock(initialState: Data())
+        reads.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            errorData.withLock { $0 = data }
+            reads.leave()
+        }
+
+        let deadline = timeout.map { Date().addingTimeInterval($0) }
+        var nextExpansionCheck = Date()
+        var monitorFailure: String?
+        while task.isRunning {
+            let now = Date()
+            if let deadline, now >= deadline {
+                monitorFailure = "The update operation exceeded its (Int(timeout ?? 0))-second safety limit."
+                stop(task)
+                break
+            }
+            if let expansionRoot, now >= nextExpansionCheck {
+                if let violation = expandedContentsViolation(at: expansionRoot) {
+                    monitorFailure = violation
+                    stop(task)
+                    break
+                }
+                nextExpansionCheck = now.addingTimeInterval(0.25)
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
         task.waitUntilExit()
-        let errorText = String(data: errorData, encoding: .utf8)?
+        reads.wait()
+        let stderr = String(data: errorData.withLock { $0 }, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return CommandResult(status: task.terminationStatus, errorOutput: errorText)
+        let detail = [monitorFailure, stderr]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return CommandResult(status: task.terminationStatus, errorOutput: detail)
+    }
+
+    private static func stop(_ task: Process) {
+        guard task.isRunning else { return }
+        task.terminate()
+        let graceDeadline = Date().addingTimeInterval(1)
+        while task.isRunning, Date() < graceDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if task.isRunning {
+            Darwin.kill(task.processIdentifier, SIGKILL)
+        }
+    }
+
+    /// Returns a user-facing reason when extracted contents exceed a resource
+    /// ceiling. Kept internal so the release logic tests can exercise the
+    /// archive-bomb guard without installing an app.
+    private static func expandedContentsViolation(at root: URL) -> String? {
+        expandedContentsViolation(
+            at: root,
+            maximumSize: maximumExpandedSize,
+            maximumEntries: maximumExpandedEntryCount,
+            maximumDepth: maximumExpandedPathDepth
+        )
+    }
+
+    static func expandedContentsViolation(
+        at root: URL,
+        maximumSize: Int64,
+        maximumEntries: Int,
+        maximumDepth: Int
+    ) -> String? {
+        var enumerationFailed = false
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in
+                enumerationFailed = true
+                return false
+            }
+        ) else {
+            return "FinderPath could not inspect the expanded update."
+        }
+
+        let rootDepth = root.standardizedFileURL.pathComponents.count
+        var entryCount = 0
+        var totalSize: Int64 = 0
+        while let entry = enumerator.nextObject() as? URL {
+            entryCount += 1
+            if entryCount > maximumEntries {
+                return "The expanded update contained more than (maximumEntries) entries."
+            }
+
+            let depth = entry.standardizedFileURL.pathComponents.count - rootDepth
+            if depth > maximumDepth {
+                return "The expanded update exceeded the maximum path depth of (maximumDepth)."
+            }
+
+            let values: URLResourceValues
+            do {
+                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            } catch {
+                return "FinderPath could not inspect the expanded update."
+            }
+            guard values.isDirectory != true else { continue }
+            let fileSize = Int64(max(values.fileSize ?? 0, 0))
+            let (newTotal, overflow) = totalSize.addingReportingOverflow(fileSize)
+            if overflow || newTotal > maximumSize {
+                return "The expanded update exceeded the (maximumSize / (1_024 * 1_024)) MB safety limit."
+            }
+            totalSize = newTotal
+        }
+        if enumerationFailed {
+            return "FinderPath could not inspect the expanded update."
+        }
+        return nil
     }
 }
