@@ -6,6 +6,26 @@ import Foundation
 // consumed silently so hostile or exotic output cannot corrupt parser state.
 
 struct TerminalParser {
+    /// Which character set a designator selected. Only the DEC Special
+    /// Graphics set differs from ASCII in a way this parser has to honour.
+    private enum Charset {
+        case ascii
+        case decSpecialGraphics
+    }
+
+    /// VT100 DEC Special Graphics: 0x5F-0x7E map to line drawing and a handful
+    /// of symbols. Bytes outside that range are unaffected by the charset.
+    private static let decSpecialGraphics: [UInt8: Character] = [
+        0x5F: "\u{00A0}", 0x60: "\u{25C6}", 0x61: "\u{2592}", 0x62: "\u{2409}",
+        0x63: "\u{240C}", 0x64: "\u{240D}", 0x65: "\u{240A}", 0x66: "\u{00B0}",
+        0x67: "\u{00B1}", 0x68: "\u{2424}", 0x69: "\u{240B}", 0x6A: "\u{2518}",
+        0x6B: "\u{2510}", 0x6C: "\u{250C}", 0x6D: "\u{2514}", 0x6E: "\u{253C}",
+        0x6F: "\u{23BA}", 0x70: "\u{23BB}", 0x71: "\u{2500}", 0x72: "\u{23BC}",
+        0x73: "\u{23BD}", 0x74: "\u{251C}", 0x75: "\u{2524}", 0x76: "\u{2534}",
+        0x77: "\u{252C}", 0x78: "\u{2502}", 0x79: "\u{2264}", 0x7A: "\u{2265}",
+        0x7B: "\u{03C0}", 0x7C: "\u{2260}", 0x7D: "\u{00A3}", 0x7E: "\u{00B7}",
+    ]
+
     private enum State {
         case ground
         case escape
@@ -31,6 +51,23 @@ struct TerminalParser {
     /// The running SGR style; `setStyle` actions carry the resolved result.
     private var currentStyle = CellStyle.plain
 
+    private var g0Charset: Charset = .ascii
+    private var g1Charset: Charset = .ascii
+    /// True between SO and SI, when G1 rather than G0 is drawn from.
+    private var usingG1 = false
+    private var pendingCharsetIsG1 = false
+
+    private var activeCharset: Charset { usingG1 ? g1Charset : g0Charset }
+
+    /// The character a printable byte stands for under the active charset.
+    private func printable(_ byte: UInt8) -> Character {
+        guard activeCharset == .decSpecialGraphics,
+              let mapped = Self.decSpecialGraphics[byte] else {
+            return Character(UnicodeScalar(byte))
+        }
+        return mapped
+    }
+
     init() {}
 
     mutating func parse(_ bytes: [UInt8]) -> [TerminalAction] {
@@ -43,7 +80,11 @@ struct TerminalParser {
             case .escape:
                 parseEscape(byte, into: &actions)
             case .escapeCharset:
-                // ESC ( X or ESC ) X — consume the charset designator.
+                // ESC ( X or ESC ) X — record which charset was designated.
+                // The designator used to be consumed and thrown away, which is
+                // why line drawing printed as the raw letters.
+                let designated: Charset = byte == UInt8(ascii: "0") ? .decSpecialGraphics : .ascii
+                if pendingCharsetIsG1 { g1Charset = designated } else { g0Charset = designated }
                 state = .ground
             case .csi:
                 parseCSI(byte, into: &actions)
@@ -108,10 +149,16 @@ struct TerminalParser {
             actions.append(.tab)
         case 0x07:
             actions.append(.bell)
+        case 0x0E:
+            // SO — shift out to G1, the other route ncurses takes into the
+            // line-drawing charset.
+            usingG1 = true
+        case 0x0F:
+            usingG1 = false // SI — shift back in to G0
         case 0x00..<0x20, 0x7F:
             break // other C0 controls and DEL are ignored
         case 0x20..<0x7F:
-            actions.append(.print(Character(UnicodeScalar(byte))))
+            actions.append(.print(printable(byte)))
         default:
             // Leading byte of a multi-byte UTF-8 sequence.
             let expected: Int
@@ -150,6 +197,7 @@ struct TerminalParser {
             oscBuffer = []
             state = .osc
         case UInt8(ascii: "("), UInt8(ascii: ")"):
+            pendingCharsetIsG1 = byte == UInt8(ascii: ")")
             state = .escapeCharset
         case UInt8(ascii: "P"),   // DCS - e.g. terminfo queries, sixel
              UInt8(ascii: "_"),   // APC - e.g. the kitty graphics protocol
@@ -173,6 +221,12 @@ struct TerminalParser {
             // RIS hard reset is one atomic screen action so saved cursor,
             // alternate-buffer, title, and mode state cannot leak through.
             currentStyle = .plain
+            // A TUI killed mid-draw leaves the graphics charset selected, and
+            // every letter then renders as line drawing. RIS is exactly what
+            // `reset` sends to fix that, so it has to clear the charset state.
+            g0Charset = .ascii
+            g1Charset = .ascii
+            usingG1 = false
             actions.append(.hardReset)
         case UInt8(ascii: "="), UInt8(ascii: ">"):
             break // keypad modes, ignored

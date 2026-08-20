@@ -1349,6 +1349,117 @@ struct FinderPathTerminalTests {
         )
         restartable.terminate()
 
+        // MARK: - Parser: DEC Special Graphics charset
+        //
+        // TERM is forced to xterm-256color, whose terminfo declares
+        // smacs=\E(0, so ncurses uses this charset for line drawing even in a
+        // UTF-8 locale. Consuming the designator without recording it printed
+        // the raw bytes, so every framed TUI drew "lqqqk" instead of a box.
+
+        var charset = TerminalParser()
+        expect(
+            charset.parse(Array("\u{1B}(0lqk".utf8)) == [.print("\u{250C}"), .print("\u{2500}"), .print("\u{2510}")],
+            "ESC ( 0 maps l/q/k to the corner and line glyphs"
+        )
+        expect(
+            charset.parse(Array("xtuv".utf8)) == [.print("\u{2502}"), .print("\u{251C}"), .print("\u{2524}"), .print("\u{2534}")],
+            "the charset stays selected until it is changed back"
+        )
+        expect(
+            charset.parse(Array("\u{1B}(Blqk".utf8)) == [.print("l"), .print("q"), .print("k")],
+            "ESC ( B restores ASCII"
+        )
+
+        // Only 0x5F-0x7E is remapped; everything else passes through.
+        var partial = TerminalParser()
+        _ = partial.parse(Array("\u{1B}(0".utf8))
+        expect(
+            partial.parse(Array("AZ09".utf8)) == [.print("A"), .print("Z"), .print("0"), .print("9")],
+            "bytes outside the graphics range are unaffected by the charset"
+        )
+
+        // G1 plus shift-out/shift-in, the other way ncurses reaches the charset.
+        var shifted = TerminalParser()
+        _ = shifted.parse(Array("\u{1B})0".utf8))
+        expect(shifted.parse([0x0E]).isEmpty, "SO emits nothing itself")
+        expect(shifted.parse(Array("q".utf8)) == [.print("\u{2500}")], "SO selects G1, which was designated as graphics")
+        expect(shifted.parse([0x0F]).isEmpty, "SI emits nothing itself")
+        expect(shifted.parse(Array("q".utf8)) == [.print("q")], "SI returns to G0, still ASCII")
+
+        // RIS (ESC c) must restore ASCII. A TUI killed mid-draw leaves the
+        // graphics charset selected, which is exactly the garbled terminal that
+        // `reset` fixes -- and `reset` fixes it by sending RIS.
+        var afterReset = TerminalParser()
+        _ = afterReset.parse(Array("\u{1B}(0".utf8))
+        expect(afterReset.parse(Array("q".utf8)) == [.print("\u{2500}")], "precondition: graphics selected")
+        _ = afterReset.parse(Array("\u{1B}c".utf8))
+        expect(afterReset.parse(Array("q".utf8)) == [.print("q")], "RIS restores the ASCII charset")
+
+        var shiftedThenReset = TerminalParser()
+        _ = shiftedThenReset.parse(Array("\u{1B})0".utf8))
+        _ = shiftedThenReset.parse([0x0E])
+        _ = shiftedThenReset.parse(Array("\u{1B}c".utf8))
+        expect(
+            shiftedThenReset.parse(Array("q".utf8)) == [.print("q")],
+            "RIS also shifts back in to G0"
+        )
+
+        // End to end: a real ncurses frame reaches the grid as box drawing.
+        var boxScreen = TerminalScreen(rows: 3, columns: 6, scrollbackLimit: 10)
+        var boxParser = TerminalParser()
+        for action in boxParser.parse(Array("\u{1B}(0lqqqqk\u{1B}(B".utf8)) { boxScreen.apply(action) }
+        expect(
+            boxScreen.lineText(0) == "\u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}",
+            "a framed TUI renders as box drawing, not as 'lqqqqk'"
+        )
+
+        // MARK: - Screen: East-Asian-Wide symbol widths
+        //
+        // The 0x1F300+ emoji block and CJK were already handled; the wide
+        // symbols that CLI tools actually print for status were measured as one
+        // column, so the emulator advanced one less than the program computed
+        // and everything positioned later on that row drifted.
+
+        let wideSymbols: [(String, Character)] = [
+            ("U+231B hourglass", "\u{231B}"),
+            ("U+23F0 alarm clock", "\u{23F0}"),
+            ("U+26A1 high voltage", "\u{26A1}"),
+            ("U+2705 check mark button", "\u{2705}"),
+            ("U+274C cross mark", "\u{274C}"),
+            ("U+2728 sparkles", "\u{2728}"),
+            ("U+2753 question mark", "\u{2753}"),
+            ("U+2757 exclamation mark", "\u{2757}"),
+            ("U+2795 plus", "\u{2795}"),
+            ("U+2B1B black large square", "\u{2B1B}"),
+            ("U+2B50 star", "\u{2B50}"),
+            ("U+2B55 hollow red circle", "\u{2B55}"),
+        ]
+        for (name, character) in wideSymbols {
+            expect(TerminalScreen.columnWidth(of: character) == 2, "\(name) occupies two columns")
+        }
+
+        // Narrow neighbours in the same blocks must not be swept up.
+        let narrowSymbols: [(String, Character)] = [
+            ("U+2192 rightwards arrow", "\u{2192}"),
+            ("U+2713 check mark", "\u{2713}"),
+            ("U+2717 ballot X", "\u{2717}"),
+            ("U+26A0 warning sign", "\u{26A0}"),
+            ("U+2B1A dotted square", "\u{2B1A}"),
+        ]
+        for (name, character) in narrowSymbols {
+            expect(TerminalScreen.columnWidth(of: character) == 1, "\(name) stays one column")
+        }
+
+        // A status line a test runner would print lands where the child expects.
+        var statusScreen = TerminalScreen(rows: 2, columns: 20, scrollbackLimit: 5)
+        var statusParser = TerminalParser()
+        for action in statusParser.parse(Array("\u{2705} ok".utf8)) { statusScreen.apply(action) }
+        expect(
+            statusScreen.cell(atRow: 0, column: 2).character == " "
+                && statusScreen.cell(atRow: 0, column: 3).character == "o",
+            "a wide status glyph advances two columns, so following text is not off by one"
+        )
+
         // MARK: - Result
 
         if failures.isEmpty {
