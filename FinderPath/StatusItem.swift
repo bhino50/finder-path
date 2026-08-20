@@ -47,6 +47,19 @@ final class StatusItemController: NSObject {
 
     private static let copyConfirmationNanoseconds: UInt64 = 1_000_000_000
 
+    private static let recentPathActions = RecentPathActions(
+        copyPath: #selector(copyRecentPathMenuItem(_:)),
+        copyCDCommand: #selector(copyRecentCDCommandMenuItem(_:)),
+        openInCmux: #selector(openRecentInCmuxMenuItem(_:)),
+        openInGhostty: #selector(openRecentInGhosttyMenuItem(_:)),
+        openInTerminal: #selector(openRecentInTerminalMenuItem(_:)),
+        openWithAgent: #selector(openRecentWithAgentMenuItem(_:)),
+        openAgentInTerminal: #selector(openRecentAgentInTerminalMenuItem(_:)),
+        newTerminal: #selector(newTerminalAtRecentPathMenuItem(_:)),
+        revealInFinder: #selector(revealRecentPathMenuItem(_:)),
+        clear: #selector(clearRecentPathsMenuItem)
+    )
+
     override init() {
         super.init()
 
@@ -187,12 +200,36 @@ final class StatusItemController: NSObject {
         updateHarnessMenuItems(optionHeld: optionHeld)
     }
 
+    /// The agents the menu may offer, in display order. Availability stats every
+    /// directory on PATH, so it is resolved here once per rebuild and handed to
+    /// every row that needs it — doing it per row would mean hundreds of
+    /// filesystem calls each time the menu is built, twice per click.
+    private func agentOptions() -> [RecentPathAgentOption] {
+        [
+            ("Codex", FinderPathPreferences.codexExecutable, FinderPathPreferences.showOpenWithCodexItem),
+            ("Claude", FinderPathPreferences.claudeExecutable, FinderPathPreferences.showOpenWithClaudeItem),
+            ("Hermes", FinderPathPreferences.hermesExecutable, FinderPathPreferences.showOpenWithHermesItem)
+        ].map { name, executable, isEnabled in
+            RecentPathAgentOption(
+                name: name,
+                executable: executable,
+                availability: AgentLauncher.availability(for: executable),
+                isEnabled: isEnabled
+            )
+        }
+    }
+
     private func rebuildMenu(_ menu: NSMenu, optionHeld: Bool) {
         menu.removeAllItems()
         menu.autoenablesItems = false
         harnessMenuItemBindings.removeAll(keepingCapacity: true)
 
         let isPermissionDenied = FinderBridge.isPermissionDenied(state.currentPath)
+        let agents = agentOptions()
+        let launcherAvailability = RecentPathLauncherAvailability(
+            isCmuxInstalled: TerminalBridge.isCmuxInstalled,
+            isGhosttyInstalled: TerminalBridge.isGhosttyInstalled
+        )
 
         if FinderPathPreferences.showPathHeader {
             let pathItem = NSMenuItem()
@@ -263,7 +300,7 @@ final class StatusItemController: NSObject {
         }
 
         if FinderPathPreferences.showOpenCmuxItem {
-            let isInstalled = TerminalBridge.isCmuxInstalled
+            let isInstalled = launcherAvailability.isCmuxInstalled
             if !hideUnavailableAgents || isInstalled {
                 let title = isInstalled ? "Open in cmux" : "cmux Not Installed"
                 let cmuxItem = NSMenuItem(title: title, action: #selector(openCmuxMenuItem), keyEquivalent: "")
@@ -275,7 +312,7 @@ final class StatusItemController: NSObject {
         }
 
         if FinderPathPreferences.showOpenGhosttyItem {
-            let isInstalled = TerminalBridge.isGhosttyInstalled
+            let isInstalled = launcherAvailability.isGhosttyInstalled
             if !hideUnavailableAgents || isInstalled {
                 let title = isInstalled ? "Open in Ghostty" : "Ghostty Not Installed"
                 let ghosttyItem = NSMenuItem(title: title, action: #selector(openGhosttyMenuItem), keyEquivalent: "")
@@ -301,18 +338,17 @@ final class StatusItemController: NSObject {
         // FinderPath terminal. Menus shown with popUp do not drive AppKit's
         // live alternate-item swap, so statusItemClicked polls the modifier
         // state and updates these rows while the menu is open.
-        func addHarnessItem(show: Bool, executable: String, name: String, externalAction: Selector, terminalAction: Selector) {
-            guard show else { return }
-            let availability = AgentLauncher.availability(for: executable)
-            guard !hideUnavailableAgents || availability.isInstalled else { return }
+        func addHarnessItem(_ agent: RecentPathAgentOption, externalAction: Selector, terminalAction: Selector) {
+            guard agent.isEnabled else { return }
+            guard !hideUnavailableAgents || agent.availability.isInstalled else { return }
             addPendingLauncherSeparator()
-            guard availability.isInstalled else {
-                let item = NSMenuItem(title: "\(name) Not Installed", action: nil, keyEquivalent: "")
+            guard agent.availability.isInstalled else {
+                let item = NSMenuItem(title: "\(agent.name) Not Installed", action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
                 return
             }
-            let presentation = AgentLauncher.menuPresentation(name: name, optionHeld: optionHeld)
+            let presentation = AgentLauncher.menuPresentation(name: agent.name, optionHeld: optionHeld)
             let action = presentation.usesBuiltInTerminal ? terminalAction : externalAction
             let item = NSMenuItem(title: presentation.title, action: action, keyEquivalent: "")
             item.target = self
@@ -321,7 +357,7 @@ final class StatusItemController: NSObject {
             harnessMenuItemBindings.append(
                 HarnessMenuItemBinding(
                     item: item,
-                    name: name,
+                    name: agent.name,
                     externalAction: externalAction,
                     terminalAction: terminalAction
                 )
@@ -329,26 +365,46 @@ final class StatusItemController: NSObject {
         }
 
         addHarnessItem(
-            show: FinderPathPreferences.showOpenWithCodexItem,
-            executable: FinderPathPreferences.codexExecutable,
-            name: "Codex",
+            agents[0],
             externalAction: #selector(openWithCodexMenuItem),
             terminalAction: #selector(openCodexInTerminalMenuItem)
         )
         addHarnessItem(
-            show: FinderPathPreferences.showOpenWithClaudeItem,
-            executable: FinderPathPreferences.claudeExecutable,
-            name: "Claude",
+            agents[1],
             externalAction: #selector(openWithClaudeMenuItem),
             terminalAction: #selector(openClaudeInTerminalMenuItem)
         )
         addHarnessItem(
-            show: FinderPathPreferences.showOpenWithHermesItem,
-            executable: FinderPathPreferences.hermesExecutable,
-            name: "Hermes",
+            agents[2],
             externalAction: #selector(openWithHermesMenuItem),
             terminalAction: #selector(openHermesInTerminalMenuItem)
         )
+
+        if FinderPathPreferences.showRecentPathsItem,
+           let recentPathsMenu = RecentPathsMenu.makeMenu(
+               paths: RecentPathsStore.shared.paths,
+               launchers: launcherAvailability,
+               agents: agents,
+               hideUnavailableAgents: hideUnavailableAgents,
+               optionHeld: optionHeld,
+               target: self,
+               actions: Self.recentPathActions,
+               registerAgentItem: { [weak self] item, agent in
+                   self?.harnessMenuItemBindings.append(
+                       HarnessMenuItemBinding(
+                           item: item,
+                           name: agent.name,
+                           externalAction: Self.recentPathActions.openWithAgent,
+                           terminalAction: Self.recentPathActions.openAgentInTerminal
+                       )
+                   )
+               }
+           ) {
+            menu.addItem(.separator())
+            let recentPathsItem = NSMenuItem(title: "Recent Paths", action: nil, keyEquivalent: "")
+            recentPathsItem.submenu = recentPathsMenu
+            menu.addItem(recentPathsItem)
+        }
 
         if FinderPathPreferences.showTerminalsSection {
             menu.addItem(.separator())
@@ -523,15 +579,15 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func openWithCodexMenuItem() {
-        state.openWithCodex()
+        state.openWithAgent(named: "Codex", executable: FinderPathPreferences.codexExecutable)
     }
 
     @objc private func openWithClaudeMenuItem() {
-        state.openWithClaude()
+        state.openWithAgent(named: "Claude", executable: FinderPathPreferences.claudeExecutable)
     }
 
     @objc private func openWithHermesMenuItem() {
-        state.openWithHermes()
+        state.openWithAgent(named: "Hermes", executable: FinderPathPreferences.hermesExecutable)
     }
 
     // Clicking a terminal row opens it directly; the row's trailing button
@@ -550,9 +606,10 @@ final class StatusItemController: NSObject {
         TerminalSessionStore.shared.remove(session)
     }
 
-    /// Opens a new built-in terminal in the current folder that runs the given
-    /// agent command once the shell is ready.
-    private func openHarnessTerminal(executable: String, name: String) {
+    /// Opens a new built-in terminal that runs the given agent command once the
+    /// shell is ready. A nil directory means the current Finder folder; recent
+    /// path rows pass their own.
+    private func openHarnessTerminal(executable: String, name: String, directory: String? = nil) {
         guard let button = statusItem.button else { return }
         guard let resolvedPath = AgentLauncher.availability(for: executable).resolvedPath else {
             FinderPathAlertPresenter.presentLaunchFailure(
@@ -561,10 +618,10 @@ final class StatusItemController: NSObject {
             )
             return
         }
-        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        let workingDirectory = directory ?? (state.hasCopyablePath ? state.currentPath : NSHomeDirectory())
         let session = TerminalSessionStore.shared.newSession(
             name: name,
-            workingDirectory: directory,
+            workingDirectory: workingDirectory,
             initialCommand: ShellCommand.argument(resolvedPath)
         )
         DispatchQueue.main.async { [weak self] in
@@ -596,6 +653,65 @@ final class StatusItemController: NSObject {
         guard let button = statusItem.button else { return }
 
         terminalPanelController.toggle(relativeTo: button)
+    }
+
+    // MARK: - Recent path actions
+    //
+    // Non-agent rows carry their folder as a String representedObject; agent
+    // rows carry a RecentPathAgentTarget. A row whose object is missing or of
+    // the wrong type is ignored rather than falling back to the current Finder
+    // path, which would silently act on the wrong folder.
+
+    @objc private func copyRecentPathMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.copyCurrentPath(at: path)
+        showCopyConfirmation()
+    }
+
+    @objc private func copyRecentCDCommandMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.copyChangeDirectoryCommand(at: path)
+        showCopyConfirmation()
+    }
+
+    @objc private func openRecentInCmuxMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.openInCmux(at: path)
+    }
+
+    @objc private func openRecentInGhosttyMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.openInGhostty(at: path)
+    }
+
+    @objc private func openRecentInTerminalMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.openInTerminal(at: path)
+    }
+
+    @objc private func openRecentWithAgentMenuItem(_ sender: NSMenuItem) {
+        guard let agent = sender.representedObject as? RecentPathAgentTarget else { return }
+        state.openWithAgent(named: agent.name, executable: agent.executable, at: agent.path)
+    }
+
+    @objc private func openRecentAgentInTerminalMenuItem(_ sender: NSMenuItem) {
+        guard let agent = sender.representedObject as? RecentPathAgentTarget else { return }
+        openHarnessTerminal(executable: agent.executable, name: agent.name, directory: agent.path)
+    }
+
+    @objc private func newTerminalAtRecentPathMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String, let button = statusItem.button else { return }
+        let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: path)
+        terminalPanelController.show(session: session, relativeTo: button)
+    }
+
+    @objc private func revealRecentPathMenuItem(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        state.revealInFinder(at: path)
+    }
+
+    @objc private func clearRecentPathsMenuItem() {
+        RecentPathsStore.shared.clear()
     }
 
     @objc private func openConnectToServerMenuItem() {

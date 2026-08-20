@@ -113,3 +113,96 @@ enum TerminalAction: Equatable, Sendable {
     /// DSR: 5 = status, 6 = cursor position. Replies are the session's job.
     case reportDeviceStatus(Int)
 }
+
+/// One row of the terminal grid, plus whether its text continues onto the row
+/// below because it autowrapped rather than being ended by an explicit newline.
+///
+/// The flag has to live on the row itself. A row filled exactly to the terminal
+/// width looks identical whether it wrapped or the program sent a newline, so
+/// nothing can be recovered from the cells afterwards — and copying a wrapped
+/// path without knowing inserts a newline that breaks it when pasted. Carrying
+/// the flag with the row means every scroll, resize, insert and alternate-screen
+/// swap moves it along with its text for free, instead of a parallel array that
+/// has to be kept in step at roughly two dozen call sites.
+struct TerminalLine {
+    var cells: [TerminalCell]
+    /// True when this row's text continues on the row below.
+    var wrapped: Bool
+
+    init(cells: [TerminalCell], wrapped: Bool = false) {
+        self.cells = cells
+        self.wrapped = wrapped
+    }
+
+    static func blank(columns: Int, filledWith cell: TerminalCell = .blank) -> TerminalLine {
+        TerminalLine(cells: Array(repeating: cell, count: max(columns, 0)))
+    }
+
+    var count: Int { cells.count }
+
+    /// Cell access so the grid still reads as `grid[row][column]`.
+    subscript(index: Int) -> TerminalCell {
+        get { cells[index] }
+        set { cells[index] = newValue }
+    }
+}
+
+/// Joins selected terminal rows into clipboard text.
+///
+/// Lives here, apart from the AppKit selection code, so the rule that actually
+/// matters — a soft-wrapped row must not gain a newline — is covered by tests.
+enum TerminalTextJoiner {
+    /// One selected row: its visible text, and whether the terminal wrapped it
+    /// onto the row below rather than the program ending it with a newline.
+    struct Row {
+        var text: String
+        var continuesToNextRow: Bool
+
+        init(text: String, continuesToNextRow: Bool) {
+            self.text = text
+            self.continuesToNextRow = continuesToNextRow
+        }
+    }
+
+    /// A wrapped row is joined to the next with nothing between them, so a path
+    /// or command that merely overflowed the window comes back as one line and
+    /// pastes correctly. Every other row keeps its newline.
+    static func join(_ rows: [Row]) -> String {
+        var output = ""
+        for (index, row) in rows.enumerated() {
+            output += row.text
+            guard index < rows.count - 1 else { continue }
+            if !row.continuesToNextRow { output += "\n" }
+        }
+        return output
+    }
+}
+
+/// Converts between the terminal viewport's scroll offset and the absolute line
+/// pinned to its top row.
+///
+/// A scroll offset counts up from the bottom of the buffer, so it names a
+/// position that moves: every line of new output pushes the text the user
+/// scrolled back to one row further up, and within a few seconds of streaming
+/// output it has left the view entirely. Storing the absolute line at the top
+/// instead (see `TerminalScreen.scrollbackBase`) keeps the reader still and lets
+/// the offset be recomputed per frame.
+///
+/// Kept apart from the AppKit view so this arithmetic is covered by tests.
+enum TerminalViewport {
+    /// The absolute line that a given scroll offset puts at the top row.
+    static func anchor(forOffset offset: Int, scrollbackBase: Int, scrollbackCount: Int) -> Int {
+        let clamped = max(0, min(offset, max(scrollbackCount, 0)))
+        return scrollbackBase + max(scrollbackCount, 0) - clamped
+    }
+
+    /// The scroll offset that puts `anchor` back on the top row. An anchor the
+    /// ring has since discarded clamps to the oldest line still held, and one
+    /// past the live grid clamps to the bottom, so a stale anchor degrades to
+    /// the nearest sensible view instead of scrolling somewhere arbitrary.
+    static func offset(forAnchor anchor: Int, scrollbackBase: Int, scrollbackCount: Int) -> Int {
+        let available = max(scrollbackCount, 0)
+        let raw = scrollbackBase + available - anchor
+        return max(0, min(raw, available))
+    }
+}

@@ -15,8 +15,11 @@ TARGET="$(uname -m)-apple-macos13.0"
   -target "$TARGET" \
   "$ROOT_DIR/FinderPath/Bridges.swift" \
   "$ROOT_DIR/FinderPath/HoverPickerLogic.swift" \
+  "$ROOT_DIR/FinderPath/PendingURLQueue.swift" \
   "$ROOT_DIR/FinderPath/Preferences.swift" \
+  "$ROOT_DIR/FinderPath/RecentPaths.swift" \
   "$ROOT_DIR/FinderPath/RemoteServers.swift" \
+  "$ROOT_DIR/FinderPath/UpdateInstaller.swift" \
   "$ROOT_DIR/FinderPath/VersionLogic.swift" \
   "$ROOT_DIR/Tests/LogicTests.swift" \
   -framework AppKit \

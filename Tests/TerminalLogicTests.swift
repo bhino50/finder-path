@@ -935,6 +935,531 @@ struct FinderPathTerminalTests {
         expect(screen.lineText(0).hasPrefix("é"), "a combining mark merges onto an ASCII base")
         expect(screen.cursorColumn == 1, "a merged combining mark does not advance the cursor")
 
+        // A hostile process can emit combining marks forever. The rendered
+        // grapheme must remain bounded instead of retaining every scalar in a
+        // single cell.
+        for _ in 0..<(TerminalScreen.maximumScalarsPerCell * 3) {
+            screen.apply(.print("\u{0301}"))
+        }
+        expect(
+            screen.cell(atRow: 0, column: 0).character.unicodeScalars.count
+                <= TerminalScreen.maximumScalarsPerCell,
+            "one terminal cell caps an unbounded combining-mark stream"
+        )
+        expect(screen.cursorColumn == 1, "discarded combining marks do not advance the cursor")
+
+        // The read queue can outrun the main actor. Coalescing stays bounded and
+        // records the overflow, and what it discards is the OLDEST output.
+        // Keeping a stale prefix and dropping the tail instead leaves the screen
+        // showing mid-stream lines followed by the prompt, which the user cannot
+        // tell apart from the command genuinely ending there.
+        let outputBuffer = PTYOutputBuffer()
+        let tailMarker = Array("TAIL".utf8)
+        let oversizedOutput =
+            Array(repeating: UInt8(ascii: "x"), count: PTYOutputBuffer.maximumPendingBytes + 4_096 - tailMarker.count)
+            + tailMarker
+        expect(outputBuffer.appendAndClaimDrain(oversizedOutput), "the first PTY burst claims one drain")
+        expect(
+            outputBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
+            "PTY buffering stops at its high-water mark"
+        )
+        expect(outputBuffer.droppedByteCount == 4_096, "PTY overflow is counted")
+        let drainedBurst = outputBuffer.takeAll()
+        expect(drainedBurst.count == PTYOutputBuffer.maximumPendingBytes, "the bounded PTY window drains")
+        expect(
+            Array(drainedBurst.suffix(tailMarker.count)) == tailMarker,
+            "an oversized burst keeps its newest bytes, not its stale prefix"
+        )
+        expect(outputBuffer.bufferedByteCount == 0, "draining releases buffered PTY memory")
+
+        // Overflow that builds up across several reads evicts the oldest bytes
+        // too, so the most recent output always survives to reach the screen.
+        let steadyBuffer = PTYOutputBuffer()
+        _ = steadyBuffer.appendAndClaimDrain(
+            Array(repeating: UInt8(ascii: "o"), count: PTYOutputBuffer.maximumPendingBytes)
+        )
+        let newestMarker = Array("NEWEST".utf8)
+        _ = steadyBuffer.appendAndClaimDrain(newestMarker)
+        expect(
+            steadyBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
+            "a full buffer stays at the high-water mark after more output arrives"
+        )
+        expect(steadyBuffer.droppedByteCount == newestMarker.count, "evicted older bytes are counted as dropped")
+        let drainedSteady = steadyBuffer.takeAll()
+        expect(
+            Array(drainedSteady.suffix(newestMarker.count)) == newestMarker,
+            "bytes arriving at a full buffer evict the oldest instead of being discarded"
+        )
+
+        // MARK: - Screen: alt-screen resize preserves the parked primary screen
+        //
+        // Shrinking while a TUI holds the alternate screen must push the primary
+        // screen's dropped rows into scrollback, exactly as the same shrink does
+        // at the shell prompt. Without that, a build log that scrolls off during
+        // a resize is gone from the grid AND from scrollback, so the user cannot
+        // scroll back to it at all.
+
+        var parked = TerminalScreen(rows: 6, columns: 10, scrollbackLimit: 500)
+        for index in 1...6 {
+            for character in "LINE\(index)" { parked.apply(.print(character)) }
+            if index < 6 {
+                parked.apply(.lineFeed)
+                parked.apply(.carriageReturn)
+            }
+        }
+        expect(parked.scrollbackCount == 0, "six lines on a six-row screen do not scroll yet")
+
+        // Same shrink at the shell prompt, for parity.
+        var atPrompt = parked
+        atPrompt.resize(rows: 2, columns: 10)
+        let promptScrollback = atPrompt.scrollbackCount
+        expect(promptScrollback == 4, "shrinking at the prompt banks the four dropped rows")
+
+        parked.apply(.setMode(.alternateScreen, true))
+        for character in "TUI" { parked.apply(.print(character)) }
+        parked.resize(rows: 2, columns: 10)
+        parked.apply(.setMode(.alternateScreen, false))
+        expect(
+            parked.scrollbackCount == promptScrollback,
+            "shrinking behind a TUI banks the same rows as shrinking at the prompt"
+        )
+        let oldestParked = String(parked.scrollbackLine(0).map(\.character))
+            .trimmingCharacters(in: .whitespaces)
+        expect(oldestParked == "LINE1", "the oldest parked primary row is recoverable from scrollback")
+
+        // The scrollback limit still wins: a parked screen cannot push the ring
+        // past its cap.
+        var cappedPark = TerminalScreen(rows: 8, columns: 6, scrollbackLimit: 2)
+        for index in 1...8 {
+            for character in "P\(index)" { cappedPark.apply(.print(character)) }
+            if index < 8 {
+                cappedPark.apply(.lineFeed)
+                cappedPark.apply(.carriageReturn)
+            }
+        }
+        cappedPark.apply(.setMode(.alternateScreen, true))
+        cappedPark.resize(rows: 2, columns: 6)
+        cappedPark.apply(.setMode(.alternateScreen, false))
+        expect(cappedPark.scrollbackCount <= 2, "parked rows still respect scrollbackLimit")
+
+        // A screen with no scrollback at all must not accumulate parked rows.
+        var noScrollbackPark = TerminalScreen(rows: 6, columns: 6, scrollbackLimit: 0)
+        for index in 1...6 {
+            for character in "N\(index)" { noScrollbackPark.apply(.print(character)) }
+            if index < 6 {
+                noScrollbackPark.apply(.lineFeed)
+                noScrollbackPark.apply(.carriageReturn)
+            }
+        }
+        noScrollbackPark.apply(.setMode(.alternateScreen, true))
+        noScrollbackPark.resize(rows: 2, columns: 6)
+        noScrollbackPark.apply(.setMode(.alternateScreen, false))
+        expect(noScrollbackPark.scrollbackCount == 0, "scrollbackLimit 0 banks nothing when parked")
+
+        // MARK: - Screen: absolute line anchoring
+        //
+        // Content-line indices are relative to the front of the scrollback ring,
+        // so every trim shifts them down. Anything that must stay pinned to TEXT
+        // while output keeps arriving -- a held selection, a scrolled-back
+        // viewport -- has to be stored in absolute space and converted back, or
+        // it silently slides onto different lines.
+
+        func emitLine(_ target: inout TerminalScreen, _ text: String) {
+            for character in text { target.apply(.print(character)) }
+            target.apply(.lineFeed)
+            target.apply(.carriageReturn)
+        }
+        func ringText(_ target: TerminalScreen, _ contentLine: Int) -> String {
+            String(target.scrollbackLine(contentLine).map(\.character))
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        var ring = TerminalScreen(rows: 2, columns: 8, scrollbackLimit: 3)
+        expect(ring.scrollbackBase == 0, "a fresh screen has discarded nothing off the front")
+
+        for index in 1...5 { emitLine(&ring, "R\(index)") }
+        expect(ring.scrollbackBase > 0, "a full ring has begun trimming")
+
+        // Pin a line, then push one more line through so the ring trims again.
+        let watchedContentLine = 1
+        let watchedAbsolute = ring.absoluteLine(forContentLine: watchedContentLine)
+        let watchedText = ringText(ring, watchedContentLine)
+        let baseBeforeTrim = ring.scrollbackBase
+
+        emitLine(&ring, "R6")
+        expect(ring.scrollbackBase == baseBeforeTrim + 1, "one more scrolled-off line discards one from the front")
+
+        let resolved = ring.contentLine(forAbsoluteLine: watchedAbsolute)
+        expect(resolved == watchedContentLine - 1, "the pinned text shifted down one content index")
+        expect(
+            resolved.map { ringText(ring, $0) } == watchedText,
+            "an absolute reference still names the same text after a trim"
+        )
+
+        // Round-trip across the whole addressable range, scrollback and grid.
+        let addressable = 0..<(ring.scrollbackCount + ring.rows)
+        expect(
+            addressable.allSatisfy { ring.contentLine(forAbsoluteLine: ring.absoluteLine(forContentLine: $0)) == $0 },
+            "absolute and content line numbers round-trip over scrollback and grid"
+        )
+        expect(
+            ring.absoluteLine(forContentLine: ring.scrollbackCount) == ring.scrollbackBase + ring.scrollbackCount,
+            "the first grid row follows the last scrollback line in absolute space"
+        )
+
+        // A line that has fallen out of the ring must report as gone rather than
+        // resolving to whatever text now occupies its old index.
+        let evictedAbsolute = ring.scrollbackBase - 1
+        expect(ring.contentLine(forAbsoluteLine: evictedAbsolute) == nil, "a discarded line reports as gone")
+        expect(
+            ring.contentLine(forAbsoluteLine: ring.absoluteLine(forContentLine: ring.scrollbackCount + ring.rows)) == nil,
+            "a line past the live grid reports as gone"
+        )
+
+        // Trimming is the only thing that moves the base: plain output that fits
+        // inside the ring must not shift existing absolute references.
+        var roomy = TerminalScreen(rows: 2, columns: 8, scrollbackLimit: 500)
+        for index in 1...4 { emitLine(&roomy, "Q\(index)") }
+        let roomyAbsolute = roomy.absoluteLine(forContentLine: 0)
+        let roomyText = ringText(roomy, 0)
+        for index in 5...20 { emitLine(&roomy, "Q\(index)") }
+        expect(roomy.scrollbackBase == 0, "a ring under its limit never discards")
+        expect(
+            roomy.contentLine(forAbsoluteLine: roomyAbsolute).map { ringText(roomy, $0) } == roomyText,
+            "absolute references survive plain output when nothing is trimmed"
+        )
+
+        // Resize trims through the same path, so the base has to move there too.
+        var resized = TerminalScreen(rows: 6, columns: 8, scrollbackLimit: 2)
+        for index in 1...6 { emitLine(&resized, "Z\(index)") }
+        let baseBeforeResize = resized.scrollbackBase
+        resized.resize(rows: 2, columns: 8)
+        expect(
+            resized.scrollbackCount <= 2,
+            "resize honours the scrollback limit"
+        )
+        expect(
+            resized.scrollbackBase >= baseBeforeResize,
+            "rows discarded by a resize advance the absolute base"
+        )
+
+        // MARK: - Screen: soft-wrap continuation
+        //
+        // A row continued by autowrap and a row ended by an explicit newline are
+        // indistinguishable once printed -- both can be exactly full. The screen
+        // has to record which happened, or copying a wrapped path inserts a
+        // newline that breaks it when pasted.
+
+        var wrapped = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { wrapped.apply(.print(character)) }
+        expect(wrapped.isLineWrapped(contentLine: 0), "a row continued by autowrap is marked wrapped")
+        expect(!wrapped.isLineWrapped(contentLine: 1), "the continuation row is not itself wrapped")
+
+        var hardBreak = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "AB" { hardBreak.apply(.print(character)) }
+        hardBreak.apply(.lineFeed)
+        hardBreak.apply(.carriageReturn)
+        for character in "CD" { hardBreak.apply(.print(character)) }
+        expect(!hardBreak.isLineWrapped(contentLine: 0), "a row ended by an explicit newline is not wrapped")
+
+        // The discriminating case: a row filled to exactly the width, then ended
+        // by a newline. It looks identical to a wrapped row, so nothing can be
+        // inferred from the cells alone.
+        var exactlyFull = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDE" { exactlyFull.apply(.print(character)) }
+        exactlyFull.apply(.lineFeed)
+        exactlyFull.apply(.carriageReturn)
+        for character in "FG" { exactlyFull.apply(.print(character)) }
+        expect(
+            !exactlyFull.isLineWrapped(contentLine: 0),
+            "a row filled exactly to the width then ended by a newline is not wrapped"
+        )
+
+        var exactlyFullThenWrap = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEF" { exactlyFullThenWrap.apply(.print(character)) }
+        expect(
+            exactlyFullThenWrap.isLineWrapped(contentLine: 0),
+            "a row filled exactly to the width then continued IS wrapped"
+        )
+
+        // The flag has to travel with the text, not with the row index.
+        var travelling = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { travelling.apply(.print(character)) }
+        for _ in 0..<3 {
+            travelling.apply(.lineFeed)
+            travelling.apply(.carriageReturn)
+        }
+        expect(travelling.scrollbackCount >= 3, "the wrapped line scrolled into scrollback")
+        expect(travelling.isLineWrapped(contentLine: 0), "the wrap flag follows its line into scrollback")
+        expect(!travelling.isLineWrapped(contentLine: 1), "the continuation line stays unwrapped in scrollback")
+
+        // Erasing a row clears its continuation: the text that wrapped is gone.
+        var erased = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { erased.apply(.print(character)) }
+        expect(erased.isLineWrapped(contentLine: 0), "precondition: row 0 wrapped")
+        erased.apply(.eraseInDisplay(2))
+        expect(!erased.isLineWrapped(contentLine: 0), "erasing the screen clears continuation flags")
+
+        // Out-of-range queries must not trap.
+        expect(!erased.isLineWrapped(contentLine: -1), "a negative content line is not wrapped")
+        expect(
+            !erased.isLineWrapped(contentLine: erased.scrollbackCount + erased.rows + 5),
+            "a content line past the grid is not wrapped"
+        )
+
+        // MARK: - Selection text joining
+
+        typealias JoinRow = TerminalTextJoiner.Row
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "/Users/me/Projects/Finder", continuesToNextRow: true),
+                JoinRow(text: "Path/Terminal.swift", continuesToNextRow: false),
+            ]) == "/Users/me/Projects/FinderPath/Terminal.swift",
+            "a soft-wrapped path rejoins into one pasteable line"
+        )
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "first", continuesToNextRow: false),
+                JoinRow(text: "second", continuesToNextRow: false),
+            ]) == "first\nsecond",
+            "genuinely separate rows keep their newline"
+        )
+        expect(
+            TerminalTextJoiner.join([JoinRow(text: "only", continuesToNextRow: true)]) == "only",
+            "a trailing wrapped row does not gain a dangling separator"
+        )
+        expect(TerminalTextJoiner.join([]).isEmpty, "joining nothing yields nothing")
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "a", continuesToNextRow: true),
+                JoinRow(text: "b", continuesToNextRow: true),
+                JoinRow(text: "c", continuesToNextRow: false),
+                JoinRow(text: "d", continuesToNextRow: false),
+            ]) == "abc\nd",
+            "a run of wrapped rows collapses into a single line"
+        )
+
+        // MARK: - Viewport anchoring
+        //
+        // A scroll offset counts from the bottom, so every new line of output
+        // slides the text the user scrolled to one row further up until it
+        // leaves the view. Pinning the TOP of the viewport to an absolute line
+        // instead keeps it still while output streams underneath.
+
+        // Round-trip inside the addressable range.
+        expect(
+            (0...40).allSatisfy { offset in
+                TerminalViewport.offset(
+                    forAnchor: TerminalViewport.anchor(forOffset: offset, scrollbackBase: 7, scrollbackCount: 40),
+                    scrollbackBase: 7,
+                    scrollbackCount: 40
+                ) == offset
+            },
+            "offset and anchor round-trip across the scrollback range"
+        )
+
+        // The fix: hold an anchor, let output arrive, and the same line stays on
+        // top -- which means the offset has to grow by exactly what arrived.
+        let heldAnchor = TerminalViewport.anchor(forOffset: 10, scrollbackBase: 0, scrollbackCount: 100)
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 0, scrollbackCount: 100) == 10,
+            "precondition: the anchor resolves to the offset it came from"
+        )
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 0, scrollbackCount: 125) == 35,
+            "25 lines of new output move the offset, not the text the user is reading"
+        )
+        // Once the ring is full, further output trims the front instead of
+        // growing the count; the anchor has to track that too.
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 25, scrollbackCount: 100) == 35,
+            "trimming moves the base rather than the count, and the anchor follows"
+        )
+
+        // An anchor scrolled off the end of the ring clamps to the oldest line
+        // still held rather than resolving out of range.
+        expect(
+            TerminalViewport.offset(forAnchor: -50, scrollbackBase: 200, scrollbackCount: 100) == 100,
+            "an anchor trimmed away clamps to the oldest line still in scrollback"
+        )
+        expect(
+            TerminalViewport.offset(forAnchor: 999_999, scrollbackBase: 0, scrollbackCount: 100) == 0,
+            "an anchor past the live grid clamps to the bottom"
+        )
+
+        // Degenerate ring: nothing to scroll to.
+        expect(
+            TerminalViewport.offset(forAnchor: 5, scrollbackBase: 0, scrollbackCount: 0) == 0,
+            "with no scrollback every anchor resolves to the live grid"
+        )
+        expect(
+            TerminalViewport.anchor(forOffset: 99, scrollbackBase: 0, scrollbackCount: 0) == 0,
+            "an out-of-range offset clamps before becoming an anchor"
+        )
+
+        // MARK: - Screen: wrap flags do not survive a width change
+        //
+        // Rows are not reflowed on resize. Widening pads a wrapped row with
+        // blanks out to the new width, and because copy deliberately skips the
+        // trailing-blank trim for wrapped rows, keeping the flag would inject
+        // that padding into the middle of the copied text.
+
+        var widened = TerminalScreen(rows: 4, columns: 6, scrollbackLimit: 50)
+        for character in "ABCDEFGH" { widened.apply(.print(character)) }
+        expect(widened.isLineWrapped(contentLine: 0), "precondition: the row wrapped at the narrow width")
+        widened.resize(rows: 4, columns: 12)
+        expect(
+            !widened.isLineWrapped(contentLine: 0),
+            "widening drops the continuation flag, since the row is no longer full"
+        )
+
+        var narrowed = TerminalScreen(rows: 4, columns: 8, scrollbackLimit: 50)
+        for character in "ABCDEFGHIJ" { narrowed.apply(.print(character)) }
+        expect(narrowed.isLineWrapped(contentLine: 0), "precondition: wrapped at eight columns")
+        narrowed.resize(rows: 4, columns: 5)
+        expect(!narrowed.isLineWrapped(contentLine: 0), "narrowing drops it too, for the same reason")
+
+        // A height-only resize does not disturb the layout, so the flag stands.
+        var shorter = TerminalScreen(rows: 6, columns: 6, scrollbackLimit: 50)
+        for character in "ABCDEFGH" { shorter.apply(.print(character)) }
+        expect(shorter.isLineWrapped(contentLine: 0), "precondition: wrapped before the height change")
+        shorter.resize(rows: 3, columns: 6)
+        let stillWrapped = (0..<(shorter.scrollbackCount + shorter.rows))
+            .contains { shorter.isLineWrapped(contentLine: $0) }
+        expect(stillWrapped, "a height-only resize keeps continuation flags, since columns are unchanged")
+
+        // MARK: - Session: screen replacement is observable
+        //
+        // Views hold absolute line numbers (selection anchors, the scrolled-back
+        // viewport) that only mean anything within one screen's lifetime.
+        // restart() swaps in a fresh screen on the SAME session object, so the
+        // view's session didSet never fires and it needs another signal.
+
+        let restartable = TerminalSession(
+            name: "restart-generation",
+            workingDirectory: NSTemporaryDirectory(),
+            shellPath: "/bin/sh",
+            scrollbackLimit: 100
+        )
+        let generationBefore = restartable.screenGeneration
+        restartable.restart()
+        expect(
+            restartable.screenGeneration != generationBefore,
+            "restart() bumps the screen generation so views can drop stale absolute anchors"
+        )
+        restartable.terminate()
+
+        // MARK: - Parser: DEC Special Graphics charset
+        //
+        // TERM is forced to xterm-256color, whose terminfo declares
+        // smacs=\E(0, so ncurses uses this charset for line drawing even in a
+        // UTF-8 locale. Consuming the designator without recording it printed
+        // the raw bytes, so every framed TUI drew "lqqqk" instead of a box.
+
+        var charset = TerminalParser()
+        expect(
+            charset.parse(Array("\u{1B}(0lqk".utf8)) == [.print("\u{250C}"), .print("\u{2500}"), .print("\u{2510}")],
+            "ESC ( 0 maps l/q/k to the corner and line glyphs"
+        )
+        expect(
+            charset.parse(Array("xtuv".utf8)) == [.print("\u{2502}"), .print("\u{251C}"), .print("\u{2524}"), .print("\u{2534}")],
+            "the charset stays selected until it is changed back"
+        )
+        expect(
+            charset.parse(Array("\u{1B}(Blqk".utf8)) == [.print("l"), .print("q"), .print("k")],
+            "ESC ( B restores ASCII"
+        )
+
+        // Only 0x5F-0x7E is remapped; everything else passes through.
+        var partial = TerminalParser()
+        _ = partial.parse(Array("\u{1B}(0".utf8))
+        expect(
+            partial.parse(Array("AZ09".utf8)) == [.print("A"), .print("Z"), .print("0"), .print("9")],
+            "bytes outside the graphics range are unaffected by the charset"
+        )
+
+        // G1 plus shift-out/shift-in, the other way ncurses reaches the charset.
+        var shifted = TerminalParser()
+        _ = shifted.parse(Array("\u{1B})0".utf8))
+        expect(shifted.parse([0x0E]).isEmpty, "SO emits nothing itself")
+        expect(shifted.parse(Array("q".utf8)) == [.print("\u{2500}")], "SO selects G1, which was designated as graphics")
+        expect(shifted.parse([0x0F]).isEmpty, "SI emits nothing itself")
+        expect(shifted.parse(Array("q".utf8)) == [.print("q")], "SI returns to G0, still ASCII")
+
+        // RIS (ESC c) must restore ASCII. A TUI killed mid-draw leaves the
+        // graphics charset selected, which is exactly the garbled terminal that
+        // `reset` fixes -- and `reset` fixes it by sending RIS.
+        var afterReset = TerminalParser()
+        _ = afterReset.parse(Array("\u{1B}(0".utf8))
+        expect(afterReset.parse(Array("q".utf8)) == [.print("\u{2500}")], "precondition: graphics selected")
+        _ = afterReset.parse(Array("\u{1B}c".utf8))
+        expect(afterReset.parse(Array("q".utf8)) == [.print("q")], "RIS restores the ASCII charset")
+
+        var shiftedThenReset = TerminalParser()
+        _ = shiftedThenReset.parse(Array("\u{1B})0".utf8))
+        _ = shiftedThenReset.parse([0x0E])
+        _ = shiftedThenReset.parse(Array("\u{1B}c".utf8))
+        expect(
+            shiftedThenReset.parse(Array("q".utf8)) == [.print("q")],
+            "RIS also shifts back in to G0"
+        )
+
+        // End to end: a real ncurses frame reaches the grid as box drawing.
+        var boxScreen = TerminalScreen(rows: 3, columns: 6, scrollbackLimit: 10)
+        var boxParser = TerminalParser()
+        for action in boxParser.parse(Array("\u{1B}(0lqqqqk\u{1B}(B".utf8)) { boxScreen.apply(action) }
+        expect(
+            boxScreen.lineText(0) == "\u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}",
+            "a framed TUI renders as box drawing, not as 'lqqqqk'"
+        )
+
+        // MARK: - Screen: East-Asian-Wide symbol widths
+        //
+        // The 0x1F300+ emoji block and CJK were already handled; the wide
+        // symbols that CLI tools actually print for status were measured as one
+        // column, so the emulator advanced one less than the program computed
+        // and everything positioned later on that row drifted.
+
+        let wideSymbols: [(String, Character)] = [
+            ("U+231B hourglass", "\u{231B}"),
+            ("U+23F0 alarm clock", "\u{23F0}"),
+            ("U+26A1 high voltage", "\u{26A1}"),
+            ("U+2705 check mark button", "\u{2705}"),
+            ("U+274C cross mark", "\u{274C}"),
+            ("U+2728 sparkles", "\u{2728}"),
+            ("U+2753 question mark", "\u{2753}"),
+            ("U+2757 exclamation mark", "\u{2757}"),
+            ("U+2795 plus", "\u{2795}"),
+            ("U+2B1B black large square", "\u{2B1B}"),
+            ("U+2B50 star", "\u{2B50}"),
+            ("U+2B55 hollow red circle", "\u{2B55}"),
+        ]
+        for (name, character) in wideSymbols {
+            expect(TerminalScreen.columnWidth(of: character) == 2, "\(name) occupies two columns")
+        }
+
+        // Narrow neighbours in the same blocks must not be swept up.
+        let narrowSymbols: [(String, Character)] = [
+            ("U+2192 rightwards arrow", "\u{2192}"),
+            ("U+2713 check mark", "\u{2713}"),
+            ("U+2717 ballot X", "\u{2717}"),
+            ("U+26A0 warning sign", "\u{26A0}"),
+            ("U+2B1A dotted square", "\u{2B1A}"),
+        ]
+        for (name, character) in narrowSymbols {
+            expect(TerminalScreen.columnWidth(of: character) == 1, "\(name) stays one column")
+        }
+
+        // A status line a test runner would print lands where the child expects.
+        var statusScreen = TerminalScreen(rows: 2, columns: 20, scrollbackLimit: 5)
+        var statusParser = TerminalParser()
+        for action in statusParser.parse(Array("\u{2705} ok".utf8)) { statusScreen.apply(action) }
+        expect(
+            statusScreen.cell(atRow: 0, column: 2).character == " "
+                && statusScreen.cell(atRow: 0, column: 3).character == "o",
+            "a wide status glyph advances two columns, so following text is not off by one"
+        )
+
         // MARK: - Result
 
         if failures.isEmpty {

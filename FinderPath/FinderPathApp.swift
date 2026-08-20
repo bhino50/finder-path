@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var welcomeWindowController: WelcomeWindowController?
     private let actionRouter = FinderPathActionRouter()
+    /// Holds URLs that AppKit delivers before `applicationDidFinishLaunching`
+    /// has registered preference defaults and wired up `actionRouter`.
+    private var pendingURLs = PendingURLQueue()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Launch Services normally reuses a running app, but development builds,
@@ -54,6 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 to: $0
             )
         }) {
+            // Known gap: a URL that launched *this* process dies with it and is
+            // not forwarded to the winner, so the action is lost. That needs
+            // two FinderPath bundles registered for the scheme (a stale copy in
+            // Downloads alongside /Applications), which LaunchServices resolves
+            // independently of which one is running.
             existing.activate(options: [.activateIgnoringOtherApps])
             NSApp.terminate(nil)
             return
@@ -80,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Restore stored terminal sessions (metadata only; shells relaunch
         // lazily) before the menu builds so the Terminals section is complete.
         TerminalSessionStore.shared.loadPersistedSessions()
+        RecentPathsStore.shared.load()
         NSApp.setActivationPolicy(.accessory)
         statusItemController = StatusItemController()
         statusItemController?.onOpenWelcomeGuide = { [weak self] in
@@ -91,12 +100,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionRouter.onOpenConnectWindow = { [weak self] in
             self?.statusItemController?.openRemoteConnectionWindow()
         }
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
+
+        // Everything the router depends on now exists, so replay any URL that
+        // launched the app. AppKit hands the launch URL to application(_:open:)
+        // during finishLaunching — before this method returns — so without this
+        // replay a cold-launch finderpath:// action silently does nothing and
+        // the user has to trigger it a second time.
+        for url in pendingURLs.drain() {
+            actionRouter.handle(url: url)
+        }
     }
 
     private static func shouldYieldCurrentInstance(
@@ -126,22 +138,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Shells do not outlive the app; session metadata stays persisted.
         TerminalSessionStore.shared.terminateAll()
-        NSAppleEventManager.shared().removeEventHandler(
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
     }
 
-    @objc private func handleGetURLEvent(
-        _ event: NSAppleEventDescriptor,
-        withReplyEvent replyEvent: NSAppleEventDescriptor
-    ) {
-        guard let urlString = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-              let url = URL(string: urlString) else {
-            return
+    /// Single entry point for every `finderpath://` URL, whether it launched
+    /// the app or arrived while it was already running.
+    ///
+    /// This replaces a manual `kAEGetURL` handler that was registered at the
+    /// end of `applicationDidFinishLaunching`. AppKit dispatches the launch URL
+    /// before that line ran, so the handler was installed microseconds too late
+    /// and every URL that started the app was dropped. AppKit's own GetURL
+    /// handler is installed early and forwards here, so this sees both cases;
+    /// URLs that arrive before the router is wired up are buffered and replayed
+    /// at the end of `applicationDidFinishLaunching`.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in pendingURLs.accept(urls) {
+            actionRouter.handle(url: url)
         }
-
-        actionRouter.handle(url: url)
     }
 
     func showWelcomeGuide() {
@@ -156,6 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 final class FinderPathActionRouter {
     var onOpenConnectWindow: (() -> Void)?
+    private var launchesInFlight: Set<String> = []
+    private var lastLaunchAt: [String: Date] = [:]
+    private static let minimumLaunchInterval: TimeInterval = 2
 
     func handle(url: URL) {
         guard url.scheme?.lowercased() == "finderpath" else { return }
@@ -164,38 +179,65 @@ final class FinderPathActionRouter {
         case "connect", "connect-to-server":
             onOpenConnectWindow?()
         case "open-ghostty", "ghostty":
+            let action = "ghostty"
+            guard FinderPathPreferences.allowExternalLaunchURLs,
+                  beginExternalLaunch(action) else { return }
             Task { @MainActor in
-                let path = await FinderBridge.fetchCurrentPath()
-                guard !path.hasPrefix("Finder AppleScript error:") else {
-                    self.presentFailure(path, displayName: "Ghostty")
+                let result = await FinderBridge.fetchCurrentPath()
+                guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.finishExternalLaunch(action)
+                    self.presentFailure(result.path, displayName: "Ghostty")
                     return
                 }
 
-                TerminalBridge.openGhostty(at: path) { error in
-                    guard let error else { return }
+                TerminalBridge.openGhostty(at: result.path) { error in
                     Task { @MainActor in
-                        self.presentFailure(error, displayName: "Ghostty")
+                        self.finishExternalLaunch(action)
+                        if let error {
+                            self.presentFailure(error, displayName: "Ghostty")
+                        }
                     }
                 }
             }
         case "open-cmux", "cmux":
+            let action = "cmux"
+            guard FinderPathPreferences.allowExternalLaunchURLs,
+                  beginExternalLaunch(action) else { return }
             Task { @MainActor in
-                let path = await FinderBridge.fetchCurrentPath()
-                guard !path.hasPrefix("Finder AppleScript error:") else {
-                    self.presentFailure(path, displayName: "cmux")
+                let result = await FinderBridge.fetchCurrentPath()
+                guard !result.path.hasPrefix("Finder AppleScript error:") else {
+                    self.finishExternalLaunch(action)
+                    self.presentFailure(result.path, displayName: "cmux")
                     return
                 }
 
-                TerminalBridge.openCmux(at: path) { error in
-                    guard let error else { return }
+                TerminalBridge.openCmux(at: result.path) { error in
                     Task { @MainActor in
-                        self.presentFailure(error, displayName: "cmux")
+                        self.finishExternalLaunch(action)
+                        if let error {
+                            self.presentFailure(error, displayName: "cmux")
+                        }
                     }
                 }
             }
         default:
             break
         }
+    }
+
+    private func beginExternalLaunch(_ action: String, now: Date = Date()) -> Bool {
+        guard !launchesInFlight.contains(action) else { return false }
+        if let previous = lastLaunchAt[action],
+           now.timeIntervalSince(previous) < Self.minimumLaunchInterval {
+            return false
+        }
+        launchesInFlight.insert(action)
+        lastLaunchAt[action] = now
+        return true
+    }
+
+    private func finishExternalLaunch(_ action: String) {
+        launchesInFlight.remove(action)
     }
 
     private func actionName(for url: URL) -> String {
@@ -238,91 +280,77 @@ final class FinderPathState {
         refreshGeneration += 1
         let generation = refreshGeneration
         Task { @MainActor [weak self] in
-            let path = await FinderBridge.fetchCurrentPath()
+            let result = await FinderBridge.fetchCurrentPath()
             guard let self, generation == self.refreshGeneration else { return }
-            self.currentPath = path
+            self.currentPath = result.path
+            // Only folders that were genuinely open in a Finder window are worth
+            // remembering. The desktop substitution would otherwise dominate the
+            // history, because opening the menu to reach Settings or a terminal
+            // returns it every time.
+            if !result.isFallback, self.hasCopyablePath {
+                RecentPathsStore.shared.record(result.path)
+            }
             onChange?()
         }
     }
 
-    func copyCurrentPath() {
-        guard hasCopyablePath else { return }
+    func copyCurrentPath(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        copyToPasteboard(currentPath)
+        copyToPasteboard(target)
     }
 
-    func copyChangeDirectoryCommand() {
-        guard hasCopyablePath else { return }
+    func copyChangeDirectoryCommand(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        copyToPasteboard("cd \(ShellCommand.argument(currentPath, quoteStyle: FinderPathPreferences.cdQuoteStyle))")
+        copyToPasteboard("cd \(ShellCommand.argument(target, quoteStyle: FinderPathPreferences.cdQuoteStyle))")
     }
 
-    func openInTerminal() {
-        guard hasCopyablePath else { return }
+    func openInTerminal(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.open(at: currentPath) { error in
+        TerminalBridge.open(at: target) { error in
             self.presentLaunchFailure(error, displayName: "Terminal")
         }
     }
 
-    func openInGhostty() {
-        guard hasCopyablePath else { return }
+    func openInGhostty(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.openGhostty(at: currentPath) { error in
+        TerminalBridge.openGhostty(at: target) { error in
             self.presentLaunchFailure(error, displayName: "Ghostty")
         }
     }
 
-    func openInCmux() {
-        guard hasCopyablePath else { return }
+    func openInCmux(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        TerminalBridge.openCmux(at: currentPath) { error in
+        TerminalBridge.openCmux(at: target) { error in
             self.presentLaunchFailure(error, displayName: "cmux")
         }
     }
 
-    func openWithCodex() {
-        guard hasCopyablePath else { return }
+    /// Opens the folder in Finder. Passing nil for the file selects nothing and
+    /// simply reveals the folder itself.
+    func revealInFinder(at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.codexExecutable)
-            .resolvedPath ?? FinderPathPreferences.codexExecutable
-
-        TerminalBridge.openAgent(
-            displayName: "Codex",
-            executable: executable,
-            at: currentPath
-        ) { error in
-            self.presentLaunchFailure(error, displayName: "Codex")
-        }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: target)
     }
 
-    func openWithClaude() {
-        guard hasCopyablePath else { return }
+    /// One launcher for all three agents: the three previous methods differed
+    /// only in which preference they read and which name they reported.
+    func openWithAgent(named name: String, executable: String, at path: String? = nil) {
+        guard let target = resolvedTarget(path) else { return }
 
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.claudeExecutable)
-            .resolvedPath ?? FinderPathPreferences.claudeExecutable
-
-        TerminalBridge.openAgent(
-            displayName: "Claude",
-            executable: executable,
-            at: currentPath
-        ) { error in
-            self.presentLaunchFailure(error, displayName: "Claude")
-        }
-    }
-
-    func openWithHermes() {
-        guard hasCopyablePath else { return }
-
-        let executable = AgentLauncher.availability(for: FinderPathPreferences.hermesExecutable)
-            .resolvedPath ?? FinderPathPreferences.hermesExecutable
+        let resolvedExecutable = AgentLauncher.availability(for: executable).resolvedPath ?? executable
 
         TerminalBridge.openAgent(
-            displayName: "Hermes",
-            executable: executable,
-            at: currentPath
+            displayName: name,
+            executable: resolvedExecutable,
+            at: target
         ) { error in
-            self.presentLaunchFailure(error, displayName: "Hermes")
+            self.presentLaunchFailure(error, displayName: name)
         }
     }
 
@@ -341,6 +369,14 @@ final class FinderPathState {
 
     var hasCopyablePath: Bool {
         !currentPath.isEmpty && !currentPath.hasPrefix("Finder AppleScript error:")
+    }
+
+    /// Recent-path rows pass an explicit folder; every other caller acts on the
+    /// live Finder path. A nil argument therefore means "whatever Finder is
+    /// showing", and yields nil when there is nothing usable to act on.
+    private func resolvedTarget(_ path: String?) -> String? {
+        if let path, !path.isEmpty { return path }
+        return hasCopyablePath ? currentPath : nil
     }
 
     private func copyToPasteboard(_ string: String) {

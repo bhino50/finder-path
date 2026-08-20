@@ -34,6 +34,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showRefreshItemKey) private var showRefreshItem = true
     @AppStorage(FinderPathPreferences.showCopyPathItemKey) private var showCopyPathItem = true
     @AppStorage(FinderPathPreferences.showCopyCDItemKey) private var showCopyCDItem = true
+    @AppStorage(FinderPathPreferences.showRecentPathsItemKey) private var showRecentPathsItem = true
     @AppStorage(FinderPathPreferences.showOpenTerminalItemKey) private var showOpenTerminalItem = true
     @AppStorage(FinderPathPreferences.showOpenGhosttyItemKey) private var showOpenGhosttyItem = true
     @AppStorage(FinderPathPreferences.showOpenWithCodexItemKey) private var showOpenWithCodexItem = true
@@ -60,6 +61,7 @@ struct SettingsView: View {
     @AppStorage(FinderPathPreferences.showTerminalsSectionKey) private var showTerminalsSection = true
     @AppStorage(FinderPathPreferences.rightClickOpensTerminalsKey) private var rightClickOpensTerminals = true
     @AppStorage(FinderPathPreferences.hoverShowsTerminalsKey) private var hoverShowsTerminals = true
+    @AppStorage(FinderPathPreferences.allowExternalLaunchURLsKey) private var allowExternalLaunchURLs = false
     @AppStorage(FinderPathPreferences.terminalFontSizeKey) private var terminalFontSize = 12.0
     @AppStorage(FinderPathPreferences.terminalScrollbackLimitKey) private var terminalScrollbackLimit = 2000
     @AppStorage(FinderPathPreferences.terminalShellOverrideKey) private var terminalShellOverride = ""
@@ -82,6 +84,12 @@ struct SettingsView: View {
             Section("General") {
                 Toggle("Launch FinderPath at login", isOn: $launchAtLogin)
 
+                Toggle("Allow shortcut URLs to launch terminal apps", isOn: $allowExternalLaunchURLs)
+
+                Text("Enables finderpath://open-ghostty and finderpath://open-cmux for trusted keyboard tools. Leave this off unless you use those shortcuts; finderpath://connect remains available.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
                 if let launchAtLoginError {
                     Text(launchAtLoginError)
                         .font(.footnote)
@@ -94,6 +102,7 @@ struct SettingsView: View {
                 Toggle("Show Refresh", isOn: $showRefreshItem)
                 Toggle("Show Copy Path", isOn: $showCopyPathItem)
                 Toggle("Show Copy cd Command", isOn: $showCopyCDItem)
+                Toggle("Show Recent Paths", isOn: $showRecentPathsItem)
                 Toggle("Show Open in cmux", isOn: $showOpenCmuxItem)
                 Toggle("Show Open in Ghostty", isOn: $showOpenGhosttyItem)
                 Toggle("Show Open in Terminal", isOn: $showOpenTerminalItem)
@@ -304,6 +313,7 @@ struct SettingsView: View {
         showRefreshItem = true
         showCopyPathItem = true
         showCopyCDItem = true
+        showRecentPathsItem = true
         showOpenTerminalItem = true
         showOpenGhosttyItem = true
         showOpenWithCodexItem = true
@@ -333,6 +343,7 @@ struct SettingsView: View {
         terminalScrollbackLimit = 2000
         terminalShellOverride = ""
         terminalOptionAsMeta = false
+        allowExternalLaunchURLs = false
         updateManifestURL = FinderPathPreferences.defaultUpdateManifestURL
         scheduleAgentAvailabilityCheck()
     }
@@ -581,7 +592,7 @@ struct WelcomeView: View {
         NSApp.activate(ignoringOtherApps: true)
         isCheckingFinder = true
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath()
+            finderPath = await FinderBridge.fetchCurrentPath().path
             isCheckingFinder = false
             if !finderAccessGranted {
                 FinderBridge.openAutomationSettings()
@@ -591,7 +602,7 @@ struct WelcomeView: View {
 
     private func refreshFinderAccess() {
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath()
+            finderPath = await FinderBridge.fetchCurrentPath().path
         }
     }
 }

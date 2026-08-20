@@ -7,6 +7,9 @@ PBXPROJ="$PROJECT_PATH/project.pbxproj"
 SCHEME="FinderPath"
 CONFIGURATION="Release"
 APP_NAME="FinderPath"
+EXPECTED_BUNDLE_ID="io.github.bhino50.FinderPath"
+EXPECTED_TEAM_ID="VJPMCBH6NX"
+SIGNING_REQUIREMENT="anchor apple generic and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\""
 
 # All project configurations must agree so the artifact name cannot drift from
 # the version embedded in the app bundle.
@@ -39,6 +42,8 @@ ENTITLEMENTS="$ROOT_DIR/FinderPath.entitlements"
 DMG_STAGING_DIR="$ROOT_DIR/.build/dmg-staging"
 VERSION_JSON="$ROOT_DIR/download-site/version.json"
 DOWNLOAD_INDEX="$ROOT_DIR/download-site/index.html"
+ARTIFACT_VERIFY_DIR="$ROOT_DIR/.build/artifact-verification"
+ARTIFACT_VERIFY_MOUNT="$ROOT_DIR/.build/artifact-verification-mount"
 
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARY_KEY="${NOTARY_KEY:-}"
@@ -116,7 +121,10 @@ if [[ -z "${DEVELOPER_DIR:-}" ]]; then
 fi
 
 cleanup() {
-  rm -rf "$DMG_STAGING_DIR"
+  if /sbin/mount | /usr/bin/grep -F " on $ARTIFACT_VERIFY_MOUNT " >/dev/null 2>&1; then
+    /usr/bin/hdiutil detach "$ARTIFACT_VERIFY_MOUNT" -force >/dev/null 2>&1 || true
+  fi
+  rm -rf "$DMG_STAGING_DIR" "$ARTIFACT_VERIFY_DIR" "$ARTIFACT_VERIFY_MOUNT"
   if [[ "$PUBLIC_RELEASE" == true && "$PUBLIC_PROMOTION_COMPLETE" != true ]]; then
     rm -f "$DMG_PATH" "$APP_ARCHIVE_PATH"
   fi
@@ -131,6 +139,62 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+verify_signed_identity() {
+  local artifact_path="$1"
+  local artifact_label="$2"
+  local signature_details team_identifier
+
+  /usr/bin/codesign --verify --strict -R="$SIGNING_REQUIREMENT" --verbose=2 "$artifact_path"
+  signature_details="$(/usr/bin/codesign -dvvv "$artifact_path" 2>&1)"
+  team_identifier="$(
+    /usr/bin/printf '%s\n' "$signature_details" |
+      /usr/bin/awk -F= '/^TeamIdentifier=/{print $2; exit}'
+  )"
+  if [[ "$team_identifier" != "$EXPECTED_TEAM_ID" ]]; then
+    echo "$artifact_label TeamIdentifier must be $EXPECTED_TEAM_ID; found ${team_identifier:-<none>}." >&2
+    exit 1
+  fi
+  if ! /usr/bin/printf '%s\n' "$signature_details" |
+      /usr/bin/grep '^Authority=Developer ID Application:' >/dev/null; then
+    echo "$artifact_label is not signed with a Developer ID Application certificate." >&2
+    exit 1
+  fi
+}
+
+verify_app_identity() {
+  local app_path="$1"
+  local bundle_id short_version
+
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist")"
+  short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")"
+  if [[ "$bundle_id" != "$EXPECTED_BUNDLE_ID" ]]; then
+    echo "App bundle identifier must be $EXPECTED_BUNDLE_ID; found $bundle_id." >&2
+    exit 1
+  fi
+  if [[ "$short_version" != "$VERSION" ]]; then
+    echo "App version must be $VERSION; found $short_version." >&2
+    exit 1
+  fi
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+  verify_signed_identity "$app_path" "App"
+}
+
+verify_public_artifact_contents() {
+  rm -rf "$ARTIFACT_VERIFY_DIR" "$ARTIFACT_VERIFY_MOUNT"
+  mkdir -p "$ARTIFACT_VERIFY_DIR" "$ARTIFACT_VERIFY_MOUNT"
+
+  /usr/bin/ditto -xk "$APP_ARCHIVE_WORK_PATH" "$ARTIFACT_VERIFY_DIR"
+  verify_app_identity "$ARTIFACT_VERIFY_DIR/$APP_NAME.app"
+  rm -rf "$ARTIFACT_VERIFY_DIR"
+
+  /usr/bin/hdiutil attach "$DMG_WORK_PATH" \
+    -nobrowse -readonly -noautoopen \
+    -mountpoint "$ARTIFACT_VERIFY_MOUNT" >/dev/null
+  verify_app_identity "$ARTIFACT_VERIFY_MOUNT/$APP_NAME.app"
+  /usr/bin/hdiutil detach "$ARTIFACT_VERIFY_MOUNT" >/dev/null
+  rm -rf "$ARTIFACT_VERIFY_MOUNT"
+}
 
 update_public_manifest() {
   # The updater lives in its own executable file so CI can run it against
@@ -184,6 +248,9 @@ if [[ -n "${DEVELOPER_ID:-}" ]] && ! /usr/bin/codesign -dvv "$APP_PATH" 2>&1 | /
   echo "Developer ID app signature is missing a trusted timestamp." >&2
   exit 1
 fi
+if [[ -n "${DEVELOPER_ID:-}" ]]; then
+  verify_app_identity "$APP_PATH"
+fi
 
 if [[ "$PUBLIC_RELEASE" == true ]]; then
   echo "Submitting a temporary app ZIP to Apple notarization using $NOTARY_AUTH_DESCRIPTION"
@@ -196,7 +263,7 @@ if [[ "$PUBLIC_RELEASE" == true ]]; then
   echo "Stapling, validating, and requiring Gatekeeper acceptance for the app..."
   /usr/bin/xcrun stapler staple "$APP_PATH"
   /usr/bin/xcrun stapler validate "$APP_PATH"
-  /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+  verify_app_identity "$APP_PATH"
   /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH"
   /usr/bin/ditto -c -k --norsrc --keepParent "$APP_PATH" "$APP_ARCHIVE_WORK_PATH"
 else
@@ -232,6 +299,7 @@ if [[ -n "${DEVELOPER_ID:-}" ]]; then
   echo "Signing the DMG with Developer ID..."
   /usr/bin/codesign --force --sign "$DEVELOPER_ID" "$DMG_WORK_PATH"
   /usr/bin/codesign --verify --strict --verbose=2 "$DMG_WORK_PATH"
+  verify_signed_identity "$DMG_WORK_PATH" "DMG"
   if ! /usr/bin/codesign -dvv "$DMG_WORK_PATH" 2>&1 | /usr/bin/grep '^Timestamp=' >/dev/null; then
     echo "Developer ID DMG signature is missing a trusted timestamp." >&2
     exit 1
@@ -247,7 +315,7 @@ if [[ "$PUBLIC_RELEASE" == true ]]; then
   echo "Stapling and validating the DMG notarization ticket..."
   /usr/bin/xcrun stapler staple "$DMG_WORK_PATH"
   /usr/bin/xcrun stapler validate "$DMG_WORK_PATH"
-  /usr/bin/codesign --verify --strict --verbose=2 "$DMG_WORK_PATH"
+  verify_signed_identity "$DMG_WORK_PATH" "DMG"
 
   echo "Requiring Gatekeeper acceptance for the DMG..."
   /usr/sbin/spctl --assess \
@@ -255,6 +323,9 @@ if [[ "$PUBLIC_RELEASE" == true ]]; then
     --context context:primary-signature \
     --verbose=4 \
     "$DMG_WORK_PATH"
+
+  echo "Verifying the exact app identity inside the final ZIP and DMG..."
+  verify_public_artifact_contents
 
   # Promote both independently validated artifacts to clean public filenames
   # only after every app and DMG trust check passes.

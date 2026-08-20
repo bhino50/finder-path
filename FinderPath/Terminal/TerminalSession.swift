@@ -29,6 +29,15 @@ final class TerminalSession: Identifiable {
     private(set) var status: Status = .notStarted
     private(set) var screen: TerminalScreen
 
+    /// Bumped whenever `screen` is replaced wholesale rather than mutated.
+    ///
+    /// Views hold absolute line numbers — selection anchors and the
+    /// scrolled-back viewport — and those only mean anything within a single
+    /// screen's lifetime. `restart()` swaps in a fresh screen on the *same*
+    /// session object, so a view watching for a new session never notices and
+    /// would keep applying dead line numbers to live text.
+    private(set) var screenGeneration = 0
+
     var onScreenUpdate: (() -> Void)?
     var onStatusChange: (() -> Void)?
     /// Fires when the terminal title (OSC 0/2) changes, so the tab can follow
@@ -107,6 +116,9 @@ final class TerminalSession: Identifiable {
             columns: screen.columns,
             scrollbackLimit: scrollbackLimit
         )
+        // Line numbering restarts with the screen; tell observers before they
+        // redraw with anchors that belong to the screen just discarded.
+        screenGeneration += 1
         onScreenUpdate?()
         spawn()
     }
@@ -322,17 +334,58 @@ final class TerminalSession: Identifiable {
 /// Coalesces PTY reads so a burst of output costs one main-queue hop instead
 /// of one per 4 KB chunk. The read source delivers on a serial queue and the
 /// drain runs on the serial main queue, so byte order is preserved end to end.
-private final class PTYOutputBuffer: @unchecked Sendable {
+/// A noisy command must not allocate without bound while the UI is busy, so
+/// bytes beyond the high-water mark are dropped until the scheduled drain.
+final class PTYOutputBuffer: @unchecked Sendable {
+    static let maximumPendingBytes = 1_024 * 1_024
     private let lock = NSLock()
     private var pending: [UInt8] = []
     private var drainScheduled = false
+    private var totalDropped = 0
+
+    var bufferedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.count
+    }
+
+    var droppedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalDropped
+    }
 
     /// Appends bytes and reports whether the caller now owns scheduling the
     /// drain. Only one drain is ever outstanding, however fast output arrives.
+    ///
+    /// Overflow costs the OLDEST bytes. Discarding the newest instead — the
+    /// obvious reading of a high-water mark — leaves the screen showing lines
+    /// from the middle of the output followed by the shell prompt, which a user
+    /// cannot distinguish from the command genuinely ending there. Losing the
+    /// oldest bytes costs scrollback the user can see is missing, and keeps the
+    /// tail (results, errors, the prompt) that they are actually waiting for.
     func appendAndClaimDrain(_ bytes: [UInt8]) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        pending.append(contentsOf: bytes)
+
+        // A single burst larger than the whole window keeps only its own tail.
+        let accepted = bytes.count > Self.maximumPendingBytes
+            ? Array(bytes.suffix(Self.maximumPendingBytes))
+            : bytes
+        let discardedFromBurst = bytes.count - accepted.count
+
+        // Anything still over the mark comes off the front of what is already
+        // buffered, oldest first.
+        let overflowing = max(pending.count + accepted.count - Self.maximumPendingBytes, 0)
+        let evicted = min(overflowing, pending.count)
+        if evicted > 0 {
+            pending.removeFirst(evicted)
+        }
+        pending.append(contentsOf: accepted)
+
+        let dropped = discardedFromBurst + evicted
+        let (newTotal, overflow) = totalDropped.addingReportingOverflow(dropped)
+        totalDropped = overflow ? Int.max : newTotal
         guard !drainScheduled else { return false }
         drainScheduled = true
         return true
