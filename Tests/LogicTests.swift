@@ -492,6 +492,54 @@ struct FinderPathLogicTests {
             "decoded history removes standardized duplicates"
         )
 
+        // MARK: - Pending URL queue
+        //
+        // AppKit delivers a launch URL before applicationDidFinishLaunching
+        // finishes wiring up preferences and the action router, so URLs that
+        // arrive early must be buffered and replayed rather than handled
+        // against half-built state (or dropped, as they were before).
+
+        var queue = PendingURLQueue()
+        let connectURL = URL(string: "finderpath://connect")!
+        let cmuxURL = URL(string: "finderpath://open-cmux")!
+
+        expect(
+            queue.accept([connectURL]).isEmpty,
+            "URLs arriving before the app is ready are not handled immediately"
+        )
+        expect(!queue.isReady, "queue starts out not ready")
+
+        expect(queue.accept([cmuxURL]).isEmpty, "a second early URL is also buffered")
+
+        let drained = queue.drain()
+        expect(drained == [connectURL, cmuxURL], "drain replays buffered URLs in arrival order")
+        expect(queue.isReady, "drain marks the queue ready")
+        expect(queue.drain().isEmpty, "draining twice does not replay URLs again")
+
+        expect(
+            queue.accept([connectURL]) == [connectURL],
+            "once ready, URLs pass straight through"
+        )
+
+        // A malicious or stuck caller must not be able to grow the buffer
+        // without bound while the app is still launching.
+        var boundedQueue = PendingURLQueue()
+        let flood = (0..<(PendingURLQueue.capacity + 25)).map {
+            URL(string: "finderpath://connect?n=\($0)")!
+        }
+        expect(boundedQueue.accept(flood).isEmpty, "flood of early URLs is buffered, not handled")
+        expect(
+            boundedQueue.drain().count == PendingURLQueue.capacity,
+            "early URL buffer is capped at PendingURLQueue.capacity"
+        )
+
+        // The queue is deliberately scheme-agnostic; FinderPathActionRouter
+        // owns scheme validation, so nothing is silently discarded here.
+        var passthroughQueue = PendingURLQueue()
+        let foreignURL = URL(string: "https://example.com")!
+        expect(passthroughQueue.accept([foreignURL]).isEmpty, "foreign URL is buffered like any other")
+        expect(passthroughQueue.drain() == [foreignURL], "queue does not filter by scheme")
+
         if failures.isEmpty {
             print("FinderPath logic tests passed (\(assertionCount) assertions).")
             return

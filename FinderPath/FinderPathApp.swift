@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var welcomeWindowController: WelcomeWindowController?
     private let actionRouter = FinderPathActionRouter()
+    /// Holds URLs that AppKit delivers before `applicationDidFinishLaunching`
+    /// has registered preference defaults and wired up `actionRouter`.
+    private var pendingURLs = PendingURLQueue()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Launch Services normally reuses a running app, but development builds,
@@ -54,6 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 to: $0
             )
         }) {
+            // Known gap: a URL that launched *this* process dies with it and is
+            // not forwarded to the winner, so the action is lost. That needs
+            // two FinderPath bundles registered for the scheme (a stale copy in
+            // Downloads alongside /Applications), which LaunchServices resolves
+            // independently of which one is running.
             existing.activate(options: [.activateIgnoringOtherApps])
             NSApp.terminate(nil)
             return
@@ -92,12 +100,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionRouter.onOpenConnectWindow = { [weak self] in
             self?.statusItemController?.openRemoteConnectionWindow()
         }
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
+
+        // Everything the router depends on now exists, so replay any URL that
+        // launched the app. AppKit hands the launch URL to application(_:open:)
+        // during finishLaunching — before this method returns — so without this
+        // replay a cold-launch finderpath:// action silently does nothing and
+        // the user has to trigger it a second time.
+        for url in pendingURLs.drain() {
+            actionRouter.handle(url: url)
+        }
     }
 
     private static func shouldYieldCurrentInstance(
@@ -127,22 +138,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Shells do not outlive the app; session metadata stays persisted.
         TerminalSessionStore.shared.terminateAll()
-        NSAppleEventManager.shared().removeEventHandler(
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
     }
 
-    @objc private func handleGetURLEvent(
-        _ event: NSAppleEventDescriptor,
-        withReplyEvent replyEvent: NSAppleEventDescriptor
-    ) {
-        guard let urlString = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-              let url = URL(string: urlString) else {
-            return
+    /// Single entry point for every `finderpath://` URL, whether it launched
+    /// the app or arrived while it was already running.
+    ///
+    /// This replaces a manual `kAEGetURL` handler that was registered at the
+    /// end of `applicationDidFinishLaunching`. AppKit dispatches the launch URL
+    /// before that line ran, so the handler was installed microseconds too late
+    /// and every URL that started the app was dropped. AppKit's own GetURL
+    /// handler is installed early and forwards here, so this sees both cases;
+    /// URLs that arrive before the router is wired up are buffered and replayed
+    /// at the end of `applicationDidFinishLaunching`.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in pendingURLs.accept(urls) {
+            actionRouter.handle(url: url)
         }
-
-        actionRouter.handle(url: url)
     }
 
     func showWelcomeGuide() {
