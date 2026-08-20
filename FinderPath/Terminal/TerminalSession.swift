@@ -345,14 +345,33 @@ final class PTYOutputBuffer: @unchecked Sendable {
 
     /// Appends bytes and reports whether the caller now owns scheduling the
     /// drain. Only one drain is ever outstanding, however fast output arrives.
+    ///
+    /// Overflow costs the OLDEST bytes. Discarding the newest instead — the
+    /// obvious reading of a high-water mark — leaves the screen showing lines
+    /// from the middle of the output followed by the shell prompt, which a user
+    /// cannot distinguish from the command genuinely ending there. Losing the
+    /// oldest bytes costs scrollback the user can see is missing, and keeps the
+    /// tail (results, errors, the prompt) that they are actually waiting for.
     func appendAndClaimDrain(_ bytes: [UInt8]) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        let available = max(Self.maximumPendingBytes - pending.count, 0)
-        if available > 0 {
-            pending.append(contentsOf: bytes.prefix(available))
+
+        // A single burst larger than the whole window keeps only its own tail.
+        let accepted = bytes.count > Self.maximumPendingBytes
+            ? Array(bytes.suffix(Self.maximumPendingBytes))
+            : bytes
+        let discardedFromBurst = bytes.count - accepted.count
+
+        // Anything still over the mark comes off the front of what is already
+        // buffered, oldest first.
+        let overflowing = max(pending.count + accepted.count - Self.maximumPendingBytes, 0)
+        let evicted = min(overflowing, pending.count)
+        if evicted > 0 {
+            pending.removeFirst(evicted)
         }
-        let dropped = max(bytes.count - available, 0)
+        pending.append(contentsOf: accepted)
+
+        let dropped = discardedFromBurst + evicted
         let (newTotal, overflow) = totalDropped.addingReportingOverflow(dropped)
         totalDropped = overflow ? Int.max : newTotal
         guard !drainScheduled else { return false }

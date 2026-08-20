@@ -628,6 +628,20 @@ struct TerminalScreen {
                 0,
                 min(saved.cursorRow - targetRows + 1, saved.grid.count - targetRows)
             )
+            // Bank the parked screen's dropped rows exactly as the live path
+            // above does. Skipping this loses them from the grid *and* from
+            // scrollback: shrink the window while a TUI holds the alternate
+            // screen and the build output that scrolled off is unreachable
+            // forever, even though the identical shrink at a shell prompt keeps
+            // it.
+            if savedDroppedTop > 0, scrollbackLimit > 0 {
+                for row in 0..<min(savedDroppedTop, saved.grid.count) {
+                    scrollback.append(saved.grid[row])
+                }
+                if scrollback.count > scrollbackLimit {
+                    scrollback.removeFirst(scrollback.count - scrollbackLimit)
+                }
+            }
             savedPrimary = (
                 Self.resizeGrid(
                     saved.grid,

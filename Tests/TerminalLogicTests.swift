@@ -948,18 +948,113 @@ struct FinderPathTerminalTests {
         )
         expect(screen.cursorColumn == 1, "discarded combining marks do not advance the cursor")
 
-        // The read queue can outrun the main actor. Coalescing stays bounded
-        // and records the overflow while preserving the accepted prefix.
+        // The read queue can outrun the main actor. Coalescing stays bounded and
+        // records the overflow, and what it discards is the OLDEST output.
+        // Keeping a stale prefix and dropping the tail instead leaves the screen
+        // showing mid-stream lines followed by the prompt, which the user cannot
+        // tell apart from the command genuinely ending there.
         let outputBuffer = PTYOutputBuffer()
-        let oversizedOutput = Array(repeating: UInt8(ascii: "x"), count: PTYOutputBuffer.maximumPendingBytes + 4_096)
+        let tailMarker = Array("TAIL".utf8)
+        let oversizedOutput =
+            Array(repeating: UInt8(ascii: "x"), count: PTYOutputBuffer.maximumPendingBytes + 4_096 - tailMarker.count)
+            + tailMarker
         expect(outputBuffer.appendAndClaimDrain(oversizedOutput), "the first PTY burst claims one drain")
         expect(
             outputBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
             "PTY buffering stops at its high-water mark"
         )
         expect(outputBuffer.droppedByteCount == 4_096, "PTY overflow is counted")
-        expect(outputBuffer.takeAll().count == PTYOutputBuffer.maximumPendingBytes, "the bounded PTY prefix drains")
+        let drainedBurst = outputBuffer.takeAll()
+        expect(drainedBurst.count == PTYOutputBuffer.maximumPendingBytes, "the bounded PTY window drains")
+        expect(
+            Array(drainedBurst.suffix(tailMarker.count)) == tailMarker,
+            "an oversized burst keeps its newest bytes, not its stale prefix"
+        )
         expect(outputBuffer.bufferedByteCount == 0, "draining releases buffered PTY memory")
+
+        // Overflow that builds up across several reads evicts the oldest bytes
+        // too, so the most recent output always survives to reach the screen.
+        let steadyBuffer = PTYOutputBuffer()
+        _ = steadyBuffer.appendAndClaimDrain(
+            Array(repeating: UInt8(ascii: "o"), count: PTYOutputBuffer.maximumPendingBytes)
+        )
+        let newestMarker = Array("NEWEST".utf8)
+        _ = steadyBuffer.appendAndClaimDrain(newestMarker)
+        expect(
+            steadyBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
+            "a full buffer stays at the high-water mark after more output arrives"
+        )
+        expect(steadyBuffer.droppedByteCount == newestMarker.count, "evicted older bytes are counted as dropped")
+        let drainedSteady = steadyBuffer.takeAll()
+        expect(
+            Array(drainedSteady.suffix(newestMarker.count)) == newestMarker,
+            "bytes arriving at a full buffer evict the oldest instead of being discarded"
+        )
+
+        // MARK: - Screen: alt-screen resize preserves the parked primary screen
+        //
+        // Shrinking while a TUI holds the alternate screen must push the primary
+        // screen's dropped rows into scrollback, exactly as the same shrink does
+        // at the shell prompt. Without that, a build log that scrolls off during
+        // a resize is gone from the grid AND from scrollback, so the user cannot
+        // scroll back to it at all.
+
+        var parked = TerminalScreen(rows: 6, columns: 10, scrollbackLimit: 500)
+        for index in 1...6 {
+            for character in "LINE\(index)" { parked.apply(.print(character)) }
+            if index < 6 {
+                parked.apply(.lineFeed)
+                parked.apply(.carriageReturn)
+            }
+        }
+        expect(parked.scrollbackCount == 0, "six lines on a six-row screen do not scroll yet")
+
+        // Same shrink at the shell prompt, for parity.
+        var atPrompt = parked
+        atPrompt.resize(rows: 2, columns: 10)
+        let promptScrollback = atPrompt.scrollbackCount
+        expect(promptScrollback == 4, "shrinking at the prompt banks the four dropped rows")
+
+        parked.apply(.setMode(.alternateScreen, true))
+        for character in "TUI" { parked.apply(.print(character)) }
+        parked.resize(rows: 2, columns: 10)
+        parked.apply(.setMode(.alternateScreen, false))
+        expect(
+            parked.scrollbackCount == promptScrollback,
+            "shrinking behind a TUI banks the same rows as shrinking at the prompt"
+        )
+        let oldestParked = String(parked.scrollbackLine(0).map(\.character))
+            .trimmingCharacters(in: .whitespaces)
+        expect(oldestParked == "LINE1", "the oldest parked primary row is recoverable from scrollback")
+
+        // The scrollback limit still wins: a parked screen cannot push the ring
+        // past its cap.
+        var cappedPark = TerminalScreen(rows: 8, columns: 6, scrollbackLimit: 2)
+        for index in 1...8 {
+            for character in "P\(index)" { cappedPark.apply(.print(character)) }
+            if index < 8 {
+                cappedPark.apply(.lineFeed)
+                cappedPark.apply(.carriageReturn)
+            }
+        }
+        cappedPark.apply(.setMode(.alternateScreen, true))
+        cappedPark.resize(rows: 2, columns: 6)
+        cappedPark.apply(.setMode(.alternateScreen, false))
+        expect(cappedPark.scrollbackCount <= 2, "parked rows still respect scrollbackLimit")
+
+        // A screen with no scrollback at all must not accumulate parked rows.
+        var noScrollbackPark = TerminalScreen(rows: 6, columns: 6, scrollbackLimit: 0)
+        for index in 1...6 {
+            for character in "N\(index)" { noScrollbackPark.apply(.print(character)) }
+            if index < 6 {
+                noScrollbackPark.apply(.lineFeed)
+                noScrollbackPark.apply(.carriageReturn)
+            }
+        }
+        noScrollbackPark.apply(.setMode(.alternateScreen, true))
+        noScrollbackPark.resize(rows: 2, columns: 6)
+        noScrollbackPark.apply(.setMode(.alternateScreen, false))
+        expect(noScrollbackPark.scrollbackCount == 0, "scrollbackLimit 0 banks nothing when parked")
 
         // MARK: - Result
 
