@@ -83,17 +83,21 @@ extension TerminalView {
         let end = max(anchor, head)
         let screen = session.screen
 
-        var lines: [String] = []
+        var rows: [TerminalTextJoiner.Row] = []
         for absoluteLine in start.line...end.line {
             // A line trimmed out of the ring while the selection was held is
             // genuinely gone; skip it rather than substituting whatever text
             // now sits at its old index.
             guard let line = screen.contentLine(forAbsoluteLine: absoluteLine) else { continue }
             let cells = cells(forContentLine: line, screen: screen)
+            // A row the terminal wrapped continues on the next one, so it must
+            // not gain a newline: a path that merely overflowed the window has
+            // to come back as one pasteable line.
+            let continues = screen.isLineWrapped(contentLine: line)
             let firstColumn = absoluteLine == start.line ? start.column : 0
             let lastColumn = absoluteLine == end.line ? end.column : cells.count - 1
             guard firstColumn <= lastColumn, firstColumn < cells.count else {
-                lines.append("")
+                rows.append(TerminalTextJoiner.Row(text: "", continuesToNextRow: continues))
                 continue
             }
             let upperBound = min(lastColumn, cells.count - 1)
@@ -102,11 +106,15 @@ extension TerminalView {
                     .filter { !$0.isContinuation }
                     .map(\.character)
             )
-            // Trailing blanks on a terminal row are padding, not content.
-            lines.append(String(text.reversed().drop(while: { $0 == " " }).reversed()))
+            // Trailing blanks are row padding, not content -- but a wrapped row
+            // runs to the edge, so trimming it would eat real characters.
+            let trimmed = continues
+                ? text
+                : String(text.reversed().drop(while: { $0 == " " }).reversed())
+            rows.append(TerminalTextJoiner.Row(text: trimmed, continuesToNextRow: continues))
         }
 
-        let joined = lines.joined(separator: "\n")
+        let joined = TerminalTextJoiner.join(rows)
         guard !joined.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(joined, forType: .string)

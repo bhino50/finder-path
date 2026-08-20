@@ -1143,6 +1143,102 @@ struct FinderPathTerminalTests {
             "rows discarded by a resize advance the absolute base"
         )
 
+        // MARK: - Screen: soft-wrap continuation
+        //
+        // A row continued by autowrap and a row ended by an explicit newline are
+        // indistinguishable once printed -- both can be exactly full. The screen
+        // has to record which happened, or copying a wrapped path inserts a
+        // newline that breaks it when pasted.
+
+        var wrapped = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { wrapped.apply(.print(character)) }
+        expect(wrapped.isLineWrapped(contentLine: 0), "a row continued by autowrap is marked wrapped")
+        expect(!wrapped.isLineWrapped(contentLine: 1), "the continuation row is not itself wrapped")
+
+        var hardBreak = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "AB" { hardBreak.apply(.print(character)) }
+        hardBreak.apply(.lineFeed)
+        hardBreak.apply(.carriageReturn)
+        for character in "CD" { hardBreak.apply(.print(character)) }
+        expect(!hardBreak.isLineWrapped(contentLine: 0), "a row ended by an explicit newline is not wrapped")
+
+        // The discriminating case: a row filled to exactly the width, then ended
+        // by a newline. It looks identical to a wrapped row, so nothing can be
+        // inferred from the cells alone.
+        var exactlyFull = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDE" { exactlyFull.apply(.print(character)) }
+        exactlyFull.apply(.lineFeed)
+        exactlyFull.apply(.carriageReturn)
+        for character in "FG" { exactlyFull.apply(.print(character)) }
+        expect(
+            !exactlyFull.isLineWrapped(contentLine: 0),
+            "a row filled exactly to the width then ended by a newline is not wrapped"
+        )
+
+        var exactlyFullThenWrap = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEF" { exactlyFullThenWrap.apply(.print(character)) }
+        expect(
+            exactlyFullThenWrap.isLineWrapped(contentLine: 0),
+            "a row filled exactly to the width then continued IS wrapped"
+        )
+
+        // The flag has to travel with the text, not with the row index.
+        var travelling = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { travelling.apply(.print(character)) }
+        for _ in 0..<3 {
+            travelling.apply(.lineFeed)
+            travelling.apply(.carriageReturn)
+        }
+        expect(travelling.scrollbackCount >= 3, "the wrapped line scrolled into scrollback")
+        expect(travelling.isLineWrapped(contentLine: 0), "the wrap flag follows its line into scrollback")
+        expect(!travelling.isLineWrapped(contentLine: 1), "the continuation line stays unwrapped in scrollback")
+
+        // Erasing a row clears its continuation: the text that wrapped is gone.
+        var erased = TerminalScreen(rows: 4, columns: 5, scrollbackLimit: 50)
+        for character in "ABCDEFG" { erased.apply(.print(character)) }
+        expect(erased.isLineWrapped(contentLine: 0), "precondition: row 0 wrapped")
+        erased.apply(.eraseInDisplay(2))
+        expect(!erased.isLineWrapped(contentLine: 0), "erasing the screen clears continuation flags")
+
+        // Out-of-range queries must not trap.
+        expect(!erased.isLineWrapped(contentLine: -1), "a negative content line is not wrapped")
+        expect(
+            !erased.isLineWrapped(contentLine: erased.scrollbackCount + erased.rows + 5),
+            "a content line past the grid is not wrapped"
+        )
+
+        // MARK: - Selection text joining
+
+        typealias JoinRow = TerminalTextJoiner.Row
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "/Users/me/Projects/Finder", continuesToNextRow: true),
+                JoinRow(text: "Path/Terminal.swift", continuesToNextRow: false),
+            ]) == "/Users/me/Projects/FinderPath/Terminal.swift",
+            "a soft-wrapped path rejoins into one pasteable line"
+        )
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "first", continuesToNextRow: false),
+                JoinRow(text: "second", continuesToNextRow: false),
+            ]) == "first\nsecond",
+            "genuinely separate rows keep their newline"
+        )
+        expect(
+            TerminalTextJoiner.join([JoinRow(text: "only", continuesToNextRow: true)]) == "only",
+            "a trailing wrapped row does not gain a dangling separator"
+        )
+        expect(TerminalTextJoiner.join([]).isEmpty, "joining nothing yields nothing")
+        expect(
+            TerminalTextJoiner.join([
+                JoinRow(text: "a", continuesToNextRow: true),
+                JoinRow(text: "b", continuesToNextRow: true),
+                JoinRow(text: "c", continuesToNextRow: false),
+                JoinRow(text: "d", continuesToNextRow: false),
+            ]) == "abc\nd",
+            "a run of wrapped rows collapses into a single line"
+        )
+
         // MARK: - Result
 
         if failures.isEmpty {

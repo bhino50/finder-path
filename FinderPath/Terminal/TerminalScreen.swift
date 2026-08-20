@@ -20,17 +20,17 @@ struct TerminalScreen {
     private(set) var autowrap = true
     private(set) var title = ""
 
-    private var grid: [[TerminalCell]]
+    private var grid: [TerminalLine]
     /// The primary screen's contents parked while the alternate screen is up.
     /// `savedCursor` travels with it: DECSC/DECRC state is per screen, so a TUI
     /// issuing ESC 7 must not clobber the position the shell saved earlier.
     private var savedPrimary: (
-        grid: [[TerminalCell]],
+        grid: [TerminalLine],
         cursorRow: Int,
         cursorColumn: Int,
         savedCursor: (row: Int, column: Int)?
     )?
-    private var scrollback: [[TerminalCell]] = []
+    private var scrollback: [TerminalLine] = []
     private let scrollbackLimit: Int
 
     /// 0-based inclusive scroll region bounds.
@@ -91,8 +91,8 @@ struct TerminalScreen {
         self.grid = Self.blankGrid(rows: self.rows, columns: self.columns)
     }
 
-    private static func blankGrid(rows: Int, columns: Int) -> [[TerminalCell]] {
-        Array(repeating: Array(repeating: TerminalCell.blank, count: columns), count: rows)
+    private static func blankGrid(rows: Int, columns: Int) -> [TerminalLine] {
+        Array(repeating: TerminalLine.blank(columns: columns), count: rows)
     }
 
     private var blankCell: TerminalCell { .blank(withBackgroundOf: brush) }
@@ -106,12 +106,24 @@ struct TerminalScreen {
 
     func scrollbackLine(_ index: Int) -> [TerminalCell] {
         guard index >= 0, index < scrollback.count else { return [] }
-        return scrollback[index]
+        return scrollback[index].cells
+    }
+
+    /// Whether the line at `contentLine` (scrollback lines first, then live grid
+    /// rows) continues onto the line below because it autowrapped. Callers that
+    /// join lines into text — copy, accessibility — must not insert a newline
+    /// where this is true.
+    func isLineWrapped(contentLine: Int) -> Bool {
+        guard contentLine >= 0 else { return false }
+        if contentLine < scrollback.count { return scrollback[contentLine].wrapped }
+        let row = contentLine - scrollback.count
+        guard row < rows, row < grid.count else { return false }
+        return grid[row].wrapped
     }
 
     func lineText(_ row: Int) -> String {
         guard row >= 0, row < rows else { return "" }
-        return String(grid[row].prefix(columns).filter { !$0.isContinuation }.map(\.character))
+        return String(grid[row].cells.prefix(columns).filter { !$0.isContinuation }.map(\.character))
     }
 
     // MARK: - Applying actions
@@ -246,6 +258,7 @@ struct TerminalScreen {
         guard width > 0 else { return }
 
         if pendingWrap && autowrap {
+            markCurrentLineWrapped()
             cursorColumn = 0
             lineFeed()
         }
@@ -254,6 +267,7 @@ struct TerminalScreen {
         // before drawing when possible; a one-column terminal degrades to a
         // single visible cell rather than corrupting the row.
         if width == 2, columns > 1, cursorColumn == columns - 1, autowrap {
+            markCurrentLineWrapped()
             cursorColumn = 0
             lineFeed()
         }
@@ -454,6 +468,18 @@ struct TerminalScreen {
         }
     }
 
+    /// Records that the current row's text continues on the row below. Called
+    /// only where autowrap moves to the next line — an explicit newline must
+    /// leave the flag clear, or copy joins two genuinely separate lines.
+    private mutating func markCurrentLineWrapped() {
+        setCurrentLineWrapped(true)
+    }
+
+    private mutating func setCurrentLineWrapped(_ wrapped: Bool) {
+        guard cursorRow >= 0, cursorRow < grid.count else { return }
+        grid[cursorRow].wrapped = wrapped
+    }
+
     private mutating func lineFeed() {
         pendingWrap = false
         if cursorRow == regionBottom {
@@ -479,7 +505,7 @@ struct TerminalScreen {
         for row in regionTop..<regionBottom {
             grid[row] = grid[row + 1]
         }
-        grid[regionBottom] = Array(repeating: blankCell, count: columns)
+        grid[regionBottom] = TerminalLine.blank(columns: columns, filledWith: blankCell)
     }
 
     private mutating func scrollRegionDown() {
@@ -488,7 +514,7 @@ struct TerminalScreen {
             grid[row] = grid[row - 1]
             row -= 1
         }
-        grid[regionTop] = Array(repeating: blankCell, count: columns)
+        grid[regionTop] = TerminalLine.blank(columns: columns, filledWith: blankCell)
     }
 
     // MARK: - Erase
@@ -499,16 +525,16 @@ struct TerminalScreen {
             eraseInLine(0)
             if cursorRow + 1 < rows {
                 for row in (cursorRow + 1)..<rows {
-                    grid[row] = Array(repeating: blankCell, count: columns)
+                    grid[row] = TerminalLine.blank(columns: columns, filledWith: blankCell)
                 }
             }
         case 1:
             eraseInLine(1)
             for row in 0..<cursorRow {
-                grid[row] = Array(repeating: blankCell, count: columns)
+                grid[row] = TerminalLine.blank(columns: columns, filledWith: blankCell)
             }
         case 2, 3:
-            grid = Array(repeating: Array(repeating: blankCell, count: columns), count: rows)
+            grid = Array(repeating: TerminalLine.blank(columns: columns, filledWith: blankCell), count: rows)
         default:
             break
         }
@@ -519,10 +545,16 @@ struct TerminalScreen {
         switch mode {
         case 0:
             eraseCells(in: cursorColumn..<columns, row: cursorRow)
+            // The text that ran onto the next row has just been erased, so the
+            // row no longer continues. Leaving the flag set would make copy
+            // silently glue this row to the one below.
+            setCurrentLineWrapped(false)
         case 1:
+            // Erasing the start of the row leaves its tail, so whatever
+            // continuation it had still stands.
             eraseCells(in: 0..<(min(cursorColumn, columns - 1) + 1), row: cursorRow)
         case 2:
-            grid[cursorRow] = Array(repeating: blankCell, count: columns)
+            grid[cursorRow] = TerminalLine.blank(columns: columns, filledWith: blankCell)
         default:
             break
         }
@@ -540,7 +572,7 @@ struct TerminalScreen {
                 grid[row] = grid[row - 1]
                 row -= 1
             }
-            grid[cursorRow] = Array(repeating: blankCell, count: columns)
+            grid[cursorRow] = TerminalLine.blank(columns: columns, filledWith: blankCell)
         }
         cursorColumn = 0
         pendingWrap = false
@@ -552,7 +584,7 @@ struct TerminalScreen {
             for row in cursorRow..<regionBottom {
                 grid[row] = grid[row + 1]
             }
-            grid[regionBottom] = Array(repeating: blankCell, count: columns)
+            grid[regionBottom] = TerminalLine.blank(columns: columns, filledWith: blankCell)
         }
         cursorColumn = 0
         pendingWrap = false
@@ -562,8 +594,8 @@ struct TerminalScreen {
         discardHiddenColumns(in: cursorRow)
         let count = min(max(amount, 1), columns - cursorColumn)
         var line = grid[cursorRow]
-        line.removeLast(count)
-        line.insert(contentsOf: Array(repeating: blankCell, count: count), at: cursorColumn)
+        line.cells.removeLast(count)
+        line.cells.insert(contentsOf: Array(repeating: blankCell, count: count), at: cursorColumn)
         grid[cursorRow] = line
         normalizeWideCells(in: cursorRow)
     }
@@ -572,8 +604,8 @@ struct TerminalScreen {
         discardHiddenColumns(in: cursorRow)
         let count = min(max(amount, 1), columns - cursorColumn)
         var line = grid[cursorRow]
-        line.removeSubrange(cursorColumn..<(cursorColumn + count))
-        line.append(contentsOf: Array(repeating: blankCell, count: count))
+        line.cells.removeSubrange(cursorColumn..<(cursorColumn + count))
+        line.cells.append(contentsOf: Array(repeating: blankCell, count: count))
         grid[cursorRow] = line
         normalizeWideCells(in: cursorRow)
     }
@@ -586,7 +618,7 @@ struct TerminalScreen {
             guard enabled != usingAlternateScreen else { return }
             if enabled {
                 savedPrimary = (grid, cursorRow, cursorColumn, savedCursor)
-                grid = Array(repeating: Array(repeating: blankCell, count: columns), count: rows)
+                grid = Array(repeating: TerminalLine.blank(columns: columns, filledWith: blankCell), count: rows)
                 cursorRow = 0
                 cursorColumn = 0
                 // The alternate screen starts with no saved cursor of its own.
@@ -706,22 +738,25 @@ struct TerminalScreen {
     /// TUIs, and a cursor-derived offset for the primary screen so the active
     /// prompt stays visible instead of scrolling away behind blank rows.
     private static func resizeGrid(
-        _ source: [[TerminalCell]],
+        _ source: [TerminalLine],
         rows: Int,
         columns: Int,
         firstRetained: Int = 0
-    ) -> [[TerminalCell]] {
+    ) -> [TerminalLine] {
         let start = min(max(firstRetained, 0), max(source.count - rows, 0))
         let retainedRows = source.dropFirst(start).prefix(rows)
-        var result = retainedRows.map { line -> [TerminalCell] in
+        var result = retainedRows.map { line -> TerminalLine in
             // Keep cells beyond the temporarily visible width. If the user
             // widens the terminal again before that row is overwritten, its
             // right-hand content reappears instead of being destroyed.
             guard line.count < columns else { return line }
-            return line + Array(repeating: TerminalCell.blank, count: columns - line.count)
+            return TerminalLine(
+                cells: line.cells + Array(repeating: TerminalCell.blank, count: columns - line.count),
+                wrapped: line.wrapped
+            )
         }
         while result.count < rows {
-            result.append(Array(repeating: TerminalCell.blank, count: columns))
+            result.append(TerminalLine.blank(columns: columns))
         }
         return result
     }
@@ -737,7 +772,7 @@ struct TerminalScreen {
         // Skipping it here is what takes printing from O(columns) back to O(1):
         // printCharacter calls this for every glyph.
         guard grid[row].count > columns else { return }
-        grid[row] = Array(grid[row].prefix(columns))
+        grid[row] = TerminalLine(cells: Array(grid[row].cells.prefix(columns)), wrapped: grid[row].wrapped)
         normalizeWideCells(in: row)
     }
 
