@@ -1,11 +1,16 @@
 import AppKit
 
 // Mouse-driven text selection and clipboard copy for TerminalView. Kept in a
-// companion file so the renderer stays focused on drawing. Selection is
-// expressed in content-line space (scrollback lines first, then live grid
-// rows) so it stays anchored to text while the user scrolls.
+// companion file so the renderer stays focused on drawing.
 
-/// A selection endpoint: a content line and a column within it.
+/// A selection endpoint: an *absolute* line (see `TerminalScreen.scrollbackBase`)
+/// and a column within it.
+///
+/// Content-line indices shift down every time the scrollback ring trims, so a
+/// selection stored in that space slides onto different text as output arrives —
+/// the highlight and Cmd+C end up on a line the user never selected. Absolute
+/// line numbers stay attached to their text for its whole life, and a line that
+/// falls out of the ring resolves to nil rather than to a stranger.
 struct TerminalSelectionPoint: Equatable, Comparable {
     var line: Int
     var column: Int
@@ -20,16 +25,20 @@ extension TerminalView {
     /// interior lines are fully covered, the first and last lines are bounded
     /// by their respective columns.
     func isSelected(contentLine: Int, column: Int) -> Bool {
-        guard hasActiveSelection, let anchor = selectionAnchor, let head = selectionHead else { return false }
+        guard hasActiveSelection, let anchor = selectionAnchor, let head = selectionHead,
+              let session else { return false }
         let start = min(anchor, head)
         let end = max(anchor, head)
+        // The renderer walks content lines; the selection lives in absolute
+        // space, so lift the row being drawn rather than lowering the anchors.
+        let line = session.screen.absoluteLine(forContentLine: contentLine)
 
-        guard contentLine >= start.line, contentLine <= end.line else { return false }
+        guard line >= start.line, line <= end.line else { return false }
         if start.line == end.line {
             return column >= start.column && column <= end.column
         }
-        if contentLine == start.line { return column >= start.column }
-        if contentLine == end.line { return column <= end.column }
+        if line == start.line { return column >= start.column }
+        if line == end.line { return column <= end.column }
         return true
     }
 
@@ -75,10 +84,14 @@ extension TerminalView {
         let screen = session.screen
 
         var lines: [String] = []
-        for line in start.line...end.line {
+        for absoluteLine in start.line...end.line {
+            // A line trimmed out of the ring while the selection was held is
+            // genuinely gone; skip it rather than substituting whatever text
+            // now sits at its old index.
+            guard let line = screen.contentLine(forAbsoluteLine: absoluteLine) else { continue }
             let cells = cells(forContentLine: line, screen: screen)
-            let firstColumn = line == start.line ? start.column : 0
-            let lastColumn = line == end.line ? end.column : cells.count - 1
+            let firstColumn = absoluteLine == start.line ? start.column : 0
+            let lastColumn = absoluteLine == end.line ? end.column : cells.count - 1
             guard firstColumn <= lastColumn, firstColumn < cells.count else {
                 lines.append("")
                 continue
@@ -99,7 +112,7 @@ extension TerminalView {
         NSPasteboard.general.setString(joined, forType: .string)
     }
 
-    /// Maps a mouse event to a content-line/column endpoint, clamped to the
+    /// Maps a mouse event to an absolute-line/column endpoint, clamped to the
     /// current screen so drags past the edges stay in bounds.
     private func selectionPoint(for event: NSEvent) -> TerminalSelectionPoint? {
         guard let session else { return nil }
@@ -114,6 +127,9 @@ extension TerminalView {
         let column = Int((local.x / metrics.cellWidth).rounded(.down))
         let clampedColumn = min(max(column, 0), screen.columns - 1)
 
-        return TerminalSelectionPoint(line: contentLine, column: clampedColumn)
+        return TerminalSelectionPoint(
+            line: screen.absoluteLine(forContentLine: contentLine),
+            column: clampedColumn
+        )
     }
 }

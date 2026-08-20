@@ -47,6 +47,42 @@ struct TerminalScreen {
 
     var scrollbackCount: Int { scrollback.count }
 
+    /// How many lines have been discarded off the front of the scrollback ring.
+    ///
+    /// Content-line indices (scrollback lines first, then live grid rows) are
+    /// relative to the front of the ring, so every trim shifts them down by one.
+    /// Anything that has to stay pinned to *text* while output keeps arriving —
+    /// a held selection, a scrolled-back viewport — must store the absolute line
+    /// number instead and convert back through `contentLine(forAbsoluteLine:)`,
+    /// or it silently slides onto whatever text later occupies that index.
+    private(set) var scrollbackBase = 0
+
+    /// The stable identity of a content line: unchanged for the life of the text
+    /// it names, however much the ring trims afterwards.
+    func absoluteLine(forContentLine line: Int) -> Int {
+        scrollbackBase + line
+    }
+
+    /// Where `absolute` currently sits, or nil once it has been trimmed away or
+    /// if it names a line past the live grid. Returning nil rather than a
+    /// clamped index is deliberate: silently resolving an evicted line to its
+    /// old index is exactly the drift this exists to prevent.
+    func contentLine(forAbsoluteLine absolute: Int) -> Int? {
+        let line = absolute - scrollbackBase
+        guard line >= 0, line < scrollback.count + rows else { return nil }
+        return line
+    }
+
+    /// Enforces `scrollbackLimit`, advancing `scrollbackBase` by whatever it
+    /// discards. Every trim goes through here so the base cannot drift out of
+    /// step with the ring.
+    private mutating func trimScrollbackToLimit() {
+        guard scrollback.count > scrollbackLimit else { return }
+        let excess = scrollback.count - scrollbackLimit
+        scrollback.removeFirst(excess)
+        scrollbackBase += excess
+    }
+
     init(rows: Int, columns: Int, scrollbackLimit: Int = 2000) {
         self.rows = max(rows, 1)
         self.columns = max(columns, 1)
@@ -437,9 +473,7 @@ struct TerminalScreen {
 
         if feedsScrollback {
             scrollback.append(grid[regionTop])
-            if scrollback.count > scrollbackLimit {
-                scrollback.removeFirst(scrollback.count - scrollbackLimit)
-            }
+            trimScrollbackToLimit()
         }
 
         for row in regionTop..<regionBottom {
@@ -606,9 +640,7 @@ struct TerminalScreen {
             for row in 0..<firstRetained {
                 scrollback.append(grid[row])
             }
-            if scrollback.count > scrollbackLimit {
-                scrollback.removeFirst(scrollback.count - scrollbackLimit)
-            }
+            trimScrollbackToLimit()
         }
 
         // Preserve both primary and alternate-screen contents until the child
@@ -638,9 +670,7 @@ struct TerminalScreen {
                 for row in 0..<min(savedDroppedTop, saved.grid.count) {
                     scrollback.append(saved.grid[row])
                 }
-                if scrollback.count > scrollbackLimit {
-                    scrollback.removeFirst(scrollback.count - scrollbackLimit)
-                }
+                trimScrollbackToLimit()
             }
             savedPrimary = (
                 Self.resizeGrid(

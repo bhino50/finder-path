@@ -1056,6 +1056,93 @@ struct FinderPathTerminalTests {
         noScrollbackPark.apply(.setMode(.alternateScreen, false))
         expect(noScrollbackPark.scrollbackCount == 0, "scrollbackLimit 0 banks nothing when parked")
 
+        // MARK: - Screen: absolute line anchoring
+        //
+        // Content-line indices are relative to the front of the scrollback ring,
+        // so every trim shifts them down. Anything that must stay pinned to TEXT
+        // while output keeps arriving -- a held selection, a scrolled-back
+        // viewport -- has to be stored in absolute space and converted back, or
+        // it silently slides onto different lines.
+
+        func emitLine(_ target: inout TerminalScreen, _ text: String) {
+            for character in text { target.apply(.print(character)) }
+            target.apply(.lineFeed)
+            target.apply(.carriageReturn)
+        }
+        func ringText(_ target: TerminalScreen, _ contentLine: Int) -> String {
+            String(target.scrollbackLine(contentLine).map(\.character))
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        var ring = TerminalScreen(rows: 2, columns: 8, scrollbackLimit: 3)
+        expect(ring.scrollbackBase == 0, "a fresh screen has discarded nothing off the front")
+
+        for index in 1...5 { emitLine(&ring, "R\(index)") }
+        expect(ring.scrollbackBase > 0, "a full ring has begun trimming")
+
+        // Pin a line, then push one more line through so the ring trims again.
+        let watchedContentLine = 1
+        let watchedAbsolute = ring.absoluteLine(forContentLine: watchedContentLine)
+        let watchedText = ringText(ring, watchedContentLine)
+        let baseBeforeTrim = ring.scrollbackBase
+
+        emitLine(&ring, "R6")
+        expect(ring.scrollbackBase == baseBeforeTrim + 1, "one more scrolled-off line discards one from the front")
+
+        let resolved = ring.contentLine(forAbsoluteLine: watchedAbsolute)
+        expect(resolved == watchedContentLine - 1, "the pinned text shifted down one content index")
+        expect(
+            resolved.map { ringText(ring, $0) } == watchedText,
+            "an absolute reference still names the same text after a trim"
+        )
+
+        // Round-trip across the whole addressable range, scrollback and grid.
+        let addressable = 0..<(ring.scrollbackCount + ring.rows)
+        expect(
+            addressable.allSatisfy { ring.contentLine(forAbsoluteLine: ring.absoluteLine(forContentLine: $0)) == $0 },
+            "absolute and content line numbers round-trip over scrollback and grid"
+        )
+        expect(
+            ring.absoluteLine(forContentLine: ring.scrollbackCount) == ring.scrollbackBase + ring.scrollbackCount,
+            "the first grid row follows the last scrollback line in absolute space"
+        )
+
+        // A line that has fallen out of the ring must report as gone rather than
+        // resolving to whatever text now occupies its old index.
+        let evictedAbsolute = ring.scrollbackBase - 1
+        expect(ring.contentLine(forAbsoluteLine: evictedAbsolute) == nil, "a discarded line reports as gone")
+        expect(
+            ring.contentLine(forAbsoluteLine: ring.absoluteLine(forContentLine: ring.scrollbackCount + ring.rows)) == nil,
+            "a line past the live grid reports as gone"
+        )
+
+        // Trimming is the only thing that moves the base: plain output that fits
+        // inside the ring must not shift existing absolute references.
+        var roomy = TerminalScreen(rows: 2, columns: 8, scrollbackLimit: 500)
+        for index in 1...4 { emitLine(&roomy, "Q\(index)") }
+        let roomyAbsolute = roomy.absoluteLine(forContentLine: 0)
+        let roomyText = ringText(roomy, 0)
+        for index in 5...20 { emitLine(&roomy, "Q\(index)") }
+        expect(roomy.scrollbackBase == 0, "a ring under its limit never discards")
+        expect(
+            roomy.contentLine(forAbsoluteLine: roomyAbsolute).map { ringText(roomy, $0) } == roomyText,
+            "absolute references survive plain output when nothing is trimmed"
+        )
+
+        // Resize trims through the same path, so the base has to move there too.
+        var resized = TerminalScreen(rows: 6, columns: 8, scrollbackLimit: 2)
+        for index in 1...6 { emitLine(&resized, "Z\(index)") }
+        let baseBeforeResize = resized.scrollbackBase
+        resized.resize(rows: 2, columns: 8)
+        expect(
+            resized.scrollbackCount <= 2,
+            "resize honours the scrollback limit"
+        )
+        expect(
+            resized.scrollbackBase >= baseBeforeResize,
+            "rows discarded by a resize advance the absolute base"
+        )
+
         // MARK: - Result
 
         if failures.isEmpty {
