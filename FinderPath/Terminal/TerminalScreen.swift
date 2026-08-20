@@ -722,6 +722,20 @@ struct TerminalScreen {
             )
         }
 
+        // Rows are not reflowed, so a stored continuation no longer describes
+        // the layout once the width changes: a widened row is padded with
+        // blanks out to the new width, and copy deliberately skips the
+        // trailing-blank trim for wrapped rows, which would inject that padding
+        // into the middle of the copied text.
+        if targetColumns != columns {
+            for index in grid.indices { grid[index].wrapped = false }
+            for index in scrollback.indices { scrollback[index].wrapped = false }
+            if var saved = savedPrimary {
+                for index in saved.grid.indices { saved.grid[index].wrapped = false }
+                savedPrimary = saved
+            }
+        }
+
         rows = targetRows
         columns = targetColumns
         regionTop = 0

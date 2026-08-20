@@ -63,7 +63,8 @@ final class TerminalView: NSView {
             // Only onScreenUpdate belongs to the view; onStatusChange is owned
             // by TerminalPanelController, so the view must never touch it.
             oldValue?.onScreenUpdate = nil
-            scrollbackOffset = 0
+            viewportAnchor = nil
+            anchoredScreenGeneration = session?.screenGeneration ?? 0
             clearSelection()
             // Grid de-duplication is per attached session. Reset it so the new
             // session receives this view's real geometry exactly once.
@@ -87,8 +88,33 @@ final class TerminalView: NSView {
 
     private(set) var metrics = CellMetrics(fontSize: TerminalView.defaultFontSize)
 
+    /// Absolute line pinned to the top row while the user is scrolled back;
+    /// nil means the view follows live output at the bottom.
+    private var viewportAnchor: Int?
+
+    /// The screen generation the current anchors belong to. See
+    /// `dropAnchorsIfScreenReplaced()`.
+    private var anchoredScreenGeneration = 0
+
     /// Lines scrolled up into the scrollback; 0 means the live grid.
-    private(set) var scrollbackOffset = 0
+    ///
+    /// Derived from `viewportAnchor` rather than stored. A stored offset counts
+    /// from the bottom, so each new line of output slid whatever the user had
+    /// scrolled back to read one row further up until it left the view; pinning
+    /// the top line instead keeps it still while output streams underneath.
+    var scrollbackOffset: Int {
+        // The alternate screen owns its whole viewport and has no scrollback to
+        // show; wheel events there are translated into arrow keys instead, so a
+        // non-zero offset would paint scrollback over the TUI with no way to
+        // scroll back out.
+        guard let viewportAnchor, let screen = session?.screen,
+              !screen.usingAlternateScreen else { return 0 }
+        return TerminalViewport.offset(
+            forAnchor: viewportAnchor,
+            scrollbackBase: screen.scrollbackBase,
+            scrollbackCount: screen.scrollbackCount
+        )
+    }
 
     // Selection anchors in content-line space (scrollback lines first, then
     // grid rows); mutated by the mouse handlers in TerminalViewSelection.swift.
@@ -151,7 +177,12 @@ final class TerminalView: NSView {
         // TerminalPanelController, which repaints the view on status changes;
         // taking it here would clobber the controller's exit/Restart handling.
         session?.onScreenUpdate = { [weak self] in
-            self?.screenDirty = true
+            guard let self else { return }
+            // restart() replaces the screen and fires this before any redraw,
+            // which is the one chance to drop anchors that belong to the screen
+            // it just discarded.
+            self.dropAnchorsIfScreenReplaced()
+            self.screenDirty = true
         }
     }
 
@@ -519,17 +550,40 @@ final class TerminalView: NSView {
             return
         }
 
-        let limit = session.screen.scrollbackCount
-        let updated = min(max(scrollbackOffset + wholeLines, 0), limit)
-        if updated != scrollbackOffset {
-            scrollbackOffset = updated
-            needsDisplay = true
-        }
+        let screen = session.screen
+        let current = scrollbackOffset
+        let updated = min(max(current + wholeLines, 0), screen.scrollbackCount)
+        guard updated != current else { return }
+        // Re-pin to whatever line the new offset lands on, so subsequent output
+        // moves the offset instead of the text under the reader.
+        viewportAnchor = updated == 0
+            ? nil
+            : TerminalViewport.anchor(
+                forOffset: updated,
+                scrollbackBase: screen.scrollbackBase,
+                scrollbackCount: screen.scrollbackCount
+            )
+        needsDisplay = true
+    }
+
+    /// Discards absolute line anchors when the session swaps in a fresh screen.
+    ///
+    /// `TerminalSession.restart()` replaces the screen on the same session
+    /// object, so the `session` didSet never fires. Line numbering starts over,
+    /// which is the one time `scrollbackBase + scrollbackCount` goes backwards:
+    /// without this the viewport stays pinned to a line number from the dead
+    /// screen and silently stops following output once the new screen grows
+    /// past it, and an old selection re-materializes over unrelated new text.
+    private func dropAnchorsIfScreenReplaced() {
+        guard let session, session.screenGeneration != anchoredScreenGeneration else { return }
+        anchoredScreenGeneration = session.screenGeneration
+        viewportAnchor = nil
+        clearSelection()
     }
 
     private func snapToLiveGrid() {
-        guard scrollbackOffset != 0 else { return }
-        scrollbackOffset = 0
+        guard viewportAnchor != nil else { return }
+        viewportAnchor = nil
         needsDisplay = true
     }
 

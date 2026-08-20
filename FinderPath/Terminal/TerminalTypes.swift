@@ -177,3 +177,32 @@ enum TerminalTextJoiner {
         return output
     }
 }
+
+/// Converts between the terminal viewport's scroll offset and the absolute line
+/// pinned to its top row.
+///
+/// A scroll offset counts up from the bottom of the buffer, so it names a
+/// position that moves: every line of new output pushes the text the user
+/// scrolled back to one row further up, and within a few seconds of streaming
+/// output it has left the view entirely. Storing the absolute line at the top
+/// instead (see `TerminalScreen.scrollbackBase`) keeps the reader still and lets
+/// the offset be recomputed per frame.
+///
+/// Kept apart from the AppKit view so this arithmetic is covered by tests.
+enum TerminalViewport {
+    /// The absolute line that a given scroll offset puts at the top row.
+    static func anchor(forOffset offset: Int, scrollbackBase: Int, scrollbackCount: Int) -> Int {
+        let clamped = max(0, min(offset, max(scrollbackCount, 0)))
+        return scrollbackBase + max(scrollbackCount, 0) - clamped
+    }
+
+    /// The scroll offset that puts `anchor` back on the top row. An anchor the
+    /// ring has since discarded clamps to the oldest line still held, and one
+    /// past the live grid clamps to the bottom, so a stale anchor degrades to
+    /// the nearest sensible view instead of scrolling somewhere arbitrary.
+    static func offset(forAnchor anchor: Int, scrollbackBase: Int, scrollbackCount: Int) -> Int {
+        let available = max(scrollbackCount, 0)
+        let raw = scrollbackBase + available - anchor
+        return max(0, min(raw, available))
+    }
+}

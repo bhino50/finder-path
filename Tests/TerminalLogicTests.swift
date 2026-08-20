@@ -1239,6 +1239,116 @@ struct FinderPathTerminalTests {
             "a run of wrapped rows collapses into a single line"
         )
 
+        // MARK: - Viewport anchoring
+        //
+        // A scroll offset counts from the bottom, so every new line of output
+        // slides the text the user scrolled to one row further up until it
+        // leaves the view. Pinning the TOP of the viewport to an absolute line
+        // instead keeps it still while output streams underneath.
+
+        // Round-trip inside the addressable range.
+        expect(
+            (0...40).allSatisfy { offset in
+                TerminalViewport.offset(
+                    forAnchor: TerminalViewport.anchor(forOffset: offset, scrollbackBase: 7, scrollbackCount: 40),
+                    scrollbackBase: 7,
+                    scrollbackCount: 40
+                ) == offset
+            },
+            "offset and anchor round-trip across the scrollback range"
+        )
+
+        // The fix: hold an anchor, let output arrive, and the same line stays on
+        // top -- which means the offset has to grow by exactly what arrived.
+        let heldAnchor = TerminalViewport.anchor(forOffset: 10, scrollbackBase: 0, scrollbackCount: 100)
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 0, scrollbackCount: 100) == 10,
+            "precondition: the anchor resolves to the offset it came from"
+        )
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 0, scrollbackCount: 125) == 35,
+            "25 lines of new output move the offset, not the text the user is reading"
+        )
+        // Once the ring is full, further output trims the front instead of
+        // growing the count; the anchor has to track that too.
+        expect(
+            TerminalViewport.offset(forAnchor: heldAnchor, scrollbackBase: 25, scrollbackCount: 100) == 35,
+            "trimming moves the base rather than the count, and the anchor follows"
+        )
+
+        // An anchor scrolled off the end of the ring clamps to the oldest line
+        // still held rather than resolving out of range.
+        expect(
+            TerminalViewport.offset(forAnchor: -50, scrollbackBase: 200, scrollbackCount: 100) == 100,
+            "an anchor trimmed away clamps to the oldest line still in scrollback"
+        )
+        expect(
+            TerminalViewport.offset(forAnchor: 999_999, scrollbackBase: 0, scrollbackCount: 100) == 0,
+            "an anchor past the live grid clamps to the bottom"
+        )
+
+        // Degenerate ring: nothing to scroll to.
+        expect(
+            TerminalViewport.offset(forAnchor: 5, scrollbackBase: 0, scrollbackCount: 0) == 0,
+            "with no scrollback every anchor resolves to the live grid"
+        )
+        expect(
+            TerminalViewport.anchor(forOffset: 99, scrollbackBase: 0, scrollbackCount: 0) == 0,
+            "an out-of-range offset clamps before becoming an anchor"
+        )
+
+        // MARK: - Screen: wrap flags do not survive a width change
+        //
+        // Rows are not reflowed on resize. Widening pads a wrapped row with
+        // blanks out to the new width, and because copy deliberately skips the
+        // trailing-blank trim for wrapped rows, keeping the flag would inject
+        // that padding into the middle of the copied text.
+
+        var widened = TerminalScreen(rows: 4, columns: 6, scrollbackLimit: 50)
+        for character in "ABCDEFGH" { widened.apply(.print(character)) }
+        expect(widened.isLineWrapped(contentLine: 0), "precondition: the row wrapped at the narrow width")
+        widened.resize(rows: 4, columns: 12)
+        expect(
+            !widened.isLineWrapped(contentLine: 0),
+            "widening drops the continuation flag, since the row is no longer full"
+        )
+
+        var narrowed = TerminalScreen(rows: 4, columns: 8, scrollbackLimit: 50)
+        for character in "ABCDEFGHIJ" { narrowed.apply(.print(character)) }
+        expect(narrowed.isLineWrapped(contentLine: 0), "precondition: wrapped at eight columns")
+        narrowed.resize(rows: 4, columns: 5)
+        expect(!narrowed.isLineWrapped(contentLine: 0), "narrowing drops it too, for the same reason")
+
+        // A height-only resize does not disturb the layout, so the flag stands.
+        var shorter = TerminalScreen(rows: 6, columns: 6, scrollbackLimit: 50)
+        for character in "ABCDEFGH" { shorter.apply(.print(character)) }
+        expect(shorter.isLineWrapped(contentLine: 0), "precondition: wrapped before the height change")
+        shorter.resize(rows: 3, columns: 6)
+        let stillWrapped = (0..<(shorter.scrollbackCount + shorter.rows))
+            .contains { shorter.isLineWrapped(contentLine: $0) }
+        expect(stillWrapped, "a height-only resize keeps continuation flags, since columns are unchanged")
+
+        // MARK: - Session: screen replacement is observable
+        //
+        // Views hold absolute line numbers (selection anchors, the scrolled-back
+        // viewport) that only mean anything within one screen's lifetime.
+        // restart() swaps in a fresh screen on the SAME session object, so the
+        // view's session didSet never fires and it needs another signal.
+
+        let restartable = TerminalSession(
+            name: "restart-generation",
+            workingDirectory: NSTemporaryDirectory(),
+            shellPath: "/bin/sh",
+            scrollbackLimit: 100
+        )
+        let generationBefore = restartable.screenGeneration
+        restartable.restart()
+        expect(
+            restartable.screenGeneration != generationBefore,
+            "restart() bumps the screen generation so views can drop stale absolute anchors"
+        )
+        restartable.terminate()
+
         // MARK: - Result
 
         if failures.isEmpty {

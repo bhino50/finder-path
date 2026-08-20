@@ -29,6 +29,15 @@ final class TerminalSession: Identifiable {
     private(set) var status: Status = .notStarted
     private(set) var screen: TerminalScreen
 
+    /// Bumped whenever `screen` is replaced wholesale rather than mutated.
+    ///
+    /// Views hold absolute line numbers — selection anchors and the
+    /// scrolled-back viewport — and those only mean anything within a single
+    /// screen's lifetime. `restart()` swaps in a fresh screen on the *same*
+    /// session object, so a view watching for a new session never notices and
+    /// would keep applying dead line numbers to live text.
+    private(set) var screenGeneration = 0
+
     var onScreenUpdate: (() -> Void)?
     var onStatusChange: (() -> Void)?
     /// Fires when the terminal title (OSC 0/2) changes, so the tab can follow
@@ -107,6 +116,9 @@ final class TerminalSession: Identifiable {
             columns: screen.columns,
             scrollbackLimit: scrollbackLimit
         )
+        // Line numbering restarts with the screen; tell observers before they
+        // redraw with anchors that belong to the screen just discarded.
+        screenGeneration += 1
         onScreenUpdate?()
         spawn()
     }
