@@ -144,7 +144,13 @@ final class TerminalSession: Identifiable {
     /// to run before the process exits.
     @discardableResult
     func hangUp() -> PTYProcess.TerminationSnapshot? {
-        pty?.hangUpSynchronously()
+        // A session still validating its folder has no pty yet. Retire the
+        // spawn so a launch that completes after this point is abandoned
+        // rather than creating a shell that nothing will ever signal.
+        spawnGeneration += 1
+        spawnTask?.cancel()
+        spawnTask = nil
+        return pty?.hangUpSynchronously()
     }
 
     private func spawn() {

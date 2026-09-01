@@ -42,6 +42,13 @@ def fixture_paths(work_dir):
 def test_updates_both_files():
     with tempfile.TemporaryDirectory() as work_dir:
         manifest_path, index_path = fixture_paths(work_dir)
+        with open(manifest_path, encoding="utf-8") as source:
+            previous_version = json.load(source)["version"]
+        with open(index_path, encoding="utf-8") as source:
+            check(
+                f'class="release-note">Version {previous_version}' in source.read(),
+                "fixture download page should start on the shipping version",
+            )
         update_public_manifest.update("9.9", manifest_path, index_path)
 
         with open(manifest_path, encoding="utf-8") as source:
@@ -65,7 +72,7 @@ def test_updates_both_files():
             "download page should show the new version",
         )
         check(
-            'class="release-note">Version 1.6' not in index,
+            f'class="release-note">Version {previous_version}' not in index,
             "download page should not keep the previous version label",
         )
 

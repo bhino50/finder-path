@@ -41,6 +41,9 @@ final class StatusItemController: NSObject {
         store: .shared,
         newSessionDirectory: { [weak self] in
             guard let self else { return nil }
+            // A right-click shows the panel and starts a refresh at the same
+            // time; read the folder only once that refresh has settled.
+            await self.state.waitForRefresh()
             let candidate = self.state.hasCopyablePath
                 ? self.state.actionTargetCandidate()
                 : NSHomeDirectory()
@@ -148,13 +151,14 @@ final class StatusItemController: NSObject {
         hoverPicker.dismiss()
 
         // Right-click goes straight to the terminal panel (the button sends
-        // rightMouseUp); refresh keeps the new-session directory current.
+        // rightMouseUp). The refresh runs alongside the panel, not ahead of
+        // it: a stalled Finder query can take its whole timeout, and the
+        // panel must not wait on that. newSessionDirectory waits instead, so
+        // a session created for this panel still gets the live folder.
         if FinderPathPreferences.rightClickOpensTerminals,
            NSApp.currentEvent?.type == .rightMouseUp {
-            state.refresh { [weak self, weak sender] in
-                guard let self, let sender else { return }
-                self.terminalPanelController.toggle(relativeTo: sender)
-            }
+            state.refresh()
+            terminalPanelController.toggle(relativeTo: sender)
             return
         }
 

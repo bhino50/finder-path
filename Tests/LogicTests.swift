@@ -165,6 +165,35 @@ struct FinderPathLogicTests {
             ) != nil,
             "expanded update entry count is capped"
         )
+        // Zip-slip defense in depth: a link that resolves outside the
+        // extraction root fails inspection before any signature check runs.
+        let escapingLink = quotaRoot.appendingPathComponent("escape")
+        try? FileManager.default.createSymbolicLink(atPath: escapingLink.path, withDestinationPath: "/etc")
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot, maximumSize: 1_024, maximumEntries: 10, maximumDepth: 4
+            ) == UpdateInstaller.escapedContainmentMessage,
+            "an absolute symlink out of the package is rejected"
+        )
+        try? FileManager.default.removeItem(at: escapingLink)
+        let climbingLink = quotaRoot.appendingPathComponent("climb")
+        try? FileManager.default.createSymbolicLink(atPath: climbingLink.path, withDestinationPath: "../../outside")
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot, maximumSize: 1_024, maximumEntries: 10, maximumDepth: 4
+            ) == UpdateInstaller.escapedContainmentMessage,
+            "a relative symlink that climbs out of the package is rejected"
+        )
+        try? FileManager.default.removeItem(at: climbingLink)
+        let internalLink = quotaRoot.appendingPathComponent("alias")
+        try? FileManager.default.createSymbolicLink(atPath: internalLink.path, withDestinationPath: "payload")
+        expect(
+            UpdateInstaller.expandedContentsViolation(
+                at: quotaRoot, maximumSize: 1_024, maximumEntries: 10, maximumDepth: 4
+            ) == nil,
+            "a symlink that stays inside the package is allowed"
+        )
+        try? FileManager.default.removeItem(at: internalLink)
         let deepQuotaDirectory = quotaRoot.appendingPathComponent("one/two")
         try? FileManager.default.createDirectory(at: deepQuotaDirectory, withIntermediateDirectories: true)
         expect(

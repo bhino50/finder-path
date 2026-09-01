@@ -496,16 +496,25 @@ enum FinderPathAlertPresenter {
 @MainActor
 final class FinderPathState {
     private var refreshState = FinderPathRefreshState()
+    private var refreshTask: Task<Void, Never>?
 
     var currentPath: String { refreshState.currentPath }
     var isRefreshing: Bool { refreshState.isRefreshing }
+
+    /// Waits for the most recent refresh to finish. begin() retires the
+    /// previous folder while a query is in flight, so a caller that needs the
+    /// live Finder folder (a new mini-terminal session) would otherwise read
+    /// the empty in-flight value and fall back to the home directory.
+    func waitForRefresh() async {
+        await refreshTask?.value
+    }
 
     /// Fetches the Finder path off the main thread and reports back on the
     /// main actor, so a stalled Finder can never beachball the app. Stale
     /// completions from an earlier refresh are dropped.
     func refresh(onChange: (() -> Void)? = nil) {
         let generation = refreshState.begin()
-        Task { @MainActor [weak self] in
+        refreshTask = Task { @MainActor [weak self] in
             let result = await FinderBridge.fetchCurrentPath()
             guard let self, self.refreshState.complete(result, generation: generation) else { return }
             // Only folders that were genuinely open in a Finder window are worth

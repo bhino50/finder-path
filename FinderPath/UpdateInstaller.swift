@@ -248,7 +248,11 @@ enum UpdateInstaller {
     private static func makeWorkDirectory() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("FinderPathUpdate-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         return dir
     }
 
@@ -258,7 +262,11 @@ enum UpdateInstaller {
 
     private static func extractApp(from archive: URL, into workDir: URL) throws -> URL {
         let extractDir = workDir.appendingPathComponent("extracted")
-        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: extractDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
 
         if archive.pathExtension.lowercased() == "dmg" {
             try extractFromDiskImage(archive, into: extractDir)
@@ -526,6 +534,27 @@ enum UpdateInstaller {
         "The expanded update exceeded the \(maximumSize / (1_024 * 1_024)) MB safety limit."
     }
 
+    static let escapedContainmentMessage = "The expanded update contained an entry outside the package."
+
+    private static func isContained(_ path: String, within root: String) -> Bool {
+        path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    /// Symlinks are the entry class the extractor cannot make safe on its own:
+    /// an absolute or climbing link inside the archive would let the install
+    /// copy, or a later extracted entry, write outside the work tree. Links
+    /// that stay inside the package (framework layouts) remain allowed.
+    private static func symbolicLinkEscapes(_ link: URL, root: URL) -> Bool {
+        guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: link.path) else {
+            return true
+        }
+        if destination.hasPrefix("/") { return true }
+        let resolved = link.deletingLastPathComponent()
+            .appendingPathComponent(destination)
+            .standardizedFileURL
+        return !isContained(resolved.path, within: root.standardizedFileURL.path)
+    }
+
     /// Returns a user-facing reason when extracted contents exceed a resource
     /// ceiling. Kept internal so the release logic tests can exercise the
     /// archive-bomb guard without installing an app.
@@ -547,7 +576,7 @@ enum UpdateInstaller {
         var enumerationFailed = false
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey],
             options: [],
             errorHandler: { _, _ in
                 enumerationFailed = true
@@ -573,9 +602,18 @@ enum UpdateInstaller {
 
             let values: URLResourceValues
             do {
-                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey])
             } catch {
                 return "FinderPath could not inspect the expanded update."
+            }
+            // Zip-slip defense in depth: the archive is inspected before any
+            // signature check, so a link that resolves outside the extraction
+            // root is rejected here, before verification or install follow it.
+            if values.isSymbolicLink == true {
+                if symbolicLinkEscapes(entry, root: root) {
+                    return escapedContainmentMessage
+                }
+                continue
             }
             guard values.isDirectory != true else { continue }
             let fileSize = Int64(max(values.fileSize ?? 0, 0))
