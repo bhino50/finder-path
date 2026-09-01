@@ -13,7 +13,9 @@ TARGET="$(uname -m)-apple-macos13.0"
   -parse-as-library \
   -O \
   -target "$TARGET" \
+  "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
   "$ROOT_DIR/FinderPath/Bridges.swift" \
+  "$ROOT_DIR/FinderPath/FinderPathStateLogic.swift" \
   "$ROOT_DIR/FinderPath/HoverPickerLogic.swift" \
   "$ROOT_DIR/FinderPath/PendingURLQueue.swift" \
   "$ROOT_DIR/FinderPath/Preferences.swift" \
@@ -27,6 +29,20 @@ TARGET="$(uname -m)-apple-macos13.0"
 
 "$TEST_BINARY"
 
+# Process lifecycle tests run in their own binary because they use deliberately
+# slow and TERM-resistant shell fixtures that do not belong in the pure logic
+# test entry point.
+PROCESS_RUNNER_TEST_BINARY="$BUILD_DIR/BoundedProcessRunnerTests"
+"$SWIFTC" \
+  -parse-as-library \
+  -O \
+  -target "$TARGET" \
+  "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
+  "$ROOT_DIR/Tests/BoundedProcessRunnerTests.swift" \
+  -o "$PROCESS_RUNNER_TEST_BINARY"
+
+"$PROCESS_RUNNER_TEST_BINARY"
+
 # Terminal emulator logic tests build as a second binary so the terminal
 # subsystem's UI-free files stay covered without linking the whole app.
 TERMINAL_TEST_BINARY="$BUILD_DIR/FinderPathTerminalTests"
@@ -36,6 +52,7 @@ for CANDIDATE in \
   "$ROOT_DIR/FinderPath/Terminal/TerminalParser.swift" \
   "$ROOT_DIR/FinderPath/Terminal/TerminalScreen.swift" \
   "$ROOT_DIR/FinderPath/Terminal/TerminalInputEncoder.swift" \
+  "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
   "$ROOT_DIR/FinderPath/Terminal/PTYProcess.swift" \
   "$ROOT_DIR/FinderPath/Terminal/TerminalSession.swift" \
   "$ROOT_DIR/FinderPath/Terminal/TerminalSessionStore.swift"; do

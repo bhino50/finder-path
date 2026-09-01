@@ -3,6 +3,7 @@ import Foundation
 
 @main
 struct FinderPathTerminalTests {
+    @MainActor
     static func main() {
         var failures: [String] = []
         var assertionCount = 0
@@ -82,6 +83,7 @@ struct FinderPathTerminalTests {
         parser = TerminalParser()
         expect(parser.parse(Array("\u{1B}[J".utf8)) == [.eraseInDisplay(0)], "ED defaults to 0")
         expect(parser.parse(Array("\u{1B}[2J".utf8)) == [.eraseInDisplay(2)], "ED 2 erases all")
+        expect(parser.parse(Array("\u{1B}[3J".utf8)) == [.eraseInDisplay(3)], "ED 3 erases saved lines")
         expect(parser.parse(Array("\u{1B}[1K".utf8)) == [.eraseInLine(1)], "EL 1 erases to start")
         expect(parser.parse(Array("\u{1B}[3L".utf8)) == [.insertLines(3)], "IL inserts lines")
         expect(parser.parse(Array("\u{1B}[M".utf8)) == [.deleteLines(1)], "DL defaults to 1")
@@ -91,6 +93,27 @@ struct FinderPathTerminalTests {
         expect(parser.parse(Array("\u{1B}[2;5r".utf8)) == [.setScrollRegion(top: 2, bottom: 5)], "DECSTBM sets region")
         expect(parser.parse(Array("\u{1B}[2S".utf8)) == [.scrollUp(2)], "SU scrolls up")
         expect(parser.parse(Array("\u{1B}[T".utf8)) == [.scrollDown(1)], "SD defaults to 1")
+
+        // MARK: - Parser: private markers, intermediates, replacement character
+
+        // Vendor-private CSI markers are consumed whole. Dispatching them by
+        // their final byte ran kitty's `CSI > 1 u` as a cursor restore and
+        // xterm's `CSI > 4;1 m` as real SGR attributes.
+        expect(parser.parse(Array("\u{1B}[>1u".utf8)) == [], "CSI > u is consumed, not a cursor restore")
+        expect(parser.parse(Array("\u{1B}[>4;1m".utf8)) == [], "CSI > m is consumed, not SGR")
+        expect(parser.parse(Array("\u{1B}[=c".utf8)) == [], "CSI = c is consumed")
+        expect(parser.parse(Array("\u{1B}[<u".utf8)) == [], "CSI < u is consumed")
+        expect(parser.parse(Array("\u{1B}[?25l".utf8)) == [.setMode(.cursorVisible, false)], "? private modes still dispatch")
+        // ESC with an intermediate byte runs to its final byte; returning to
+        // ground right after the intermediate printed that final byte.
+        expect(parser.parse(Array("\u{1B}#8A".utf8)) == [.print("A")], "DECALN final byte is consumed, later text prints")
+        expect(parser.parse(Array("\u{1B}%GB".utf8)) == [.print("B")], "ESC % G is consumed whole")
+        expect(parser.parse(Array("\u{1B} FC".utf8)) == [.print("C")], "ESC sp F is consumed whole")
+        expect(parser.parse([0xEF, 0xBF, 0xBD]) == [.print("\u{FFFD}")], "a genuine U+FFFD from the child prints")
+        expect(parser.parse([0xC0, 0x80]) == [], "an overlong encoding is still dropped")
+        expect(TerminalInputEncoder.encodeControl(character: " ") == [0x00], "Control-Space sends NUL")
+        expect(TerminalInputEncoder.encodeControl(character: "@") == [0x00], "Control-@ sends NUL")
+        expect(TerminalInputEncoder.encodeControl(character: "1") == nil, "Control-1 has no C0 mapping")
 
         // MARK: - Parser: modes
 
@@ -166,6 +189,111 @@ struct FinderPathTerminalTests {
         for character in "abc界" { screen.apply(.print(character)) }
         expect(screen.lineText(1).hasPrefix("界"), "wide glyph wraps before the final column")
         expect(screen.cursorRow == 1 && screen.cursorColumn == 2, "wrapped wide glyph advances by two columns")
+        expect(screen.cell(atRow: 0, column: 3).isWrapPadding, "wide pre-wrap marks its unused final cell")
+        let wideWrapText = TerminalTextJoiner.join([
+            .init(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { screen.cell(atRow: 0, column: $0) },
+                    trimmingTrailingSpaces: false
+                ),
+                continuesToNextRow: true
+            ),
+            .init(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { screen.cell(atRow: 1, column: $0) },
+                    trimmingTrailingSpaces: true
+                ),
+                continuesToNextRow: false
+            ),
+        ])
+        expect(wideWrapText == "abc界", "wide pre-wrap padding never becomes copied or accessible text")
+
+        screen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
+        for character in "abc 界" { screen.apply(.print(character)) }
+        let firstWideWrapRow = (0..<5).map { screen.cell(atRow: 0, column: $0) }
+        expect(
+            TerminalRowText.string(from: firstWideWrapRow, trimmingTrailingSpaces: false) == "abc ",
+            "a real trailing space survives while only wide pre-wrap padding is omitted"
+        )
+
+        var narrowedWideWrap = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        for character in "abc" { narrowedWideWrap.apply(.print(character)) }
+        narrowedWideWrap.resize(rows: 2, columns: 4) // backing row still retains six cells
+        narrowedWideWrap.apply(.print("界"))
+        let narrowedRows = [
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { narrowedWideWrap.cell(atRow: 0, column: $0) },
+                    trimmingTrailingSpaces: false
+                ),
+                continuesToNextRow: true
+            ),
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { narrowedWideWrap.cell(atRow: 1, column: $0) },
+                    trimmingTrailingSpaces: true
+                ),
+                continuesToNextRow: false
+            ),
+        ]
+        expect(
+            narrowedWideWrap.cell(atRow: 0, column: 3).isWrapPadding,
+            "wide pre-wrap after narrowing marks the visible final column"
+        )
+        expect(
+            TerminalTextJoiner.join(narrowedRows) == "abc界",
+            "hidden retained cells cannot redirect the visible wrap-padding marker"
+        )
+
+        var addressedWideWrap = TerminalScreen(rows: 2, columns: 4, scrollbackLimit: 10)
+        for character in "ABCD" { addressedWideWrap.apply(.print(character)) }
+        addressedWideWrap.apply(.moveCursor(row: 1, column: 4))
+        addressedWideWrap.apply(.print("界"))
+        let addressedRows = [
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { addressedWideWrap.cell(atRow: 0, column: $0) },
+                    trimmingTrailingSpaces: false
+                ),
+                continuesToNextRow: true
+            ),
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { addressedWideWrap.cell(atRow: 1, column: $0) },
+                    trimmingTrailingSpaces: true
+                ),
+                continuesToNextRow: false
+            ),
+        ]
+        expect(
+            TerminalTextJoiner.join(addressedRows) == "ABCD界",
+            "wide pre-wrap preserves an occupied cell reached by cursor addressing"
+        )
+
+        var addressedSpaceWrap = TerminalScreen(rows: 2, columns: 4, scrollbackLimit: 10)
+        for character in "ABC " { addressedSpaceWrap.apply(.print(character)) }
+        addressedSpaceWrap.apply(.moveCursor(row: 1, column: 4))
+        addressedSpaceWrap.apply(.print("界"))
+        let addressedSpaceRows = [
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { addressedSpaceWrap.cell(atRow: 0, column: $0) },
+                    trimmingTrailingSpaces: false
+                ),
+                continuesToNextRow: true
+            ),
+            TerminalTextJoiner.Row(
+                text: TerminalRowText.string(
+                    from: (0..<4).map { addressedSpaceWrap.cell(atRow: 1, column: $0) },
+                    trimmingTrailingSpaces: true
+                ),
+                continuesToNextRow: false
+            ),
+        ]
+        expect(
+            TerminalTextJoiner.join(addressedSpaceRows) == "ABC 界",
+            "wide pre-wrap preserves an explicitly printed edge space"
+        )
 
         screen = TerminalScreen(rows: 1, columns: 6, scrollbackLimit: 10)
         for character in "A界B" { screen.apply(.print(character)) }
@@ -207,9 +335,30 @@ struct FinderPathTerminalTests {
         for character in "llo" { screen.apply(.print(character)) }
         screen.apply(.moveCursor(row: 1, column: 3))
         screen.apply(.eraseInLine(1))
-        expect(screen.lineText(0) == "   lo" || screen.lineText(0).hasSuffix("lo"), "EL 1 erases to start inclusive")
+        expect(screen.lineText(0) == "   lo", "EL 1 erases to start inclusive")
         screen.apply(.eraseInDisplay(2))
         expect(screen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty, "ED 2 clears everything")
+
+        // xterm's ED 3 clears saved scrollback without erasing the live grid.
+        // Grouping it with ED 2 made a clear-scrollback command also blank the
+        // user's current prompt and output.
+        var savedLinesScreen = TerminalScreen(rows: 2, columns: 8, scrollbackLimit: 10)
+        for text in ["saved-1", "saved-2", "visible"] {
+            for character in text { savedLinesScreen.apply(.print(character)) }
+            savedLinesScreen.apply(.lineFeed)
+            savedLinesScreen.apply(.carriageReturn)
+        }
+        expect(savedLinesScreen.scrollbackCount > 0, "ED 3 fixture has saved lines")
+        let savedCountBeforeED3 = savedLinesScreen.scrollbackCount
+        let baseBeforeED3 = savedLinesScreen.scrollbackBase
+        let visibleBeforeED3 = savedLinesScreen.lineText(0)
+        savedLinesScreen.apply(.eraseInDisplay(3))
+        expect(savedLinesScreen.scrollbackCount == 0, "ED 3 clears only saved lines")
+        expect(
+            savedLinesScreen.scrollbackBase == baseBeforeED3 + savedCountBeforeED3,
+            "ED 3 advances absolute line identity past cleared scrollback"
+        )
+        expect(savedLinesScreen.lineText(0) == visibleBeforeED3, "ED 3 preserves the live grid")
 
         // MARK: - Screen: styles captured
 
@@ -498,21 +647,68 @@ struct FinderPathTerminalTests {
         // reparenting the terminal view. Starting at the fallback 80x24 grid
         // and resizing a moment later corrupts zsh prompt/history redraws, so
         // the spawn must wait for the first real viewport dimensions.
-        MainActor.assumeIsolated {
-            let deferredSession = TerminalSession(
-                name: "Deferred",
-                workingDirectory: "/tmp",
-                shellPath: "/bin/zsh",
-                scrollbackLimit: 10
-            )
-            deferredSession.start()
-            expect(deferredSession.status == .notStarted, "session waits for a real viewport before spawning")
-            deferredSession.resize(rows: 12, columns: 37)
-            expect(deferredSession.screen.rows == 12 && deferredSession.screen.columns == 37,
-                   "first viewport dimensions reach the screen before spawn")
-            expect(deferredSession.status == .running, "session spawns once viewport geometry is ready")
-            deferredSession.terminate()
+        let deferredSession = TerminalSession(
+            name: "Deferred",
+            workingDirectory: "/tmp",
+            shellPath: "/bin/zsh",
+            scrollbackLimit: 10
+        )
+        deferredSession.start()
+        expect(deferredSession.status == .notStarted, "session waits for a real viewport before spawning")
+        deferredSession.resize(rows: 12, columns: 37)
+        expect(deferredSession.screen.rows == 12 && deferredSession.screen.columns == 37,
+               "first viewport dimensions reach the screen before spawn")
+        for _ in 0..<300 where deferredSession.status == .starting {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
+        expect(deferredSession.status == .running, "session spawns once viewport geometry is ready")
+        deferredSession.terminate()
+
+        // A persisted terminal folder can disappear between launches. Starting
+        // in HOME would silently run commands in the wrong project, so the
+        // session must instead surface the exact unavailable path.
+        let missingDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("finderpath-missing-terminal-folder-\(UUID().uuidString)")
+            .path
+        let missingFolderSession = TerminalSession(
+            name: "Missing Folder",
+            workingDirectory: missingDirectory,
+            shellPath: "/bin/sh",
+            scrollbackLimit: 10
+        )
+        missingFolderSession.resize(rows: 12, columns: 37)
+        missingFolderSession.start()
+        for _ in 0..<300 where missingFolderSession.status == .starting {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        let missingFolderFailure: String? = {
+            if case .failed(let message) = missingFolderSession.status { return message }
+            return nil
+        }()
+        expect(
+            missingFolderFailure?.contains(missingDirectory) == true,
+            "a missing terminal working folder fails with its exact path instead of launching in HOME"
+        )
+        if missingFolderSession.status == .running {
+            missingFolderSession.terminate()
+        }
+
+        let immediateExitSession = TerminalSession(
+            name: "Immediate Exit",
+            workingDirectory: NSTemporaryDirectory(),
+            shellPath: "/usr/bin/true",
+            scrollbackLimit: 10
+        )
+        immediateExitSession.resize(rows: 12, columns: 37)
+        immediateExitSession.start()
+        for _ in 0..<300 {
+            if case .exited = immediateExitSession.status { break }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        expect(
+            { if case .exited = immediateExitSession.status { return true }; return false }(),
+            "an immediately exiting shell cannot be overwritten back to running"
+        )
 
         // MARK: - Screen: hostile counts are clamped to the region
 
@@ -574,6 +770,50 @@ struct FinderPathTerminalTests {
         }
 
         expect(!PTYProcess.defaultShell().isEmpty, "default shell resolves to a non-empty path")
+
+        do {
+            // POSIX permits entering a search/execute-only directory even when
+            // its entries cannot be listed. The cwd descriptor must use
+            // O_SEARCH; O_RDONLY rejects this valid shell working directory.
+            let searchOnlyDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-search-only-cwd-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(
+                at: searchOnlyDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o100]
+            )
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700],
+                    ofItemAtPath: searchOnlyDirectory.path
+                )
+                try? FileManager.default.removeItem(at: searchOnlyDirectory)
+            }
+
+            let pty = PTYProcess(
+                executable: "/bin/sh",
+                arguments: ["-c", "pwd >/dev/null"],
+                workingDirectory: searchOnlyDirectory.path,
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            let exited = DispatchSemaphore(value: 0)
+            var exitCode: Int32 = -999
+            pty.onOutput = { _ in }
+            pty.onExit = { code in exitCode = code; exited.signal() }
+            do {
+                try pty.launch()
+                expect(
+                    exited.wait(timeout: .now() + 5) == .success && exitCode == 0,
+                    "PTY launch accepts an execute-only working directory"
+                )
+            } catch {
+                failures.append("execute-only working-directory launch threw: \(error)")
+            }
+        } catch {
+            failures.append("execute-only working-directory fixture setup failed: \(error)")
+        }
 
         // MARK: - PTY controlling terminal
 
@@ -756,6 +996,77 @@ struct FinderPathTerminalTests {
             try? FileManager.default.removeItem(at: pidFile)
         }
 
+        do {
+            // A process can create new session members from its SIGHUP handler;
+            // they do not exist in terminate()'s pre-signal snapshot. The
+            // delayed escalation must rescan while the original leader remains
+            // live or that HUP-resistant child is orphaned.
+            let readyFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-pty-hup-fork-ready-\(UUID().uuidString)")
+            let childFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-pty-hup-fork-child-\(UUID().uuidString)")
+            let python = """
+            import os, signal, sys, time
+            def on_hup(_signal, _frame):
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                child = os.fork()
+                if child == 0:
+                    with open(sys.argv[2], 'w') as output:
+                        output.write(str(os.getpid()))
+                    time.sleep(30)
+                    os._exit(0)
+            signal.signal(signal.SIGHUP, on_hup)
+            with open(sys.argv[1], 'w') as output:
+                output.write('ready')
+            while True:
+                time.sleep(1)
+            """
+            var pty: PTYProcess? = PTYProcess(
+                executable: "/usr/bin/python3",
+                arguments: ["-c", python, readyFile.path, childFile.path],
+                workingDirectory: NSTemporaryDirectory(),
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            pty?.onOutput = { _ in }
+            var lateChild: pid_t = -1
+            do {
+                try pty?.launch()
+                for _ in 0..<300 where !FileManager.default.fileExists(atPath: readyFile.path) {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                pty?.terminate()
+                for _ in 0..<300 {
+                    if let text = try? String(contentsOf: childFile, encoding: .utf8),
+                       let parsed = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        lateChild = parsed
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                expect(lateChild > 1, "terminate fixture forks a child only after SIGHUP")
+                if lateChild > 1 {
+                    var disappeared = false
+                    for _ in 0..<500 {
+                        if kill(lateChild, 0) == -1, errno == ESRCH {
+                            disappeared = true
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                    expect(disappeared, "terminate escalation kills a child forked by the HUP handler")
+                    if !disappeared { kill(lateChild, SIGKILL) }
+                }
+            } catch {
+                failures.append("HUP-handler fork terminate test could not launch: \(error)")
+            }
+            pty?.terminate()
+            pty = nil
+            try? FileManager.default.removeItem(at: readyFile)
+            try? FileManager.default.removeItem(at: childFile)
+        }
+
         // MARK: - PTY synchronous hang-up (app quit path)
 
         // applicationWillTerminate has no time to let the async terminate()
@@ -771,17 +1082,21 @@ struct FinderPathTerminalTests {
             )
             do {
                 try pty.launch()
-                let pid = pty.hangUpSynchronously()
-                expect(pid != nil, "hangUpSynchronously reports the pid it signalled")
-                if let pid {
-                    PTYProcess.waitForExit(of: [pid], upTo: 2.0)
+                let termination = pty.hangUpSynchronously()
+                expect(termination != nil, "hangUpSynchronously reports the session it signalled")
+                if let termination {
+                    expect(
+                        termination.members.contains(termination.sessionLeader),
+                        "the termination snapshot includes its session leader"
+                    )
+                    PTYProcess.waitForExit(of: [termination], upTo: 2.0)
                     // The child is reaped by the exit watcher, so the pid is
                     // gone rather than a zombie once it has actually died.
                     var stillAlive = false
                     for _ in 0..<50 {
-                        if kill(pid, 0) != 0 { break }
+                        if kill(termination.sessionLeader, 0) != 0 { break }
                         usleep(20_000)
-                        stillAlive = kill(pid, 0) == 0
+                        stillAlive = kill(termination.sessionLeader, 0) == 0
                     }
                     expect(!stillAlive, "the child is dead once the synchronous hang-up returns")
                 }
@@ -791,7 +1106,180 @@ struct FinderPathTerminalTests {
                 failures.append("PTY hang-up test could not launch a child: \(error)")
             }
         }
-        // An empty pid list must not wait out the timeout.
+
+        do {
+            // The shell/session leader should accept SIGHUP, while its child
+            // deliberately ignores it and remains in the original POSIX
+            // session. Quit escalation must retain that pre-HUP membership
+            // even after the leader is gone.
+            let pidFile = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("finderpath-quit-session-child-\(UUID().uuidString)")
+            let python = """
+            import os, signal, sys, time
+            child = os.fork()
+            if child == 0:
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                with open(sys.argv[1], 'w') as output:
+                    output.write(str(os.getpid()))
+                time.sleep(30)
+                os._exit(0)
+            time.sleep(30)
+            """
+            let pty = PTYProcess(
+                executable: "/usr/bin/python3",
+                arguments: ["-c", python, pidFile.path],
+                workingDirectory: NSTemporaryDirectory(),
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            pty.onOutput = { _ in }
+            var descendantPID: pid_t = -1
+            var capturedMembers: [pid_t] = []
+            var capturedSessionLeader: pid_t = -1
+            do {
+                try pty.launch()
+                for _ in 0..<300 {
+                    if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                       let parsed = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        descendantPID = parsed
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                expect(descendantPID > 1, "quit cleanup test should capture the HUP-resistant child PID")
+
+                if let termination = pty.hangUpSynchronously() {
+                    capturedMembers = termination.members
+                    capturedSessionLeader = termination.sessionLeader
+                    expect(
+                        capturedMembers.contains(descendantPID),
+                        "the quit termination snapshot captures the HUP-resistant session child"
+                    )
+
+                    var leaderExited = false
+                    for _ in 0..<200 {
+                        if kill(termination.sessionLeader, 0) == -1, errno == ESRCH {
+                            leaderExited = true
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                    expect(leaderExited, "the session leader exits after the synchronous SIGHUP")
+                    if descendantPID > 1 {
+                        expect(
+                            kill(descendantPID, 0) == 0,
+                            "the child that ignores SIGHUP survives its session leader"
+                        )
+                    }
+
+                    PTYProcess.waitForExit(of: [termination], upTo: 0.1)
+
+                    var survivors = Set(capturedMembers)
+                    for _ in 0..<500 where !survivors.isEmpty {
+                        survivors = survivors.filter { kill($0, 0) == 0 }
+                        if !survivors.isEmpty {
+                            Thread.sleep(forTimeInterval: 0.01)
+                        }
+                    }
+                    expect(
+                        survivors.isEmpty,
+                        "quit escalation removes every captured POSIX session member"
+                    )
+                } else {
+                    failures.append("quit cleanup test did not receive a termination snapshot")
+                }
+            } catch {
+                failures.append("quit session cleanup test could not launch a child: \(error)")
+            }
+            for pid in Set(capturedMembers + [descendantPID])
+            where pid > 1 && getsid(pid) == capturedSessionLeader {
+                kill(pid, SIGKILL)
+            }
+            try? FileManager.default.removeItem(at: pidFile)
+        }
+
+        do {
+            // The synchronous quit snapshot is also taken before SIGHUP. Verify
+            // waitForExit expands it to include a child created by the handler,
+            // rather than limiting SIGKILL to processes that existed beforehand.
+            let readyFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-quit-hup-fork-ready-\(UUID().uuidString)")
+            let childFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-quit-hup-fork-child-\(UUID().uuidString)")
+            let python = """
+            import os, signal, sys, time
+            def on_hup(_signal, _frame):
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                child = os.fork()
+                if child == 0:
+                    with open(sys.argv[2], 'w') as output:
+                        output.write(str(os.getpid()))
+                    time.sleep(30)
+                    os._exit(0)
+            signal.signal(signal.SIGHUP, on_hup)
+            with open(sys.argv[1], 'w') as output:
+                output.write('ready')
+            while True:
+                time.sleep(1)
+            """
+            let pty = PTYProcess(
+                executable: "/usr/bin/python3",
+                arguments: ["-c", python, readyFile.path, childFile.path],
+                workingDirectory: NSTemporaryDirectory(),
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            pty.onOutput = { _ in }
+            var lateChild: pid_t = -1
+            var sessionLeader: pid_t = -1
+            do {
+                try pty.launch()
+                for _ in 0..<300 where !FileManager.default.fileExists(atPath: readyFile.path) {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                if let termination = pty.hangUpSynchronously() {
+                    sessionLeader = termination.sessionLeader
+                    for _ in 0..<300 {
+                        if let text = try? String(contentsOf: childFile, encoding: .utf8),
+                           let parsed = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                            lateChild = parsed
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                    expect(lateChild > 1, "quit fixture forks a child only after synchronous SIGHUP")
+                    expect(
+                        !termination.members.contains(lateChild),
+                        "the post-HUP child is absent from the original quit snapshot"
+                    )
+                    PTYProcess.waitForExit(of: [termination], upTo: 0.15)
+                    if lateChild > 1 {
+                        var disappeared = false
+                        for _ in 0..<300 {
+                            if kill(lateChild, 0) == -1, errno == ESRCH {
+                                disappeared = true
+                                break
+                            }
+                            Thread.sleep(forTimeInterval: 0.01)
+                        }
+                        expect(disappeared, "quit escalation kills a child forked by the HUP handler")
+                    }
+                } else {
+                    failures.append("HUP-handler quit fixture did not return a termination snapshot")
+                }
+            } catch {
+                failures.append("HUP-handler fork quit test could not launch: \(error)")
+            }
+            for pid in [lateChild, sessionLeader] where pid > 1 {
+                if sessionLeader > 1, getsid(pid) == sessionLeader { kill(pid, SIGKILL) }
+            }
+            try? FileManager.default.removeItem(at: readyFile)
+            try? FileManager.default.removeItem(at: childFile)
+        }
+
+        // An empty termination list must not wait out the timeout.
         do {
             let started = Date()
             PTYProcess.waitForExit(of: [], upTo: 5.0)
@@ -915,6 +1403,15 @@ struct FinderPathTerminalTests {
         expect(screen.cell(atRow: 0, column: 0).character == "漢",
                "the intact wide glyph is preserved")
 
+        var wrapMetadataResize = TerminalScreen(rows: 2, columns: 4, scrollbackLimit: 10)
+        for character in "abc界" { wrapMetadataResize.apply(.print(character)) }
+        expect(wrapMetadataResize.cell(atRow: 0, column: 3).isWrapPadding, "resize fixture starts with padding")
+        wrapMetadataResize.resize(rows: 2, columns: 5)
+        expect(
+            !wrapMetadataResize.cell(atRow: 0, column: 3).isWrapPadding,
+            "width changes clear obsolete wrap-padding metadata"
+        )
+
         // MARK: - Screen: ASCII fast path agrees with the Unicode path
 
         expect(TerminalScreen.columnWidth(of: "A") == 1, "printable ASCII is one column")
@@ -948,48 +1445,110 @@ struct FinderPathTerminalTests {
         )
         expect(screen.cursorColumn == 1, "discarded combining marks do not advance the cursor")
 
-        // The read queue can outrun the main actor. Coalescing stays bounded and
-        // records the overflow, and what it discards is the OLDEST output.
-        // Keeping a stale prefix and dropping the tail instead leaves the screen
-        // showing mid-stream lines followed by the prompt, which the user cannot
-        // tell apart from the command genuinely ending there.
+        // The read queue can outrun the main actor, but terminal bytes are a
+        // protocol stream and cannot be evicted safely. Once the bounded buffer
+        // reaches its high-water mark, its serial producer waits for the one
+        // scheduled main-thread drain and then resumes without losing order.
         let outputBuffer = PTYOutputBuffer()
-        let tailMarker = Array("TAIL".utf8)
-        let oversizedOutput =
-            Array(repeating: UInt8(ascii: "x"), count: PTYOutputBuffer.maximumPendingBytes + 4_096 - tailMarker.count)
-            + tailMarker
-        expect(outputBuffer.appendAndClaimDrain(oversizedOutput), "the first PTY burst claims one drain")
+        let readChunkSize = 4_096
+        var expectedPrefix: [UInt8] = []
+        var unexpectedDrainClaims = 0
+        for index in 0..<(PTYOutputBuffer.maximumPendingBytes / readChunkSize) {
+            let chunk = [UInt8](repeating: UInt8(index % 251), count: readChunkSize)
+            expectedPrefix.append(contentsOf: chunk)
+            let claimedDrain = outputBuffer.appendAndClaimDrain(chunk)
+            if claimedDrain != (index == 0) {
+                unexpectedDrainClaims += 1
+            }
+        }
+        expect(unexpectedDrainClaims == 0, "one full PTY window retains a single drain claim")
         expect(
             outputBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
             "PTY buffering stops at its high-water mark"
         )
-        expect(outputBuffer.droppedByteCount == 4_096, "PTY overflow is counted")
-        let drainedBurst = outputBuffer.takeAll()
-        expect(drainedBurst.count == PTYOutputBuffer.maximumPendingBytes, "the bounded PTY window drains")
-        expect(
-            Array(drainedBurst.suffix(tailMarker.count)) == tailMarker,
-            "an oversized burst keeps its newest bytes, not its stale prefix"
-        )
-        expect(outputBuffer.bufferedByteCount == 0, "draining releases buffered PTY memory")
 
-        // Overflow that builds up across several reads evicts the oldest bytes
-        // too, so the most recent output always survives to reach the screen.
-        let steadyBuffer = PTYOutputBuffer()
-        _ = steadyBuffer.appendAndClaimDrain(
-            Array(repeating: UInt8(ascii: "o"), count: PTYOutputBuffer.maximumPendingBytes)
-        )
-        let newestMarker = Array("NEWEST".utf8)
-        _ = steadyBuffer.appendAndClaimDrain(newestMarker)
+        let tailMarker = Array("TAIL".utf8)
+        let producerStarted = DispatchSemaphore(value: 0)
+        let producerFinished = DispatchSemaphore(value: 0)
+        let nextDrainClaimed = DispatchSemaphore(value: 0)
+        DispatchQueue(label: "io.github.bhino50.FinderPath.tests.output-backpressure").async {
+            producerStarted.signal()
+            if outputBuffer.appendAndClaimDrain(tailMarker) {
+                nextDrainClaimed.signal()
+            }
+            producerFinished.signal()
+        }
         expect(
-            steadyBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
-            "a full buffer stays at the high-water mark after more output arrives"
+            producerStarted.wait(timeout: .now() + 1) == .success,
+            "the backpressure test producer starts"
         )
-        expect(steadyBuffer.droppedByteCount == newestMarker.count, "evicted older bytes are counted as dropped")
-        let drainedSteady = steadyBuffer.takeAll()
         expect(
-            Array(drainedSteady.suffix(newestMarker.count)) == newestMarker,
-            "bytes arriving at a full buffer evict the oldest instead of being discarded"
+            producerFinished.wait(timeout: .now() + 0.1) == .timedOut,
+            "a PTY producer blocks when the pending buffer is at its high-water mark"
         )
+        expect(
+            outputBuffer.bufferedByteCount == PTYOutputBuffer.maximumPendingBytes,
+            "a blocked append never grows the PTY buffer beyond its bound"
+        )
+        let drainedPrefix = outputBuffer.takeAll()
+        expect(drainedPrefix == expectedPrefix, "the first bounded PTY window drains without byte loss")
+        expect(
+            nextDrainClaimed.wait(timeout: .now() + 2) == .success,
+            "draining wakes the blocked producer and lets it claim the next drain"
+        )
+        expect(
+            producerFinished.wait(timeout: .now() + 2) == .success,
+            "the producer returns after backpressure is released"
+        )
+        let drainedTail = outputBuffer.takeAll()
+        expect(
+            drainedPrefix + drainedTail == expectedPrefix + tailMarker,
+            "backpressure retains every PTY byte in arrival order"
+        )
+        expect(outputBuffer.bufferedByteCount == 0, "draining releases all pending PTY bytes")
+
+        // Exercise several full-window producer/drain handoffs. Every append is
+        // no larger than a real PTY read, and total output exceeds the bound so
+        // the test cannot pass without repeated wakeups.
+        let repeatedBuffer = PTYOutputBuffer()
+        let repeatedChunkCount = (PTYOutputBuffer.maximumPendingBytes / readChunkSize) * 3
+        var repeatedExpected: [UInt8] = []
+        for index in 0..<repeatedChunkCount {
+            repeatedExpected.append(
+                contentsOf: [UInt8](repeating: UInt8(index % 251), count: readChunkSize)
+            )
+        }
+        let drainRequested = DispatchSemaphore(value: 0)
+        let repeatedProducerFinished = DispatchSemaphore(value: 0)
+        DispatchQueue(label: "io.github.bhino50.FinderPath.tests.repeated-output-backpressure").async {
+            for index in 0..<repeatedChunkCount {
+                let chunk = [UInt8](repeating: UInt8(index % 251), count: readChunkSize)
+                if repeatedBuffer.appendAndClaimDrain(chunk) {
+                    drainRequested.signal()
+                }
+            }
+            repeatedProducerFinished.signal()
+        }
+
+        var repeatedDrained: [UInt8] = []
+        var repeatedDrainCount = 0
+        var repeatedDrainTimedOut = false
+        while repeatedDrained.count < repeatedExpected.count {
+            guard drainRequested.wait(timeout: .now() + 2) == .success else {
+                repeatedDrainTimedOut = true
+                break
+            }
+            repeatedDrained.append(contentsOf: repeatedBuffer.takeAll())
+            repeatedDrainCount += 1
+        }
+        expect(!repeatedDrainTimedOut, "repeated PTY backpressure handoffs do not deadlock")
+        expect(
+            repeatedProducerFinished.wait(timeout: .now() + 2) == .success,
+            "the repeated PTY producer completes"
+        )
+        expect(repeatedDrainCount >= 3, "output larger than the bound requires repeated drains")
+        expect(repeatedDrained == repeatedExpected, "repeated drains retain every PTY byte in order")
+        expect(repeatedBuffer.bufferedByteCount == 0, "repeated drains leave no pending bytes")
 
         // MARK: - Screen: alt-screen resize preserves the parked primary screen
         //
@@ -1141,6 +1700,27 @@ struct FinderPathTerminalTests {
         expect(
             resized.scrollbackBase >= baseBeforeResize,
             "rows discarded by a resize advance the absolute base"
+        )
+
+        // Sustained output crosses many backing-array compactions. The logical
+        // ring must retain its exact newest window and absolute base throughout.
+        let stressLineCount = 5_000
+        let stressLimit = 128
+        var stressedRing = TerminalScreen(rows: 2, columns: 16, scrollbackLimit: stressLimit)
+        for index in 0..<stressLineCount { emitLine(&stressedRing, "S\(index)") }
+        let expectedDiscarded = stressLineCount - 1 - stressLimit
+        expect(stressedRing.scrollbackCount == stressLimit, "sustained scrollback stays at its exact limit")
+        expect(
+            stressedRing.scrollbackBase == expectedDiscarded,
+            "every compacted scrollback line advances the absolute base"
+        )
+        expect(
+            ringText(stressedRing, 0) == "S\(expectedDiscarded)",
+            "compaction preserves the oldest retained line"
+        )
+        expect(
+            ringText(stressedRing, stressLimit - 1) == "S\(stressLineCount - 2)",
+            "compaction preserves the newest saved line"
         )
 
         // MARK: - Screen: soft-wrap continuation

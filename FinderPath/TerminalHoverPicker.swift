@@ -139,6 +139,9 @@ final class TerminalHoverPickerController {
     }
 
     private func startProximityTimer() {
+        // A second start while a timer is live must replace it, not stack a
+        // permanent 4 Hz wakeup that nothing can invalidate.
+        proximityTimer?.invalidate()
         missedProximityChecks = 0
         let timer = Timer(timeInterval: Self.proximityInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in

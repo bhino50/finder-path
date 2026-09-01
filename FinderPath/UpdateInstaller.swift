@@ -18,6 +18,11 @@ enum UpdateInstaller {
     private static let maximumExpandedPathDepth = 64
     private static let extractionTimeout: TimeInterval = 120
 
+    enum BrowserRecoveryPolicy: Equatable {
+        case unavailable
+        case offerManifestDownload
+    }
+
     /// Cancels an oversized update while bytes are still arriving. The final
     /// file-size check remains as a second line of defense for responses whose
     /// expected length is unknown or inaccurate.
@@ -59,8 +64,10 @@ enum UpdateInstaller {
     }
 
     enum InstallError: LocalizedError {
+        case unsupportedHostBundle(String?)
         case noArchiveURL
         case downloadFailed(String)
+        case downloadRejected(String)
         case extractionFailed(String)
         case appNotFoundInArchive
         case verificationFailed(String)
@@ -68,10 +75,14 @@ enum UpdateInstaller {
 
         var errorDescription: String? {
             switch self {
+            case .unsupportedHostBundle:
+                return "Automatic updates can only replace the official FinderPath app. Development builds remain isolated and must be rebuilt from source."
             case .noArchiveURL:
                 return "This release does not include a direct install package."
             case .downloadFailed(let detail):
                 return "The update could not be downloaded: \(detail)"
+            case .downloadRejected(let detail):
+                return "The update package was rejected: \(detail)"
             case .extractionFailed(let detail):
                 return "The update package could not be opened: \(detail)"
             case .appNotFoundInArchive:
@@ -82,19 +93,44 @@ enum UpdateInstaller {
                 return "The update could not be installed: \(detail)"
             }
         }
+
+        /// Only a clearly operational download failure may offer the manifest's
+        /// external download URL. Every package rejection and every error whose
+        /// verification state is unknown fails closed.
+        var browserRecoveryPolicy: BrowserRecoveryPolicy {
+            switch self {
+            case .downloadFailed:
+                return .offerManifestDownload
+            case .unsupportedHostBundle,
+                 .noArchiveURL,
+                 .downloadRejected,
+                 .extractionFailed,
+                 .appNotFoundInArchive,
+                 .verificationFailed,
+                 .installFailed:
+                return .unavailable
+            }
+        }
     }
 
     static func install(
         manifest: UpdateManifest,
         completion: @escaping @MainActor (Result<Void, InstallError>) -> Void
     ) {
+        let hostBundleIdentifier = Bundle.main.bundleIdentifier
+        guard installerHostIsEligible(bundleIdentifier: hostBundleIdentifier) else {
+            Task { @MainActor in
+                completion(.failure(.unsupportedHostBundle(hostBundleIdentifier)))
+            }
+            return
+        }
         guard let archiveURL = manifest.archiveURL else {
             Task { @MainActor in completion(.failure(.noArchiveURL)) }
             return
         }
         guard isHTTPSWebURL(archiveURL) else {
             Task { @MainActor in
-                completion(.failure(.downloadFailed("Update packages must be served over HTTPS.")))
+                completion(.failure(.downloadRejected("Update packages must be served over HTTPS.")))
             }
             return
         }
@@ -116,41 +152,41 @@ enum UpdateInstaller {
             defer { session.finishTasksAndInvalidate() }
             if let error {
                 if sizeLimiter.didExceedLimit {
-                    finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
+                    finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
                     return
                 }
-                finish(.failure(.downloadFailed(error.localizedDescription)))
+                finish(.failure(classifyDownloadError(error)))
                 return
             }
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode) else {
-                let status = (response as? HTTPURLResponse)?.statusCode
-                let detail = status.map { "Update server returned HTTP \($0)." }
-                    ?? "The update server returned an invalid response."
-                finish(.failure(.downloadFailed(detail)))
+            guard let httpResponse = response as? HTTPURLResponse else {
+                finish(.failure(.downloadRejected("The update server returned an invalid response.")))
+                return
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                finish(.failure(.downloadRejected("Update server returned HTTP \(httpResponse.statusCode).")))
                 return
             }
             guard let finalURL = httpResponse.url, isHTTPSWebURL(finalURL) else {
-                finish(.failure(.downloadFailed("The update redirected to a non-HTTPS location.")))
+                finish(.failure(.downloadRejected("The update redirected to a non-HTTPS location.")))
                 return
             }
             if httpResponse.expectedContentLength > maximumArchiveSize {
-                finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
+                finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
                 return
             }
             guard let location else {
-                finish(.failure(.downloadFailed("No file was received.")))
+                finish(.failure(.downloadRejected("No file was received.")))
                 return
             }
 
             let archiveSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
                 .map(Int64.init) ?? 0
             guard archiveSize > 0 else {
-                finish(.failure(.downloadFailed("The update package was empty.")))
+                finish(.failure(.downloadRejected("The update package was empty.")))
                 return
             }
             guard archiveSize <= maximumArchiveSize else {
-                finish(.failure(.downloadFailed("The update package exceeded the 256 MB safety limit.")))
+                finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
                 return
             }
 
@@ -174,12 +210,49 @@ enum UpdateInstaller {
         }.resume()
     }
 
+    /// A Debug/no-Xcode bundle must never replace itself with a release bundle.
+    /// Doing so crosses the development/production persistence namespace and
+    /// defeats deterministic duplicate-process election on relaunch.
+    static func installerHostIsEligible(bundleIdentifier: String?) -> Bool {
+        bundleIdentifier == expectedBundleID
+    }
+
+    /// URLSession uses the same error channel for ordinary connectivity loss
+    /// and trust failures. Only explicit network-availability failures qualify
+    /// for external browser recovery; unknown and security-sensitive failures
+    /// remain rejected.
+    static func classifyDownloadError(_ error: Error) -> InstallError {
+        let detail = error.localizedDescription
+        guard let urlError = error as? URLError else {
+            return .downloadRejected(detail)
+        }
+
+        switch urlError.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .notConnectedToInternet,
+             .internationalRoamingOff,
+             .callIsActive,
+             .dataNotAllowed:
+            return .downloadFailed(detail)
+        default:
+            return .downloadRejected(detail)
+        }
+    }
+
     // MARK: - Steps
 
     private static func makeWorkDirectory() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("FinderPathUpdate-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         return dir
     }
 
@@ -189,7 +262,11 @@ enum UpdateInstaller {
 
     private static func extractApp(from archive: URL, into workDir: URL) throws -> URL {
         let extractDir = workDir.appendingPathComponent("extracted")
-        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: extractDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
 
         if archive.pathExtension.lowercased() == "dmg" {
             try extractFromDiskImage(archive, into: extractDir)
@@ -403,7 +480,7 @@ enum UpdateInstaller {
         while task.isRunning {
             let now = Date()
             if let deadline, now >= deadline {
-                monitorFailure = "The update operation exceeded its (Int(timeout ?? 0))-second safety limit."
+                monitorFailure = operationTimeoutMessage(seconds: timeout ?? 0)
                 stop(task)
                 break
             }
@@ -441,6 +518,43 @@ enum UpdateInstaller {
         }
     }
 
+    static func operationTimeoutMessage(seconds: TimeInterval) -> String {
+        "The update operation exceeded its \(Int(seconds))-second safety limit."
+    }
+
+    static func expandedEntryCountMessage(maximumEntries: Int) -> String {
+        "The expanded update contained more than \(maximumEntries) entries."
+    }
+
+    static func expandedPathDepthMessage(maximumDepth: Int) -> String {
+        "The expanded update exceeded the maximum path depth of \(maximumDepth)."
+    }
+
+    static func expandedSizeLimitMessage(maximumSize: Int64) -> String {
+        "The expanded update exceeded the \(maximumSize / (1_024 * 1_024)) MB safety limit."
+    }
+
+    static let escapedContainmentMessage = "The expanded update contained an entry outside the package."
+
+    private static func isContained(_ path: String, within root: String) -> Bool {
+        path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    /// Symlinks are the entry class the extractor cannot make safe on its own:
+    /// an absolute or climbing link inside the archive would let the install
+    /// copy, or a later extracted entry, write outside the work tree. Links
+    /// that stay inside the package (framework layouts) remain allowed.
+    private static func symbolicLinkEscapes(_ link: URL, root: URL) -> Bool {
+        guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: link.path) else {
+            return true
+        }
+        if destination.hasPrefix("/") { return true }
+        let resolved = link.deletingLastPathComponent()
+            .appendingPathComponent(destination)
+            .standardizedFileURL
+        return !isContained(resolved.path, within: root.standardizedFileURL.path)
+    }
+
     /// Returns a user-facing reason when extracted contents exceed a resource
     /// ceiling. Kept internal so the release logic tests can exercise the
     /// archive-bomb guard without installing an app.
@@ -462,7 +576,7 @@ enum UpdateInstaller {
         var enumerationFailed = false
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey],
             options: [],
             errorHandler: { _, _ in
                 enumerationFailed = true
@@ -478,25 +592,34 @@ enum UpdateInstaller {
         while let entry = enumerator.nextObject() as? URL {
             entryCount += 1
             if entryCount > maximumEntries {
-                return "The expanded update contained more than (maximumEntries) entries."
+                return expandedEntryCountMessage(maximumEntries: maximumEntries)
             }
 
             let depth = entry.standardizedFileURL.pathComponents.count - rootDepth
             if depth > maximumDepth {
-                return "The expanded update exceeded the maximum path depth of (maximumDepth)."
+                return expandedPathDepthMessage(maximumDepth: maximumDepth)
             }
 
             let values: URLResourceValues
             do {
-                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey])
             } catch {
                 return "FinderPath could not inspect the expanded update."
+            }
+            // Zip-slip defense in depth: the archive is inspected before any
+            // signature check, so a link that resolves outside the extraction
+            // root is rejected here, before verification or install follow it.
+            if values.isSymbolicLink == true {
+                if symbolicLinkEscapes(entry, root: root) {
+                    return escapedContainmentMessage
+                }
+                continue
             }
             guard values.isDirectory != true else { continue }
             let fileSize = Int64(max(values.fileSize ?? 0, 0))
             let (newTotal, overflow) = totalSize.addingReportingOverflow(fileSize)
             if overflow || newTotal > maximumSize {
-                return "The expanded update exceeded the (maximumSize / (1_024 * 1_024)) MB safety limit."
+                return expandedSizeLimitMessage(maximumSize: maximumSize)
             }
             totalSize = newTotal
         }

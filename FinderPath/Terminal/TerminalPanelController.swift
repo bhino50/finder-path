@@ -29,7 +29,12 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     private static let panelTitle = "FinderPath Terminals"
 
     private let store: TerminalSessionStore
-    private let newSessionDirectory: () -> String
+    private let newSessionDirectory: @MainActor () async -> String?
+    private var defaultSessionCreationTask: Task<TerminalSession?, Never>?
+    private var defaultSessionCreationGeneration: UInt64 = 0
+    private var defaultSessionCreationRequiresEmptyStore = false
+    private var pendingPresentationTask: Task<Void, Never>?
+    private var presentationGeneration: UInt64 = 0
 
     /// True while the content lives in the resizable floating window instead of
     /// the popover. The window is the default surface so the terminal resizes
@@ -55,7 +60,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     /// after that the user's position (and window autosave) win.
     private var hasPositionedPanel = false
 
-    init(store: TerminalSessionStore, newSessionDirectory: @escaping () -> String) {
+    init(store: TerminalSessionStore, newSessionDirectory: @escaping @MainActor () async -> String?) {
         self.store = store
         self.newSessionDirectory = newSessionDirectory
         super.init()
@@ -85,79 +90,123 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
 
     // MARK: - Presentation
 
-    /// True while either surface (popover or pinned panel) is on screen. The
-    /// hover quick-pick uses this to stay out of the way when the terminal UI
-    /// is already visible.
+    /// True while either surface is on screen or an asynchronous show is
+    /// pending. The hover quick-pick and a second toggle both treat validation
+    /// time as presenting so the user's close intent cannot be reversed later.
     var isPresenting: Bool {
-        popover?.isShown == true || panel?.isVisible == true
+        pendingPresentationTask != nil
+            || popover?.isShown == true
+            || panel?.isVisible == true
     }
 
     func toggle(relativeTo statusButton: NSStatusBarButton) {
         lastStatusButton = statusButton
+        if isPresenting {
+            dismiss()
+            return
+        }
         if isPinned {
-            togglePanel()
-            return
+            presentPanel()
+        } else {
+            presentPopover(relativeTo: statusButton)
         }
-        if let popover, popover.isShown {
-            popover.performClose(nil)
-            return
-        }
-        presentPopover(relativeTo: statusButton)
     }
 
     func show(session: TerminalSession, relativeTo statusButton: NSStatusBarButton) {
         lastStatusButton = statusButton
         activeSessionID = session.id
-        if isPinned {
-            presentPanel()
-        } else if popover?.isShown == true {
+        if isPinned, panel?.isVisible == true {
             activate(session)
+        } else if !isPinned, popover?.isShown == true {
+            activate(session)
+        } else if isPinned {
+            presentPanel()
         } else {
             presentPopover(relativeTo: statusButton)
         }
     }
 
     private func presentPopover(relativeTo statusButton: NSStatusBarButton) {
-        let popover = ensurePopover()
-        activateCurrentOrFirstSession()
-        // .applicationDefined popovers (unlike .transient) do not take key
-        // focus on their own, so the app must be activated for the terminal to
-        // receive keystrokes. No dismiss monitor is installed, so this does not
-        // make the popover vanish on interaction.
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
-        terminalView.focusTerminal()
-        terminalView.updateRedrawTimer()
+        let generation = beginPresentation()
+        let task = Task { @MainActor [weak self, weak statusButton] in
+            guard let self else { return }
+            defer { self.finishPresentation(generation: generation) }
+            guard let statusButton else { return }
+            let popover = self.ensurePopover()
+            guard await self.ensureSessionExists() else { return }
+            guard !Task.isCancelled,
+                  generation == self.presentationGeneration,
+                  !self.isPinned else { return }
+            guard self.activateCurrentOrFirstSession() else { return }
+            // .applicationDefined popovers (unlike .transient) do not take key
+            // focus on their own, so the app must be activated for the terminal to
+            // receive keystrokes. No dismiss monitor is installed, so this does not
+            // make the popover vanish on interaction.
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: statusButton.bounds, of: statusButton, preferredEdge: .minY)
+            self.terminalView.focusTerminal()
+            self.terminalView.updateRedrawTimer()
+        }
+        pendingPresentationTask = task
     }
 
     private func presentPanel() {
-        let panel = ensurePanel()
-        if panel.contentView !== contentView {
-            contentView.removeFromSuperview()
-            panel.contentView = contentView
+        let generation = beginPresentation()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.finishPresentation(generation: generation) }
+            let panel = self.ensurePanel()
+            if panel.contentView !== self.contentView {
+                self.contentView.removeFromSuperview()
+                panel.contentView = self.contentView
+            }
+            self.positionPanelIfNeeded(panel)
+            guard await self.ensureSessionExists() else { return }
+            guard !Task.isCancelled,
+                  generation == self.presentationGeneration,
+                  self.isPinned else { return }
+            guard self.activateCurrentOrFirstSession() else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            panel.orderFrontRegardless()
+            self.terminalView.focusTerminal()
+            self.terminalView.updateRedrawTimer()
         }
-        positionPanelIfNeeded(panel)
-        activateCurrentOrFirstSession()
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
-        panel.orderFrontRegardless()
-        terminalView.focusTerminal()
-        terminalView.updateRedrawTimer()
+        pendingPresentationTask = task
     }
 
-    private func togglePanel() {
-        if let panel, panel.isVisible {
-            // Hiding, not closing: sessions keep running in the store.
-            panel.orderOut(nil)
-            terminalView.updateRedrawTimer()
-            return
+    private func beginPresentation() -> UInt64 {
+        pendingPresentationTask?.cancel()
+        pendingPresentationTask = nil
+        presentationGeneration &+= 1
+        return presentationGeneration
+    }
+
+    private func finishPresentation(generation: UInt64) {
+        guard generation == presentationGeneration else { return }
+        pendingPresentationTask = nil
+    }
+
+    private func cancelPendingPresentation(cancelDefaultSessionCreation: Bool = false) {
+        presentationGeneration &+= 1
+        pendingPresentationTask?.cancel()
+        pendingPresentationTask = nil
+        if cancelDefaultSessionCreation, defaultSessionCreationRequiresEmptyStore {
+            cancelDefaultSessionCreationTask()
         }
-        presentPanel()
+    }
+
+    private func cancelDefaultSessionCreationTask() {
+        defaultSessionCreationGeneration &+= 1
+        defaultSessionCreationTask?.cancel()
+        defaultSessionCreationTask = nil
+        defaultSessionCreationRequiresEmptyStore = false
     }
 
     /// Hides whichever surface is showing. Sessions keep running in the store,
     /// so reopening restores them.
     private func dismiss() {
+        cancelPendingPresentation(cancelDefaultSessionCreation: true)
         if isPinned {
             panel?.orderOut(nil)
         } else {
@@ -239,6 +288,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     }
 
     private func pin() {
+        cancelPendingPresentation()
         persistPopoverSize()
         popover?.performClose(nil)
         popover = nil
@@ -251,6 +301,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     }
 
     private func unpin() {
+        cancelPendingPresentation()
         if let panel {
             panel.orderOut(nil)
             // Detach the content so the popover can adopt it again.
@@ -319,24 +370,67 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         updateRestartButton()
     }
 
-    private func activateCurrentOrFirstSession() {
+    private func ensureSessionExists() async -> Bool {
         // Never present an empty window: if nothing is open, start a terminal
         // in the current Finder folder so there is always something to show.
         if store.sessions.isEmpty {
-            _ = store.newSession(name: nil, workingDirectory: newSessionDirectory())
+            guard await createDefaultSession(onlyIfStoreEmpty: true) != nil else { return false }
         }
+        return true
+    }
+
+    @discardableResult
+    private func activateCurrentOrFirstSession() -> Bool {
         if let session = activeSession {
             activate(session)
-            return
+            return true
         }
         terminalView.session = nil
         rebuildTabs()
         updateRestartButton()
+        return false
+    }
+
+    /// Coalesces simultaneous panel/open-tab requests while a network folder is
+    /// being checked, so one user gesture cannot create duplicate terminals.
+    private func createDefaultSession(onlyIfStoreEmpty: Bool = false) async -> TerminalSession? {
+        if let defaultSessionCreationTask {
+            return await defaultSessionCreationTask.value
+        }
+        defaultSessionCreationGeneration &+= 1
+        let generation = defaultSessionCreationGeneration
+        let task = Task { @MainActor [weak self] () -> TerminalSession? in
+            guard let self, let directory = await self.newSessionDirectory() else { return nil }
+            guard !Task.isCancelled,
+                  generation == self.defaultSessionCreationGeneration else { return nil }
+            if onlyIfStoreEmpty, !self.store.sessions.isEmpty {
+                return self.store.sessions.first
+            }
+            // Prevent storeDidChange from mistaking this task's own committed
+            // session for an external action that superseded the default.
+            if onlyIfStoreEmpty {
+                self.defaultSessionCreationRequiresEmptyStore = false
+            }
+            return self.store.newSession(name: nil, workingDirectory: directory)
+        }
+        defaultSessionCreationTask = task
+        defaultSessionCreationRequiresEmptyStore = onlyIfStoreEmpty
+        let session = await task.value
+        if generation == defaultSessionCreationGeneration {
+            defaultSessionCreationTask = nil
+            defaultSessionCreationRequiresEmptyStore = false
+        }
+        return session
     }
 
     // MARK: - Store and status wiring
 
     private func storeDidChange() {
+        if !store.sessions.isEmpty, defaultSessionCreationRequiresEmptyStore {
+            // An explicit session supersedes an invisible auto-create request.
+            // Cancel before its directory validation can surface a stale alert.
+            cancelDefaultSessionCreationTask()
+        }
         for session in store.sessions {
             session.onStatusChange = { [weak self] in self?.sessionStatusDidChange() }
             // Follow the shell title so the tab renames itself to the running task.
@@ -397,7 +491,10 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func newSessionClicked(_ sender: NSButton) {
-        activate(store.newSession(name: nil, workingDirectory: newSessionDirectory()))
+        Task { @MainActor [weak self] in
+            guard let self, let session = await self.createDefaultSession() else { return }
+            self.activate(session)
+        }
     }
 
     @objc private func restartClicked(_ sender: NSButton) {
@@ -597,7 +694,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         let color: NSColor
         switch status {
         case .exited, .failed: color = .tertiaryLabelColor
-        case .running, .notStarted: color = .labelColor
+        case .running, .starting, .notStarted: color = .labelColor
         }
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byTruncatingTail
@@ -614,7 +711,7 @@ final class TerminalPanelController: NSObject, NSPopoverDelegate {
         switch activeSession?.status {
         case .exited, .failed:
             restartButton.isHidden = false
-        case .running, .notStarted, nil:
+        case .running, .starting, .notStarted, nil:
             restartButton.isHidden = true
         }
     }
@@ -657,15 +754,18 @@ private final class ResizeGripView: NSView {
     private var startSize: CGSize = .zero
 
     override func mouseDown(with event: NSEvent) {
-        startMouse = event.locationInWindow
+        // Track the drag in screen coordinates. The popover's own window
+        // moves and resizes while the corner is dragged, so window-relative
+        // points fed the delta back into itself: drag 100 px, grow 200 px.
+        startMouse = NSEvent.mouseLocation
         startSize = onResizeBegan?() ?? .zero
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let now = event.locationInWindow
+        let now = NSEvent.mouseLocation
         let dx = now.x - startMouse.x
         let dy = now.y - startMouse.y
-        // Window coordinates increase upward, so dragging the corner down
+        // Screen coordinates increase upward, so dragging the corner down
         // (negative dy) must grow the height.
         onResize?(CGSize(width: startSize.width + dx, height: startSize.height - dy))
     }

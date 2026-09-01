@@ -27,10 +27,10 @@ struct PendingURLQueue {
     /// False until `drain()` runs, i.e. until the router and preferences exist.
     private(set) var isReady = false
 
-    /// Records `incoming` and returns the URLs to handle right now: everything
-    /// once the app is ready, nothing while it is still launching.
+    /// Records `incoming` and returns the URLs to handle right now: a bounded
+    /// batch once the app is ready, nothing while it is still launching.
     mutating func accept(_ incoming: [URL]) -> [URL] {
-        guard !isReady else { return incoming }
+        guard !isReady else { return Array(incoming.prefix(Self.capacity)) }
         // Keep the earliest URLs: the one that launched the app is the one the
         // user actually asked for.
         for url in incoming where buffered.count < Self.capacity {

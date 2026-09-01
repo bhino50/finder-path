@@ -147,10 +147,19 @@ final class RecentPathsStore {
         }
     }
 
+    nonisolated static func applicationSupportDirectoryName(bundleIdentifier: String?) -> String {
+        bundleIdentifier == "io.github.bhino50.FinderPathDev" ? "FinderPathDev" : "FinderPath"
+    }
+
     private nonisolated static func persistenceURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("FinderPath/recent-paths.json")
+        return base
+            .appendingPathComponent(
+                applicationSupportDirectoryName(bundleIdentifier: Bundle.main.bundleIdentifier),
+                isDirectory: true
+            )
+            .appendingPathComponent("recent-paths.json")
     }
 
     private nonisolated static func hardenPermissions(at url: URL) throws {

@@ -32,7 +32,7 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 - **Mini terminals** — cmux-style terminal sessions built into the menu bar. A homegrown terminal emulator (no third-party dependencies) runs real shells, so you can use `git`, `ssh`, `vim`, `htop`, or CLI agents in FinderPath. Sessions keep running in the background while the app is open and restore their name and working directory after a restart. Left-click shows them in a **Terminals** menu section with **New Terminal Here**; right-click opens the movable, edge-resizable terminal window directly. Switch sessions with the tab strip, or unpin the window to return it to a menu-bar popover. Hold Option before opening the path menu to launch Codex, Claude, or Hermes inside FinderPath Terminal instead of an external terminal.
 - **Connect to Server** — a clean window (modeled on macOS Terminal's New Remote Connection) for SSH-ing to your machines. Lists all of your **Tailscale** devices live by default, with a "Show all" toggle when you want a Linux-only view, shows VPN status with a Connect/Disconnect button, and keeps a curated list of your own servers you manage with +/−. Runs the session in Ghostty or Terminal.
 - **Shortcut action URLs** — `finderpath://connect` opens FinderPath's connection window. Trusted keyboard tools like Karabiner can also use `finderpath://open-ghostty` and `finderpath://open-cmux` after you opt in to terminal-app launch URLs in Settings
-- **Check for Updates** — pulls the latest GitHub Release and offers a one-click download if a newer version is available
+- **Check for Updates** — pulls the latest GitHub Release and, when it includes a direct `.zip` or `.dmg`, verifies, installs, and relaunches the new version in place
 - **Configurable Settings** — toggle menu items (including Recent Paths); choose path display style (full, `~`-abbreviated, compact); adjust header width, font size, and truncation mode; pick menu bar icon and optional short title; set `cd` quoting style; choose the SSH terminal; configure agent executable paths, the update source URL, and trusted shortcut URL launches; toggle the Terminals section and right-click behavior, and set the mini-terminal font size, scrollback limit, and shell override
 
 ---
@@ -122,20 +122,22 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 
 ## Permissions
 
-FinderPath requires two Automation permissions, granted via a macOS prompt on first use:
+FinderPath uses Apple Events only for these integrations, with macOS prompting when each one is first used:
 
 - **Finder** — reads the path of the frontmost Finder window via AppleScript
-- **Terminal / Ghostty** — opens terminal sessions for the terminal and agent launch actions
+- **Terminal** — opens Terminal sessions for Terminal and external agent launch actions
+
+Ghostty is opened through Launch Services, and cmux is launched as a direct process. Those integrations do not use Apple Events from FinderPath.
 
 To review or re-grant permissions: System Settings > Privacy & Security > Automation > FinderPath.
 
-If access is denied, FinderPath shows the AppleScript error in the path field instead of crashing.
+If Finder access is denied, FinderPath shows the AppleScript error in the path field instead of crashing.
 
 ---
 
 ## Updates
 
-`Check for Updates...` reads the latest GitHub Release from `https://api.github.com/repos/bhino50/finder-path/releases/latest`, strips the leading `v` from the tag (`v1.2` → `1.2`), and compares it to the installed `CFBundleShortVersionString`. If a newer release is found, FinderPath shows an alert with the release notes and a `Download` button that opens the first `.dmg` asset (falling back to the first `.zip`, or the release page) in your browser. The source URL is editable under Settings > Updates.
+`Check for Updates...` reads the latest GitHub Release from `https://api.github.com/repos/bhino50/finder-path/releases/latest`, strips the leading `v` from the tag (`v1.2` → `1.2`), and compares it to the installed `CFBundleShortVersionString`. If a newer release includes a direct `.zip` or `.dmg`, FinderPath offers **Install and Relaunch**. It downloads the archive to a temporary directory, extracts `FinderPath.app`, verifies the bundle identifier, version, pinned Developer ID team, and Gatekeeper assessment, then replaces the running copy and relaunches it. If no direct archive is available, **Download** opens the manifest's download or release URL in your browser. After an install attempt, browser recovery is available only for an operational download failure; rejected or unverified packages fail closed. The source URL is editable under Settings > Updates.
 
 The parser also accepts a plain JSON manifest if you point the URL elsewhere:
 

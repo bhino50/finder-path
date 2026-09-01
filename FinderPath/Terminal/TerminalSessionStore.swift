@@ -105,11 +105,13 @@ final class TerminalSessionStore {
     /// terminate() path never got to deliver its SIGHUP and left orphaned
     /// shells (and any agent CLI running inside them) behind.
     ///
-    /// Every session is signalled first and the grace period is then shared,
-    /// so quitting with ten terminals open is no slower than with one.
+    /// Every POSIX-session membership is captured before its SIGHUP. All
+    /// sessions are signalled first and the grace period is then shared, so a
+    /// HUP-resistant child remains eligible for escalation after its leader
+    /// exits, and quitting with ten terminals open is no slower than with one.
     func terminateAll() {
-        let hungUp = sessions.compactMap { $0.hangUp() }
-        PTYProcess.waitForExit(of: hungUp, upTo: Self.quitGracePeriod)
+        let terminations = sessions.compactMap { $0.hangUp() }
+        PTYProcess.waitForExit(of: terminations, upTo: Self.quitGracePeriod)
     }
 
     /// Long enough for a shell to run its exit traps, short enough that quit
@@ -178,10 +180,19 @@ final class TerminalSessionStore {
         }
     }
 
+    nonisolated static func applicationSupportDirectoryName(bundleIdentifier: String?) -> String {
+        bundleIdentifier == "io.github.bhino50.FinderPathDev" ? "FinderPathDev" : "FinderPath"
+    }
+
     private nonisolated static func persistenceURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("FinderPath/terminal-sessions.json")
+        return base
+            .appendingPathComponent(
+                applicationSupportDirectoryName(bundleIdentifier: Bundle.main.bundleIdentifier),
+                isDirectory: true
+            )
+            .appendingPathComponent("terminal-sessions.json")
     }
 
     private nonisolated static func hardenPersistencePermissions(at url: URL) throws {

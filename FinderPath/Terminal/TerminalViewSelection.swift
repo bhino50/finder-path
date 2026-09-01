@@ -101,17 +101,13 @@ extension TerminalView {
                 continue
             }
             let upperBound = min(lastColumn, cells.count - 1)
-            let text = String(
-                cells[firstColumn...upperBound]
-                    .filter { !$0.isContinuation }
-                    .map(\.character)
-            )
             // Trailing blanks are row padding, not content -- but a wrapped row
             // runs to the edge, so trimming it would eat real characters.
-            let trimmed = continues
-                ? text
-                : String(text.reversed().drop(while: { $0 == " " }).reversed())
-            rows.append(TerminalTextJoiner.Row(text: trimmed, continuesToNextRow: continues))
+            let text = TerminalRowText.string(
+                from: cells[firstColumn...upperBound],
+                trimmingTrailingSpaces: !continues
+            )
+            rows.append(TerminalTextJoiner.Row(text: text, continuesToNextRow: continues))
         }
 
         let joined = TerminalTextJoiner.join(rows)

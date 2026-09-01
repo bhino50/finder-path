@@ -10,6 +10,7 @@ import Foundation
 final class TerminalSession: Identifiable {
     enum Status: Equatable {
         case notStarted
+        case starting
         case running
         case exited(Int32)
         case failed(String)
@@ -63,6 +64,8 @@ final class TerminalSession: Identifiable {
     /// shell rather than silently re-launching the agent.
     private let initialCommand: String?
     private var pty: PTYProcess?
+    private var spawnTask: Task<Void, Never>?
+    private var spawnGeneration = 0
     private var parser = TerminalParser()
     private var lastNotifiedTitle = ""
     /// A shell must not start until a real TerminalView has supplied its grid.
@@ -107,6 +110,9 @@ final class TerminalSession: Identifiable {
     }
 
     func restart() {
+        spawnGeneration += 1
+        spawnTask?.cancel()
+        spawnTask = nil
         pty?.terminate()
         pty = nil
         startWhenViewportIsReady = false
@@ -124,28 +130,88 @@ final class TerminalSession: Identifiable {
     }
 
     func terminate() {
+        spawnGeneration += 1
+        spawnTask?.cancel()
+        spawnTask = nil
         // Status flips to .exited via the onExit callback so the exit code
         // shown in the UI is the real one, not a guess made here.
         pty?.terminate()
     }
 
-    /// Hangs the child up on the caller's thread and returns its pid so the
-    /// caller can escalate. Used on app quit, where the normal asynchronous
-    /// terminate() never gets to run before the process exits.
+    /// Hangs the child up on the caller's thread and returns the pre-signal
+    /// POSIX-session snapshot so the caller can escalate every captured member.
+    /// Used on app quit, where the normal asynchronous terminate() never gets
+    /// to run before the process exits.
     @discardableResult
-    func hangUp() -> pid_t? {
-        pty?.hangUpSynchronously()
+    func hangUp() -> PTYProcess.TerminationSnapshot? {
+        // A session still validating its folder has no pty yet. Retire the
+        // spawn so a launch that completes after this point is abandoned
+        // rather than creating a shell that nothing will ever signal.
+        spawnGeneration += 1
+        spawnTask?.cancel()
+        spawnTask = nil
+        return pty?.hangUpSynchronously()
     }
 
     private func spawn() {
+        guard spawnTask == nil else { return }
+        spawnGeneration += 1
+        let generation = spawnGeneration
+        let directory = workingDirectory
+        status = .starting
+        onStatusChange?()
+
+        spawnTask = Task { @MainActor [weak self] in
+            let validation = await FinderPathDirectoryTarget.validate(directory)
+            guard let self,
+                  !Task.isCancelled,
+                  self.spawnGeneration == generation else { return }
+
+            guard validation.isAvailable else {
+                self.spawnTask = nil
+                self.status = .failed(Self.directoryFailureMessage(for: directory, validation: validation))
+                self.onStatusChange?()
+                return
+            }
+
+            await self.launchValidatedProcess(generation: generation)
+        }
+    }
+
+    private static func directoryFailureMessage(
+        for directory: String,
+        validation: FinderPathDirectoryTarget.Validation
+    ) -> String {
+        switch validation {
+        case .available:
+            return ""
+        case .unavailable:
+            return "Working folder is unavailable: \(directory)"
+        case .timedOut:
+            return "Working folder is not responding: \(directory)"
+        case .failed(let detail):
+            return "Could not verify working folder \(directory): \(detail)"
+        }
+    }
+
+    private enum LaunchResult: Sendable {
+        case succeeded
+        case failed(String)
+    }
+
+    private func launchValidatedProcess(generation: Int) async {
         let process = PTYProcess(
             executable: shellPath,
             arguments: ["-l"],
-            workingDirectory: resolvedWorkingDirectory(),
+            workingDirectory: workingDirectory,
             environment: [:],
             rows: screen.rows,
             columns: screen.columns
         )
+        // Install identity before launching off-main. A very short-lived child
+        // can produce output or exit before the detached launch continuation
+        // returns to the main actor; callbacks must already know its owner.
+        pty = process
 
         // Identity checks drop late output or exits from a process that has
         // been replaced by restart(); without them a stale exit callback
@@ -159,7 +225,8 @@ final class TerminalSession: Identifiable {
         // One main-queue block per 4 KB read let the queue grow without bound:
         // `cat` of a large file enqueued thousands of blocks faster than the
         // main thread could run them, each paying a dispatch and a copy. Bytes
-        // now accumulate in order and a single pending block drains all of it.
+        // now accumulate in order behind one pending drain; if that bounded
+        // buffer fills, the serial read queue waits until the drain takes it.
         let outputBuffer = PTYOutputBuffer()
         process.onOutput = { [weak self, weak process] bytes in
             guard outputBuffer.appendAndClaimDrain(bytes) else { return }
@@ -184,34 +251,46 @@ final class TerminalSession: Identifiable {
             }
         }
 
-        do {
-            try process.launch()
-            pty = process
-            status = .running
-            // Feed the agent command to the shell. The PTY buffers it until the
-            // shell finishes loading and reads stdin, so it runs at the prompt.
-            if let initialCommand, !initialCommand.isEmpty {
-                process.write(Array((initialCommand + "\n").utf8))
+        let result = await Task.detached(priority: .userInitiated) { () -> LaunchResult in
+            do {
+                try process.launch()
+                return .succeeded
+            } catch let error as PTYProcess.LaunchError {
+                return .failed(error.message)
+            } catch {
+                return .failed(error.localizedDescription)
             }
-        } catch let error as PTYProcess.LaunchError {
+        }.value
+
+        guard !Task.isCancelled,
+              spawnGeneration == generation,
+              pty === process else {
+            // Restart/close won while posix_spawn was in flight. If launch did
+            // succeed, tear down the stale child instead of orphaning it.
+            if case .succeeded = result { process.terminate() }
+            return
+        }
+
+        spawnTask = nil
+        switch result {
+        case .succeeded:
+            // A custom shell can exit before the detached launch continuation
+            // returns. Its onExit callback owns that terminal state; never
+            // overwrite .exited with a stale .running transition or send an
+            // initial command to a process that is already gone.
+            if status == .starting, process.isRunning {
+                status = .running
+                // Feed the agent command to the shell. The PTY buffers it until the
+                // shell finishes loading and reads stdin, so it runs at the prompt.
+                if let initialCommand, !initialCommand.isEmpty {
+                    process.write(Array((initialCommand + "\n").utf8))
+                }
+            }
+        case .failed(let message):
             pty = nil
-            status = .failed(error.message)
-        } catch {
-            pty = nil
-            status = .failed(error.localizedDescription)
+            status = .failed(message)
         }
         onStatusChange?()
-    }
-
-    /// A persisted directory can vanish between launches; falling back to
-    /// home keeps the shell spawnable instead of failing on chdir.
-    private func resolvedWorkingDirectory() -> String {
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory)
-        if exists && isDirectory.boolValue {
-            return workingDirectory
-        }
-        return NSHomeDirectory()
     }
 
     // MARK: - Output
@@ -334,70 +413,60 @@ final class TerminalSession: Identifiable {
 /// Coalesces PTY reads so a burst of output costs one main-queue hop instead
 /// of one per 4 KB chunk. The read source delivers on a serial queue and the
 /// drain runs on the serial main queue, so byte order is preserved end to end.
-/// A noisy command must not allocate without bound while the UI is busy, so
-/// bytes beyond the high-water mark are dropped until the scheduled drain.
+/// A noisy command must not allocate without bound while the UI is busy, but
+/// terminal bytes form a protocol stream and cannot be dropped safely. The
+/// producer therefore waits at the high-water mark until the scheduled drain
+/// transfers ownership of the pending bytes and wakes it.
 final class PTYOutputBuffer: @unchecked Sendable {
     static let maximumPendingBytes = 1_024 * 1_024
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private var pending: [UInt8] = []
     private var drainScheduled = false
-    private var totalDropped = 0
 
     var bufferedByteCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
         return pending.count
-    }
-
-    var droppedByteCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return totalDropped
     }
 
     /// Appends bytes and reports whether the caller now owns scheduling the
     /// drain. Only one drain is ever outstanding, however fast output arrives.
     ///
-    /// Overflow costs the OLDEST bytes. Discarding the newest instead — the
-    /// obvious reading of a high-water mark — leaves the screen showing lines
-    /// from the middle of the output followed by the shell prompt, which a user
-    /// cannot distinguish from the command genuinely ending there. Losing the
-    /// oldest bytes costs scrollback the user can see is missing, and keeps the
-    /// tail (results, errors, the prompt) that they are actually waiting for.
+    /// PTYProcess emits at most one 4 KB read per call, well below the one MiB
+    /// bound. Waiting before the whole call fits keeps each read atomic and
+    /// preserves byte order without ever exceeding the bound.
     func appendAndClaimDrain(_ bytes: [UInt8]) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        guard !bytes.isEmpty else { return false }
+        precondition(
+            bytes.count <= Self.maximumPendingBytes,
+            "one PTY read must fit within the bounded output buffer"
+        )
 
-        // A single burst larger than the whole window keeps only its own tail.
-        let accepted = bytes.count > Self.maximumPendingBytes
-            ? Array(bytes.suffix(Self.maximumPendingBytes))
-            : bytes
-        let discardedFromBurst = bytes.count - accepted.count
-
-        // Anything still over the mark comes off the front of what is already
-        // buffered, oldest first.
-        let overflowing = max(pending.count + accepted.count - Self.maximumPendingBytes, 0)
-        let evicted = min(overflowing, pending.count)
-        if evicted > 0 {
-            pending.removeFirst(evicted)
+        condition.lock()
+        defer { condition.unlock() }
+        while pending.count > Self.maximumPendingBytes - bytes.count {
+            // A nonempty buffer acquired the drain claim when its first bytes
+            // arrived. The main-queue block always calls takeAll() before any
+            // lifecycle identity guard, so even a replaced session wakes us.
+            assert(drainScheduled)
+            condition.wait()
         }
-        pending.append(contentsOf: accepted)
 
-        let dropped = discardedFromBurst + evicted
-        let (newTotal, overflow) = totalDropped.addingReportingOverflow(dropped)
-        totalDropped = overflow ? Int.max : newTotal
+        pending.append(contentsOf: bytes)
         guard !drainScheduled else { return false }
         drainScheduled = true
         return true
     }
 
-    /// Hands over everything buffered and releases the drain claim.
+    /// Hands over everything buffered, releases the drain claim, and wakes any
+    /// producer waiting for enough room to append its complete PTY read.
     func takeAll() -> [UInt8] {
-        lock.lock()
-        defer { lock.unlock() }
-        let bytes = pending
-        pending.removeAll(keepingCapacity: true)
+        condition.lock()
+        defer { condition.unlock() }
+        var bytes: [UInt8] = []
+        swap(&bytes, &pending)
         drainScheduled = false
+        condition.broadcast()
         return bytes
     }
 }

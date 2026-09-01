@@ -29,6 +29,8 @@ final class TerminalView: NSView {
     struct CellMetrics {
         let font: NSFont
         let boldFont: NSFont
+        let italicFont: NSFont
+        let boldItalicFont: NSFont
         let cellWidth: CGFloat
         let cellHeight: CGFloat
         let ascent: CGFloat
@@ -41,6 +43,8 @@ final class TerminalView: NSView {
         init(fontSize: CGFloat) {
             font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
             boldFont = .monospacedSystemFont(ofSize: fontSize, weight: .bold)
+            italicFont = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+            boldItalicFont = NSFontManager.shared.convert(boldFont, toHaveTrait: .italicFontMask)
             let probe = CTLineCreateWithAttributedString(
                 NSAttributedString(string: "M", attributes: [.font: font])
             )
@@ -52,6 +56,15 @@ final class TerminalView: NSView {
             cellHeight = ceil(probeAscent + probeDescent + probeLeading) + 1
             ascent = probeAscent
             kern = cellWidth - CGFloat(advance)
+        }
+
+        func font(for style: CellStyle) -> NSFont {
+            switch (style.bold, style.italic) {
+            case (true, true): boldItalicFont
+            case (true, false): boldFont
+            case (false, true): italicFont
+            case (false, false): font
+            }
         }
     }
 
@@ -346,15 +359,19 @@ final class TerminalView: NSView {
         guard let session else { return "" }
         let screen = session.screen
         let offset = min(scrollbackOffset, screen.scrollbackCount)
-        return (0..<screen.rows).map { displayRow in
+        let rows = (0..<screen.rows).map { displayRow in
             let contentLine = screen.scrollbackCount - offset + displayRow
-            let text = String(
-                cells(forContentLine: contentLine, screen: screen)
-                    .filter { !$0.isContinuation }
-                    .map(\.character)
+            let continues = screen.isLineWrapped(contentLine: contentLine)
+            let text = TerminalRowText.string(
+                from: cells(forContentLine: contentLine, screen: screen),
+                trimmingTrailingSpaces: !continues
             )
-            return String(text.reversed().drop(while: { $0 == " " }).reversed())
-        }.joined(separator: "\n")
+            return TerminalTextJoiner.Row(
+                text: text,
+                continuesToNextRow: continues
+            )
+        }
+        return TerminalTextJoiner.join(rows)
     }
 
     /// Cells for a content line: scrollback lines are padded or truncated to
@@ -457,7 +474,7 @@ final class TerminalView: NSView {
             foreground = foreground.withAlphaComponent(Self.faintAlpha)
         }
         var attributes: [NSAttributedString.Key: Any] = [
-            .font: style.bold ? metrics.boldFont : metrics.font,
+            .font: metrics.font(for: style),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String): foreground.cgColor,
             // Pin every glyph to the integer cell grid so text stays aligned
             // with the cursor and backgrounds across the whole row.
@@ -486,7 +503,7 @@ final class TerminalView: NSView {
 
         let cell = screen.cell(atRow: screen.cursorRow, column: screen.cursorColumn)
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: cell.style.bold ? metrics.boldFont : metrics.font,
+            .font: metrics.font(for: cell.style),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String):
                 NSColor.textBackgroundColor.cgColor,
         ]
@@ -501,6 +518,8 @@ final class TerminalView: NSView {
             message = "process exited (code \(code)) - press Restart in the toolbar"
         case .failed(let failure):
             message = failure
+        case .starting:
+            message = "checking working folder…"
         case .notStarted, .running:
             return
         }
