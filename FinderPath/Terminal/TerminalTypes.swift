@@ -34,17 +34,34 @@ struct TerminalCell: Equatable, Sendable {
     /// skip its character while retaining its column for cursor/background
     /// geometry.
     var isContinuation: Bool
+    /// True when the child explicitly printed this cell. This distinguishes an
+    /// emitted space from an untouched grid blank when a later wide character
+    /// has to wrap before the final column.
+    var isExplicitContent: Bool
+    /// An unused final column left behind when a double-width grapheme has to
+    /// wrap before it. The cell remains part of the visual grid (and may carry
+    /// a background), but it is not text the child emitted, so copy and
+    /// accessibility omit it.
+    var isWrapPadding: Bool
 
-    init(character: Character, style: CellStyle, isContinuation: Bool = false) {
+    init(
+        character: Character,
+        style: CellStyle,
+        isContinuation: Bool = false,
+        isWrapPadding: Bool = false,
+        isExplicitContent: Bool = true
+    ) {
         self.character = character
         self.style = style
         self.isContinuation = isContinuation
+        self.isWrapPadding = isWrapPadding
+        self.isExplicitContent = isExplicitContent
     }
 
-    static let blank = TerminalCell(character: " ", style: .plain)
+    static let blank = TerminalCell(character: " ", style: .plain, isExplicitContent: false)
 
     static func continuation(with style: CellStyle) -> TerminalCell {
-        TerminalCell(character: " ", style: style, isContinuation: true)
+        TerminalCell(character: " ", style: style, isContinuation: true, isExplicitContent: false)
     }
 
     /// A blank cell that keeps the current background color, used when
@@ -52,7 +69,24 @@ struct TerminalCell: Equatable, Sendable {
     static func blank(withBackgroundOf style: CellStyle) -> TerminalCell {
         var erased = CellStyle.plain
         erased.background = style.background
-        return TerminalCell(character: " ", style: erased)
+        return TerminalCell(character: " ", style: erased, isExplicitContent: false)
+    }
+}
+
+/// Converts grid cells into user-visible text without leaking structural
+/// cells into the clipboard or VoiceOver output.
+enum TerminalRowText {
+    static func string<C: Collection>(
+        from cells: C,
+        trimmingTrailingSpaces: Bool
+    ) -> String where C.Element == TerminalCell {
+        let text = String(
+            cells.lazy
+                .filter { !$0.isContinuation && !$0.isWrapPadding }
+                .map(\.character)
+        )
+        guard trimmingTrailingSpaces else { return text }
+        return String(text.reversed().drop(while: { $0 == " " }).reversed())
     }
 }
 

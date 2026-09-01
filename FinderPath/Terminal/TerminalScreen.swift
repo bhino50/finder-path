@@ -31,6 +31,10 @@ struct TerminalScreen {
         savedCursor: (row: Int, column: Int)?
     )?
     private var scrollback: [TerminalLine] = []
+    /// Logical front of `scrollback`. Advancing this index makes steady-state
+    /// trimming O(1); the backing array is compacted only occasionally so total
+    /// work remains amortized linear under sustained output.
+    private var scrollbackHead = 0
     private let scrollbackLimit: Int
 
     /// 0-based inclusive scroll region bounds.
@@ -45,7 +49,7 @@ struct TerminalScreen {
     /// until the next print, which wraps first (matches xterm).
     private var pendingWrap = false
 
-    var scrollbackCount: Int { scrollback.count }
+    var scrollbackCount: Int { scrollback.count - scrollbackHead }
 
     /// How many lines have been discarded off the front of the scrollback ring.
     ///
@@ -69,7 +73,7 @@ struct TerminalScreen {
     /// old index is exactly the drift this exists to prevent.
     func contentLine(forAbsoluteLine absolute: Int) -> Int? {
         let line = absolute - scrollbackBase
-        guard line >= 0, line < scrollback.count + rows else { return nil }
+        guard line >= 0, line < scrollbackCount + rows else { return nil }
         return line
     }
 
@@ -77,10 +81,18 @@ struct TerminalScreen {
     /// discards. Every trim goes through here so the base cannot drift out of
     /// step with the ring.
     private mutating func trimScrollbackToLimit() {
-        guard scrollback.count > scrollbackLimit else { return }
-        let excess = scrollback.count - scrollbackLimit
-        scrollback.removeFirst(excess)
+        guard scrollbackCount > scrollbackLimit else { return }
+        let excess = scrollbackCount - scrollbackLimit
+        scrollbackHead += excess
         scrollbackBase += excess
+
+        // Keep memory bounded without returning to removeFirst-on-every-line.
+        // At most roughly twice the configured scrollback is retained between
+        // compactions, and each element is moved only once per large batch.
+        if scrollbackHead >= max(scrollbackLimit, 1), scrollbackHead * 2 >= scrollback.count {
+            scrollback.removeFirst(scrollbackHead)
+            scrollbackHead = 0
+        }
     }
 
     init(rows: Int, columns: Int, scrollbackLimit: Int = 2000) {
@@ -105,8 +117,8 @@ struct TerminalScreen {
     }
 
     func scrollbackLine(_ index: Int) -> [TerminalCell] {
-        guard index >= 0, index < scrollback.count else { return [] }
-        return scrollback[index].cells
+        guard index >= 0, index < scrollbackCount else { return [] }
+        return scrollback[scrollbackHead + index].cells
     }
 
     /// Whether the line at `contentLine` (scrollback lines first, then live grid
@@ -115,8 +127,8 @@ struct TerminalScreen {
     /// where this is true.
     func isLineWrapped(contentLine: Int) -> Bool {
         guard contentLine >= 0 else { return false }
-        if contentLine < scrollback.count { return scrollback[contentLine].wrapped }
-        let row = contentLine - scrollback.count
+        if contentLine < scrollbackCount { return scrollback[scrollbackHead + contentLine].wrapped }
+        let row = contentLine - scrollbackCount
         guard row < rows, row < grid.count else { return false }
         return grid[row].wrapped
     }
@@ -267,7 +279,7 @@ struct TerminalScreen {
         // before drawing when possible; a one-column terminal degrades to a
         // single visible cell rather than corrupting the row.
         if width == 2, columns > 1, cursorColumn == columns - 1, autowrap {
-            markCurrentLineWrapped()
+            markCurrentLineWrapped(paddingColumns: 1)
             cursorColumn = 0
             lineFeed()
         }
@@ -484,13 +496,39 @@ struct TerminalScreen {
     /// Records that the current row's text continues on the row below. Called
     /// only where autowrap moves to the next line — an explicit newline must
     /// leave the flag clear, or copy joins two genuinely separate lines.
-    private mutating func markCurrentLineWrapped() {
+    private mutating func markCurrentLineWrapped(paddingColumns: Int = 0) {
+        guard cursorRow >= 0, cursorRow < grid.count else { return }
+        // A row can be revisited and wrapped a second time after cursor motion.
+        // Retire any old marker before recording the new wrap geometry.
+        for column in grid[cursorRow].cells.indices {
+            grid[cursorRow][column].isWrapPadding = false
+        }
+        if paddingColumns > 0 {
+            // Rows can retain hidden cells after a narrowing resize. Padding is
+            // defined by the visible edge, not the backing row's old width.
+            let visibleCellCount = min(columns, grid[cursorRow].count)
+            let firstPaddingColumn = max(visibleCellCount - paddingColumns, 0)
+            for column in firstPaddingColumn..<visibleCellCount {
+                // Cursor addressing can revisit an occupied edge cell. The
+                // wide glyph wraps without erasing that visible content, so it
+                // is padding only when the cell is actually an unused blank.
+                let cell = grid[cursorRow][column]
+                if cell.character == " ", !cell.isContinuation, !cell.isExplicitContent {
+                    grid[cursorRow][column].isWrapPadding = true
+                }
+            }
+        }
         setCurrentLineWrapped(true)
     }
 
     private mutating func setCurrentLineWrapped(_ wrapped: Bool) {
         guard cursorRow >= 0, cursorRow < grid.count else { return }
         grid[cursorRow].wrapped = wrapped
+        if !wrapped {
+            for column in grid[cursorRow].cells.indices {
+                grid[cursorRow][column].isWrapPadding = false
+            }
+        }
     }
 
     private mutating func lineFeed() {
@@ -546,8 +584,15 @@ struct TerminalScreen {
             for row in 0..<cursorRow {
                 grid[row] = TerminalLine.blank(columns: columns, filledWith: blankCell)
             }
-        case 2, 3:
+        case 2:
             grid = Array(repeating: TerminalLine.blank(columns: columns, filledWith: blankCell), count: rows)
+        case 3:
+            // xterm ED 3 erases saved lines only. Treat the removed lines as
+            // evicted so absolute viewport/selection anchors cannot drift onto
+            // unrelated content that later reuses their relative indices.
+            scrollbackBase += scrollbackCount
+            scrollback.removeAll(keepingCapacity: true)
+            scrollbackHead = 0
         default:
             break
         }
@@ -741,10 +786,12 @@ struct TerminalScreen {
         // trailing-blank trim for wrapped rows, which would inject that padding
         // into the middle of the copied text.
         if targetColumns != columns {
-            for index in grid.indices { grid[index].wrapped = false }
-            for index in scrollback.indices { scrollback[index].wrapped = false }
+            for index in grid.indices { Self.clearWrapMetadata(in: &grid[index]) }
+            for index in scrollbackHead..<scrollback.count {
+                Self.clearWrapMetadata(in: &scrollback[index])
+            }
             if var saved = savedPrimary {
-                for index in saved.grid.indices { saved.grid[index].wrapped = false }
+                for index in saved.grid.indices { Self.clearWrapMetadata(in: &saved.grid[index]) }
                 savedPrimary = saved
             }
         }
@@ -758,6 +805,13 @@ struct TerminalScreen {
         cursorRow = clampRow(cursorRow - firstRetained)
         cursorColumn = clampColumn(cursorColumn)
         pendingWrap = false
+    }
+
+    private static func clearWrapMetadata(in line: inout TerminalLine) {
+        line.wrapped = false
+        for index in line.cells.indices {
+            line.cells[index].isWrapPadding = false
+        }
     }
 
     /// Retains `rows` rows starting at `firstRetained`, padding each to at

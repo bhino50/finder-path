@@ -7,9 +7,17 @@ import Foundation
 // Mutable state is confined to a private serial queue, and both callbacks
 // fire on background queues, so callers hop to the main actor themselves.
 
-final class PTYProcess: @unchecked Sendable {
+nonisolated final class PTYProcess: @unchecked Sendable {
     struct LaunchError: Error {
         let message: String
+    }
+
+    /// Immutable identity captured before quit sends SIGHUP. A session may
+    /// retain live descendants after its leader exits, so escalation must keep
+    /// both the original session ID and every PID observed under that ID.
+    struct TerminationSnapshot: Sendable {
+        let sessionLeader: pid_t
+        let members: [pid_t]
     }
 
     private static let queueLabel = "io.github.bhino50.FinderPath.pty"
@@ -44,6 +52,9 @@ final class PTYProcess: @unchecked Sendable {
     private var outputHandler: (([UInt8]) -> Void)?
 
     private var exitHandler: ((Int32) -> Void)?
+    private var launchingFlag = false
+    private var launchCancellationRequested = false
+    private var launchAttemptGeneration = 0
     private var runningFlag = false
     private var terminatingFlag = false
     private var childPID: pid_t = -1
@@ -111,13 +122,52 @@ final class PTYProcess: @unchecked Sendable {
 
     /// Spawns the child once; later calls while running are no-ops.
     func launch() throws {
-        try stateQueue.sync {
-            guard !runningFlag else { return }
-            try launchOnQueue()
+        let request: (rows: Int, columns: Int, generation: Int)? = stateQueue.sync {
+            guard !runningFlag, !launchingFlag else { return nil }
+            launchingFlag = true
+            launchCancellationRequested = false
+            launchAttemptGeneration += 1
+            return (currentRows, currentColumns, launchAttemptGeneration)
+        }
+        guard let request else { return }
+
+        do {
+            try launchOutsideStateQueue(
+                rows: request.rows,
+                columns: request.columns,
+                attemptGeneration: request.generation
+            )
+        } catch {
+            stateQueue.sync {
+                guard launchAttemptGeneration == request.generation else { return }
+                launchingFlag = false
+            }
+            throw error
         }
     }
 
-    private func launchOnQueue() throws {
+    /// Performs every potentially blocking filesystem/spawn operation without
+    /// holding `stateQueue`. Quit and restart can therefore request cancellation
+    /// immediately even if a network-backed directory or executable stalls.
+    private func launchOutsideStateQueue(
+        rows: Int,
+        columns: Int,
+        attemptGeneration: Int
+    ) throws {
+        // fchdir needs search permission, not read/list permission. O_SEARCH
+        // preserves the valid POSIX case of an execute-only working directory.
+        let directoryDescriptor = Darwin.open(workingDirectory, O_SEARCH | O_CLOEXEC)
+        guard directoryDescriptor >= 0 else {
+            throw LaunchError(
+                message: "Could not open working folder \(workingDirectory): \(Self.message(forErrno: errno))"
+            )
+        }
+        defer { close(directoryDescriptor) }
+
+        guard launchMayContinue(attemptGeneration: attemptGeneration) else {
+            throw LaunchError(message: "Terminal launch was cancelled.")
+        }
+
         var primary: Int32 = -1
         var replica: Int32 = -1
         var nameBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
@@ -126,12 +176,12 @@ final class PTYProcess: @unchecked Sendable {
         }
         let ttyPath = String(cString: nameBuffer)
 
-        var spawned = false
+        var committed = false
         defer {
             // The parent never keeps the replica; on failure the primary
             // goes too so a failed launch leaks no descriptors.
             close(replica)
-            if !spawned {
+            if !committed {
                 close(primary)
             }
         }
@@ -148,7 +198,7 @@ final class PTYProcess: @unchecked Sendable {
               fcntl(primary, F_SETFL, fileStatusFlags | O_NONBLOCK) == 0 else {
             throw LaunchError(message: "could not make PTY nonblocking: \(Self.message(forErrno: errno))")
         }
-        Self.applyWindowSize(rows: currentRows, columns: currentColumns, to: primary)
+        Self.applyWindowSize(rows: rows, columns: columns, to: primary)
 
         var fileActions: posix_spawn_file_actions_t?
         guard posix_spawn_file_actions_init(&fileActions) == 0 else {
@@ -169,8 +219,8 @@ final class PTYProcess: @unchecked Sendable {
             try Self.checkSetup(posix_spawn_file_actions_addclose(&fileActions, replica), "close inherited replica")
         }
         try Self.checkSetup(
-            posix_spawn_file_actions_addchdir_np(&fileActions, workingDirectory),
-            "chdir to \(workingDirectory)"
+            posix_spawn_file_actions_addfchdir_np(&fileActions, directoryDescriptor),
+            "fchdir to \(workingDirectory)"
         )
 
         var attributes: posix_spawnattr_t?
@@ -190,19 +240,63 @@ final class PTYProcess: @unchecked Sendable {
         }
 
         var pid: pid_t = -1
+        guard launchMayContinue(attemptGeneration: attemptGeneration) else {
+            throw LaunchError(message: "Terminal launch was cancelled.")
+        }
         let spawnResult = posix_spawn(&pid, executable, &fileActions, &attributes, argv, envp)
         guard spawnResult == 0 else {
-            throw LaunchError(message: "posix_spawn \(executable) failed: \(Self.message(forErrno: spawnResult))")
+            throw LaunchError(
+                message: "Could not start \(executable) in \(workingDirectory): \(Self.message(forErrno: spawnResult))"
+            )
         }
 
-        spawned = true
-        childPID = pid
-        primaryDescriptor = primary
-        runningFlag = true
-        terminatingFlag = false
-        launchGeneration += 1
-        startReading(from: primary)
+        committed = stateQueue.sync {
+            guard launchingFlag,
+                  launchAttemptGeneration == attemptGeneration,
+                  !launchCancellationRequested else {
+                if launchAttemptGeneration == attemptGeneration { launchingFlag = false }
+                return false
+            }
+            launchingFlag = false
+            childPID = pid
+            primaryDescriptor = primary
+            runningFlag = true
+            terminatingFlag = false
+            launchGeneration += 1
+            // A resize may have arrived while open()/posix_spawn was outside the
+            // queue. Apply its newest dimensions before output starts draining.
+            Self.applyWindowSize(rows: currentRows, columns: currentColumns, to: primary)
+            startReading(from: primary)
+            return true
+        }
+
+        guard committed else {
+            // Cancellation won after the child was created but before ownership
+            // could be published. Kill and reap it here; no callback owner exists.
+            Self.signalSessionMembers(Self.sessionMembers(ledBy: pid), ledBy: pid, signal: SIGKILL)
+            kill(pid, SIGKILL)
+            Self.reapUnownedChild(pid)
+            return
+        }
         reapExit(of: pid)
+    }
+
+    private func launchMayContinue(attemptGeneration: Int) -> Bool {
+        stateQueue.sync {
+            launchingFlag
+                && launchAttemptGeneration == attemptGeneration
+                && !launchCancellationRequested
+        }
+    }
+
+    private static func reapUnownedChild(_ pid: pid_t) {
+        DispatchQueue.global(qos: .utility).async {
+            var status: Int32 = 0
+            var result: pid_t
+            repeat {
+                result = waitpid(pid, &status, 0)
+            } while result == -1 && errno == EINTR
+        }
     }
 
     private static func checkSetup(_ result: Int32, _ step: String) throws {
@@ -303,6 +397,10 @@ final class PTYProcess: @unchecked Sendable {
         // the PTY immediately, and a weak cleanup task could otherwise vanish
         // before an uncooperative child or process group has actually exited.
         stateQueue.async { [self] in
+            if launchingFlag, !runningFlag {
+                launchCancellationRequested = true
+                return
+            }
             guard runningFlag, childPID > 0 else { return }
             let pid = childPID
             let generation = launchGeneration
@@ -320,10 +418,15 @@ final class PTYProcess: @unchecked Sendable {
             primaryDescriptor = -1
             stateQueue.asyncAfter(deadline: .now() + Self.killGracePeriod) { [self] in
                 // A same-object relaunch changes the generation and invalidates
-                // this cleanup. Each captured PID is revalidated against the
-                // original session before escalation, protecting against reuse.
+                // this cleanup. A HUP handler can fork a new HUP-resistant child
+                // after the first snapshot, so union one fresh scan while the
+                // original leader still proves this is the same POSIX session.
                 guard launchGeneration == generation else { return }
-                Self.signalSessionMembers(sessionMembers, ledBy: pid, signal: SIGKILL)
+                let escalationMembers = Self.escalationMembers(
+                    captured: sessionMembers,
+                    ledBy: pid
+                )
+                Self.signalSessionMembers(escalationMembers, ledBy: pid, signal: SIGKILL)
                 if runningFlag, childPID == pid {
                     kill(pid, SIGKILL)
                 }
@@ -331,7 +434,8 @@ final class PTYProcess: @unchecked Sendable {
         }
     }
 
-    /// Hangs the child up on the caller's thread and returns its pid.
+    /// Hangs the child up on the caller's thread and returns the POSIX-session
+    /// membership captured before any signal was sent.
     ///
     /// terminate() does its work in `stateQueue.async` with a delayed SIGKILL,
     /// which is right while the app is running but useless at quit: AppKit
@@ -340,40 +444,95 @@ final class PTYProcess: @unchecked Sendable {
     /// were left orphaned despite the app claiming it terminates them.
     /// Callers escalate survivors with `waitForExit(of:upTo:)`.
     @discardableResult
-    func hangUpSynchronously() -> pid_t? {
+    func hangUpSynchronously() -> TerminationSnapshot? {
         stateQueue.sync {
+            if launchingFlag, !runningFlag {
+                // Never wait behind open()/posix_spawn during app termination.
+                // launchOutsideStateQueue observes this before spawn, or kills
+                // and reaps a child that crossed the race immediately after it.
+                launchCancellationRequested = true
+                return nil
+            }
             guard runningFlag, childPID > 0 else { return nil }
             let pid = childPID
             terminatingFlag = true
-            Self.signalSessionMembers(Self.sessionMembers(ledBy: pid), ledBy: pid, signal: SIGHUP)
+            var sessionMembers = Self.sessionMembers(ledBy: pid)
+            // Keep the leader in the token even if it exited between the state
+            // check and process-table scan. Waiting on a dead PID is harmless,
+            // and it preserves the complete identity of this termination.
+            if !sessionMembers.contains(pid) {
+                sessionMembers.append(pid)
+            }
+            let termination = TerminationSnapshot(
+                sessionLeader: pid,
+                members: sessionMembers
+            )
+            Self.signalSessionMembers(sessionMembers, ledBy: pid, signal: SIGHUP)
             kill(pid, SIGHUP)
             // Closing the primary side delivers a terminal hangup and releases
             // readers even when the shell or a foreground child is misbehaving.
             readSource?.cancel()
             readSource = nil
             primaryDescriptor = -1
-            return pid
+            return termination
         }
     }
 
-    /// Waits up to `timeout` for every pid to exit, then SIGKILLs the rest.
-    /// The budget is shared across all pids, so quitting with many terminals
-    /// open costs the same as quitting with one.
-    static func waitForExit(of pids: [pid_t], upTo timeout: TimeInterval) {
-        let live = pids.filter { $0 > 1 }
-        guard !live.isEmpty else { return }
+    /// Waits up to `timeout` for every captured session member to exit, then
+    /// SIGKILLs survivors that still belong to their original session. The
+    /// session check prevents a recycled PID from targeting an unrelated
+    /// process. The budget is shared across every member of every session, so
+    /// quitting with many terminals open costs the same as quitting with one.
+    static func waitForExit(of terminations: [TerminationSnapshot], upTo timeout: TimeInterval) {
+        var membersBySession: [pid_t: Set<pid_t>] = [:]
+        for termination in terminations where termination.sessionLeader > 1 {
+            var members = Set(termination.members.filter { $0 > 1 })
+            members.insert(termination.sessionLeader)
+            membersBySession[termination.sessionLeader, default: []].formUnion(members)
+        }
+        guard !membersBySession.isEmpty else { return }
+
+        func refreshLiveSessions() {
+            for sessionLeader in Array(membersBySession.keys) {
+                guard kill(sessionLeader, 0) == 0,
+                      getsid(sessionLeader) == sessionLeader else { continue }
+                membersBySession[sessionLeader, default: []].formUnion(
+                    sessionMembers(ledBy: sessionLeader)
+                )
+            }
+        }
+
+        func capturedMembers() -> [(sessionLeader: pid_t, member: pid_t)] {
+            membersBySession.flatMap { sessionLeader, members in
+                members.map { (sessionLeader: sessionLeader, member: $0) }
+            }
+        }
 
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            // HUP handlers are allowed to fork. Discover those children while
+            // the original leader is still live, before it can exit and remove
+            // our safe proof that this numeric session ID has not been reused.
+            refreshLiveSessions()
+            let currentMembers = capturedMembers()
             // kill(pid, 0) keeps succeeding for a zombie, but the reaper thread
-            // waitpid()s each child, so survivors here are genuinely running.
-            if live.allSatisfy({ kill($0, 0) != 0 }) { return }
+            // waitpid()s each leader. A session-ID mismatch means the captured
+            // process exited and its PID was reused, which is also no survivor.
+            if currentMembers.allSatisfy({ captured in
+                kill(captured.member, 0) != 0
+                    || getsid(captured.member) != captured.sessionLeader
+            }) {
+                return
+            }
             usleep(10_000)
         }
 
-        for pid in live where kill(pid, 0) == 0 {
-            signalSessionMembers(sessionMembers(ledBy: pid), ledBy: pid, signal: SIGKILL)
-            kill(pid, SIGKILL)
+        refreshLiveSessions()
+        for captured in capturedMembers() where kill(captured.member, 0) == 0 {
+            // Revalidate immediately before signalling. In particular, never
+            // rediscover membership from a leader PID that may already be gone.
+            guard getsid(captured.member) == captured.sessionLeader else { continue }
+            kill(captured.member, SIGKILL)
         }
     }
 
@@ -495,6 +654,21 @@ final class PTYProcess: @unchecked Sendable {
             }
         }
         return [sessionLeader]
+    }
+
+    /// Adds processes created by a SIGHUP handler to a pre-signal snapshot.
+    /// Re-enumeration is permitted only while the original leader is live and
+    /// still owns that session ID, preventing PID reuse from widening cleanup
+    /// onto an unrelated process tree.
+    private nonisolated static func escalationMembers(
+        captured: [pid_t],
+        ledBy sessionLeader: pid_t
+    ) -> [pid_t] {
+        var members = Set(captured)
+        if kill(sessionLeader, 0) == 0, getsid(sessionLeader) == sessionLeader {
+            members.formUnion(sessionMembers(ledBy: sessionLeader))
+        }
+        return Array(members)
     }
 
     private nonisolated static func signalSessionMembers(
