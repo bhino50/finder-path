@@ -29,6 +29,8 @@ struct TerminalParser {
     private enum State {
         case ground
         case escape
+        /// ESC followed by an intermediate byte (0x20-0x2F): runs to a final.
+        case escapeIntermediate
         case escapeCharset
         case csi
         case osc
@@ -79,6 +81,12 @@ struct TerminalParser {
                 parseGround(byte, into: &actions)
             case .escape:
                 parseEscape(byte, into: &actions)
+            case .escapeIntermediate:
+                // Further intermediates extend the sequence; anything else is
+                // the final byte and completes it without printing.
+                if !(0x20...0x2F).contains(byte) {
+                    state = byte == 0x1B ? .escape : .ground
+                }
             case .escapeCharset:
                 // ESC ( X or ESC ) X — record which charset was designated.
                 // The designator used to be consumed and thrown away, which is
@@ -177,10 +185,15 @@ struct TerminalParser {
     }
 
     private mutating func flushUTF8(into actions: inout [TerminalAction]) {
-        let decoded = String(decoding: utf8Buffer, as: UTF8.self)
+        // A lenient decode turns every malformed sequence into U+FFFD, which
+        // made a genuine U+FFFD from the child indistinguishable from garbage
+        // and dropped it. Validate strictly instead: malformed bytes are
+        // discarded, and a real replacement character prints like any glyph.
+        let decoded = String(bytes: utf8Buffer, encoding: .utf8)
         utf8Buffer = []
         utf8Expected = 0
-        for character in decoded where character != "\u{FFFD}" {
+        guard let decoded else { return }
+        for character in decoded {
             actions.append(.print(character))
         }
     }
@@ -232,6 +245,11 @@ struct TerminalParser {
             break // keypad modes, ignored
         case 0x1B:
             state = .escape
+        case 0x20...0x2F:
+            // Intermediate byte (ESC # 8 DECALN, ESC % G, ESC sp F). The
+            // sequence continues to a final byte; returning to ground here
+            // printed that final byte onto the grid.
+            state = .escapeIntermediate
         default:
             break // unknown escape, consumed
         }
@@ -271,6 +289,12 @@ struct TerminalParser {
 
     private mutating func dispatchCSI(final: Character, buffer: String, into actions: inout [TerminalAction]) {
         let isPrivate = buffer.hasPrefix("?")
+        // `>`, `<` and `=` introduce vendor-private sequences (xterm's
+        // modifyOtherKeys `CSI > 4;1 m`, kitty's keyboard protocol
+        // `CSI > 1 u`, tertiary DA). None are implemented, and dispatching
+        // them by their ANSI final byte applied real SGR attributes or
+        // teleported the cursor mid-draw.
+        if let marker = buffer.first, "><=".contains(marker) { return }
         let params = Self.parameters(from: buffer)
         func param(_ index: Int, default defaultValue: Int) -> Int {
             guard index < params.count, let value = params[index] else { return defaultValue }

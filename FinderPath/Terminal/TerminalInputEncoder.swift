@@ -93,12 +93,15 @@ enum TerminalInputEncoder {
     }
 
     /// Control-key combinations with a defined C0 mapping: a-z (either case)
-    /// map to 0x01-0x1A, and the classic punctuation set covers 0x1B-0x1F.
-    /// Anything else has no control encoding and returns nil.
+    /// map to 0x01-0x1A, the classic punctuation set covers 0x1B-0x1F, and
+    /// space or @ give NUL (emacs set-mark). Anything else has no control
+    /// encoding and returns nil.
     static func encodeControl(character: Character, meta: Bool = false) -> [UInt8]? {
         guard let ascii = character.asciiValue else { return nil }
         let controlByte: UInt8
         switch ascii {
+        case 0x20, 0x40: // space, @
+            controlByte = 0x00
         case 0x61...0x7A: // a-z
             controlByte = ascii - 0x60
         case 0x41...0x5A: // A-Z

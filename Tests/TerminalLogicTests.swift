@@ -94,6 +94,27 @@ struct FinderPathTerminalTests {
         expect(parser.parse(Array("\u{1B}[2S".utf8)) == [.scrollUp(2)], "SU scrolls up")
         expect(parser.parse(Array("\u{1B}[T".utf8)) == [.scrollDown(1)], "SD defaults to 1")
 
+        // MARK: - Parser: private markers, intermediates, replacement character
+
+        // Vendor-private CSI markers are consumed whole. Dispatching them by
+        // their final byte ran kitty's `CSI > 1 u` as a cursor restore and
+        // xterm's `CSI > 4;1 m` as real SGR attributes.
+        expect(parser.parse(Array("\u{1B}[>1u".utf8)) == [], "CSI > u is consumed, not a cursor restore")
+        expect(parser.parse(Array("\u{1B}[>4;1m".utf8)) == [], "CSI > m is consumed, not SGR")
+        expect(parser.parse(Array("\u{1B}[=c".utf8)) == [], "CSI = c is consumed")
+        expect(parser.parse(Array("\u{1B}[<u".utf8)) == [], "CSI < u is consumed")
+        expect(parser.parse(Array("\u{1B}[?25l".utf8)) == [.setMode(.cursorVisible, false)], "? private modes still dispatch")
+        // ESC with an intermediate byte runs to its final byte; returning to
+        // ground right after the intermediate printed that final byte.
+        expect(parser.parse(Array("\u{1B}#8A".utf8)) == [.print("A")], "DECALN final byte is consumed, later text prints")
+        expect(parser.parse(Array("\u{1B}%GB".utf8)) == [.print("B")], "ESC % G is consumed whole")
+        expect(parser.parse(Array("\u{1B} FC".utf8)) == [.print("C")], "ESC sp F is consumed whole")
+        expect(parser.parse([0xEF, 0xBF, 0xBD]) == [.print("\u{FFFD}")], "a genuine U+FFFD from the child prints")
+        expect(parser.parse([0xC0, 0x80]) == [], "an overlong encoding is still dropped")
+        expect(TerminalInputEncoder.encodeControl(character: " ") == [0x00], "Control-Space sends NUL")
+        expect(TerminalInputEncoder.encodeControl(character: "@") == [0x00], "Control-@ sends NUL")
+        expect(TerminalInputEncoder.encodeControl(character: "1") == nil, "Control-1 has no C0 mapping")
+
         // MARK: - Parser: modes
 
         parser = TerminalParser()
@@ -314,7 +335,7 @@ struct FinderPathTerminalTests {
         for character in "llo" { screen.apply(.print(character)) }
         screen.apply(.moveCursor(row: 1, column: 3))
         screen.apply(.eraseInLine(1))
-        expect(screen.lineText(0) == "   lo" || screen.lineText(0).hasSuffix("lo"), "EL 1 erases to start inclusive")
+        expect(screen.lineText(0) == "   lo", "EL 1 erases to start inclusive")
         screen.apply(.eraseInDisplay(2))
         expect(screen.lineText(0).trimmingCharacters(in: .whitespaces).isEmpty, "ED 2 clears everything")
 
