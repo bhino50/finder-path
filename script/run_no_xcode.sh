@@ -12,18 +12,84 @@
 #   ./script/run_no_xcode.sh verify    # build, launch, confirm it stays running
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SRC_DIR="$ROOT_DIR/FinderPath"
 SRCS=("$SRC_DIR"/*.swift "$SRC_DIR"/Terminal/*.swift)
 PLIST_TEMPLATE="$ROOT_DIR/Info.plist"
 PBXPROJ="$ROOT_DIR/FinderPath.xcodeproj/project.pbxproj"
 
 APP_NAME="FinderPath"
-BUNDLE_ID="io.github.bhino50.FinderPath"
+BUNDLE_ID="io.github.bhino50.FinderPathDev"
 BUILD_DIR="$ROOT_DIR/.build/no-xcode"
 APP="$BUILD_DIR/$APP_NAME.app"
+APP_EXECUTABLE="$APP/Contents/MacOS/$APP_NAME"
 DEPLOYMENT_TARGET="13.0"
 MODE="${1:-run}"
+
+matching_executable_pids() {
+  local expected_executable="$1"
+  local line trimmed pid executable
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    pid="${trimmed%%[[:space:]]*}"
+    executable="${trimmed#"$pid"}"
+    executable="${executable#"${executable%%[![:space:]]*}"}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$executable" == "$expected_executable" ]] && printf '%s\n' "$pid"
+  done < <(/bin/ps -ww -axo pid=,comm=)
+}
+
+exact_executable_is_running() {
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && return 0
+  done < <(matching_executable_pids "$1")
+  return 1
+}
+
+terminate_exact_executable() {
+  local executable="$1"
+  local pid attempt
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && /bin/kill -TERM "$pid" 2>/dev/null || true
+  done < <(matching_executable_pids "$executable")
+
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    exact_executable_is_running "$executable" || return 0
+    /bin/sleep 0.1
+  done
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && /bin/kill -KILL "$pid" 2>/dev/null || true
+  done < <(matching_executable_pids "$executable")
+
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    exact_executable_is_running "$executable" || return 0
+    /bin/sleep 0.1
+  done
+
+  echo "Could not stop the existing development app at $executable" >&2
+  return 1
+}
+
+verify_built_app() {
+  local actual_bundle_id actual_executable
+  [[ -f "$APP/Contents/Info.plist" ]] || {
+    echo "Built app is missing Info.plist: $APP" >&2
+    return 1
+  }
+  actual_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" || return 1
+  actual_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")" || return 1
+  [[ "$actual_bundle_id" == "$BUNDLE_ID" ]] || {
+    echo "Built app has bundle ID $actual_bundle_id; expected $BUNDLE_ID" >&2
+    return 1
+  }
+  [[ "$actual_executable" == "$APP_NAME" && -x "$APP_EXECUTABLE" ]] || {
+    echo "Built app does not contain the expected executable: $APP_EXECUTABLE" >&2
+    return 1
+  }
+  echo "Verified development app: $BUNDLE_ID at $APP_EXECUTABLE"
+}
 
 # Pull version numbers from the project file so the bundle stays in sync.
 read_setting() { grep -m1 "$1" "$PBXPROJ" | sed -E "s/.*$1 = ([^;]+);.*/\1/" | tr -d ' '; }
@@ -49,6 +115,13 @@ for DEV_DIR in "${DEVELOPER_DIR:-}" \
   fi
 done
 
+# Never rewrite or re-sign the executable bundle while this exact build is
+# mapped by a live process. In-place replacement can crash the app or leave it
+# running with a mixture of old code and new resources; `build` mode needs the
+# same preflight as the launch modes.
+echo "==> Stopping an existing development build before replacing it"
+terminate_exact_executable "$APP_EXECUTABLE"
+
 echo "==> Compiling $APP_NAME with swiftc (target $TARGET, no xcodebuild)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -72,6 +145,7 @@ sed \
 
 echo "==> Ad-hoc code signing (with Apple Events entitlement)"
 codesign --force --entitlements "$ROOT_DIR/FinderPath.entitlements" --sign - "$APP" >/dev/null
+verify_built_app
 
 if [[ "$MODE" == "build" ]]; then
   echo "Built $APP (version $MARKETING_VERSION). Launch it with: open -n \"$APP\""
@@ -79,14 +153,14 @@ if [[ "$MODE" == "build" ]]; then
 fi
 
 echo "==> Launching"
-/usr/bin/pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+terminate_exact_executable "$APP_EXECUTABLE"
 sleep 1
 /usr/bin/open -n "$APP"
 
 if [[ "$MODE" == "verify" ]]; then
   sleep 2
-  if /usr/bin/pgrep -x "$APP_NAME" >/dev/null; then
-    echo "$APP_NAME is running (version $MARKETING_VERSION)."
+  if exact_executable_is_running "$APP_EXECUTABLE"; then
+    echo "$APP_NAME development build is running from $APP_EXECUTABLE (version $MARKETING_VERSION)."
   else
     echo "$APP_NAME failed to stay running." >&2
     exit 1
