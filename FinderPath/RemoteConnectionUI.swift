@@ -42,6 +42,7 @@ struct RemoteConnectionView: View {
     @State private var tailscale = TailscaleStatus.unavailable
     @State private var isLoadingTailscale = false
     @State private var isTogglingVPN = false
+    @State private var tailscaleRefreshGeneration: UInt64 = 0
     @State private var isConfirmingVPNDisconnect = false
     @State private var isAddingServer = false
     @State private var newServerName = ""
@@ -127,7 +128,7 @@ struct RemoteConnectionView: View {
                 ProgressView()
                     .controlSize(.small)
             } else if tailscale.backend == .unavailable {
-                Text("Not installed").font(.caption).foregroundStyle(.secondary)
+                Text(tailscaleUnavailableBadgeText).font(.caption).foregroundStyle(.secondary)
             } else {
                 Button(tailscale.isRunning ? "Disconnect" : "Connect") {
                     if tailscale.isRunning {
@@ -150,7 +151,41 @@ struct RemoteConnectionView: View {
         case .needsLogin:
             return "Needs login — open the Tailscale app"
         case .unavailable:
-            return isLoadingTailscale ? "Checking Tailscale status…" : "Tailscale CLI not found"
+            if isLoadingTailscale { return "Checking Tailscale status…" }
+            guard let failure = tailscale.failure else { return "Tailscale status unavailable" }
+            switch failure {
+            case .executableNotFound:
+                return "Tailscale CLI not found"
+            case .timedOut:
+                return "Tailscale status check timed out"
+            case .commandFailed(_, let exitStatus, _):
+                return "Tailscale status command failed (exit \(exitStatus))"
+            case .launchFailed:
+                return "FinderPath could not launch Tailscale"
+            case .malformedStatus:
+                return "Tailscale returned invalid status data"
+            case .outputLimitExceeded:
+                return "Tailscale status response was too large"
+            }
+        }
+    }
+
+    private var tailscaleUnavailableBadgeText: String {
+        switch tailscale.failure {
+        case .executableNotFound:
+            return "Not installed"
+        case .timedOut:
+            return "Timed out"
+        case .commandFailed:
+            return "Command failed"
+        case .launchFailed:
+            return "Launch failed"
+        case .malformedStatus:
+            return "Invalid response"
+        case .outputLimitExceeded:
+            return "Response too large"
+        case nil:
+            return "Unavailable"
         }
     }
 
@@ -190,8 +225,9 @@ struct RemoteConnectionView: View {
     }
 
     private var deviceEmptyText: String {
-        if tailscale.backend == .unavailable { return "Tailscale is not installed." }
         if isLoadingTailscale { return "Loading devices…" }
+        if let failure = tailscale.failure { return failure.userMessage }
+        if tailscale.backend == .unavailable { return "Tailscale status is unavailable." }
         return showAllDevices ? "No devices found." : "No Linux devices found. Enable \"Show all\" to see every device."
     }
 
@@ -400,16 +436,25 @@ struct RemoteConnectionView: View {
         isTogglingVPN = true
         let goingUp = !tailscale.isRunning
         Task {
-            let error = goingUp ? await TailscaleBridge.up() : await TailscaleBridge.down()
-            isTogglingVPN = false
-            if let error { errorMessage = error }
+            let outcome = goingUp ? await TailscaleBridge.up() : await TailscaleBridge.down()
+            if case .failure(let failure) = outcome {
+                errorMessage = failure.userMessage
+            }
             await refreshTailscale(forceRefresh: true)
+            isTogglingVPN = false
         }
     }
 
     private func refreshTailscale(forceRefresh: Bool = false) async {
+        tailscaleRefreshGeneration &+= 1
+        let refreshGeneration = tailscaleRefreshGeneration
         isLoadingTailscale = true
         let refreshedStatus = await TailscaleBridge.status(forceRefresh: forceRefresh)
+        // A forced refresh after `up`/`down` supersedes any status request that
+        // was already in flight. Ignoring the older completion prevents the UI
+        // from flipping back to the pre-toggle state after the fresh result.
+        guard refreshGeneration == tailscaleRefreshGeneration else { return }
+
         tailscale = refreshedStatus
         if let selection, selection.hasPrefix("ts:") {
             let selectedDeviceID = String(selection.dropFirst(3))

@@ -8,8 +8,21 @@ import os
 /// only non-fallback results, so opening the menu without a Finder window does
 /// not bury the history under repeated Desktop entries.
 nonisolated struct FinderPathQueryResult: Equatable, Sendable {
+    enum Failure: Equatable, Sendable {
+        case permissionDenied
+        case timedOut
+        case queryFailed
+    }
+
     let path: String
     let isFallback: Bool
+    let failure: Failure?
+
+    init(path: String, isFallback: Bool, failure: Failure? = nil) {
+        self.path = path
+        self.isFallback = isFallback
+        self.failure = failure
+    }
 }
 
 nonisolated enum FinderBridge {
@@ -95,7 +108,8 @@ nonisolated enum FinderBridge {
         } catch {
             return FinderPathQueryResult(
                 path: "Finder AppleScript error: \(error.localizedDescription)",
-                isFallback: true
+                isFallback: true,
+                failure: .queryFailed
             )
         }
 
@@ -168,11 +182,15 @@ nonisolated enum FinderBridge {
             }
         }
         if timedOut {
-            return FinderPathQueryResult(path: finderStalledMessage, isFallback: true)
+            return FinderPathQueryResult(path: finderStalledMessage, isFallback: true, failure: .timedOut)
         }
         let errorText = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if errorText.contains(automationDeniedErrorCode) {
-            return FinderPathQueryResult(path: permissionDeniedMessage, isFallback: true)
+            return FinderPathQueryResult(
+                path: permissionDeniedMessage,
+                isFallback: true,
+                failure: .permissionDenied
+            )
         }
         if terminationStatus != 0 {
             let detail = errorText.isEmpty
@@ -180,7 +198,8 @@ nonisolated enum FinderBridge {
                 : errorText
             return FinderPathQueryResult(
                 path: "Finder AppleScript error: \(detail)",
-                isFallback: true
+                isFallback: true,
+                failure: .queryFailed
             )
         }
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)
@@ -327,7 +346,7 @@ enum TerminalBridge {
     }
 
     static func open(at path: String, completion: @escaping (String?) -> Void) {
-        let directoryURL = resolvedDirectoryURL(for: path)
+        let directoryURL = URL(fileURLWithPath: path, isDirectory: true)
 
         guard let terminalURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
             completion("Terminal.app was not found.")
@@ -347,7 +366,7 @@ enum TerminalBridge {
     }
 
     static func openGhostty(at path: String, completion: @escaping (String?) -> Void) {
-        let directoryURL = resolvedDirectoryURL(for: path)
+        let directoryURL = URL(fileURLWithPath: path, isDirectory: true)
 
         guard let ghosttyURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: ghosttyBundleIdentifier) else {
             completion("Ghostty.app was not found.")
@@ -373,7 +392,7 @@ enum TerminalBridge {
     }
 
     static func openCmux(at path: String, completion: @escaping (String?) -> Void) {
-        let directoryPath = resolvedDirectoryURL(for: path).path
+        let directoryPath = URL(fileURLWithPath: path, isDirectory: true).path
 
         guard let cmuxPath = cmuxExecutablePath() else {
             completion("cmux CLI was not found. Install cmux or add it to your shell PATH.")
@@ -615,7 +634,7 @@ enum TerminalBridge {
         at path: String,
         completion: @escaping (String?) -> Void
     ) {
-        let directoryPath = resolvedDirectoryURL(for: path).path
+        let directoryPath = URL(fileURLWithPath: path, isDirectory: true).path
         let executableArgument = ShellCommand.argument(executable)
         let missingMessage = "\(displayName) CLI was not found. Install it or add \(executable) to your shell PATH."
         let command = """
@@ -625,17 +644,6 @@ enum TerminalBridge {
         // Terminal can open a folder through NSWorkspace, but running a CLI
         // command in a new tab/window requires Terminal's AppleScript interface.
         runTerminalScript(command: command, completion: completion)
-    }
-
-    private static func resolvedDirectoryURL(for path: String) -> URL {
-        var isDirectory: ObjCBool = false
-
-        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
-           isDirectory.boolValue {
-            return URL(fileURLWithPath: path, isDirectory: true)
-        }
-
-        return URL(fileURLWithPath: path).deletingLastPathComponent()
     }
 
     /// AppleScript string literals cannot span raw newlines, but they do

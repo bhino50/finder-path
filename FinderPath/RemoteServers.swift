@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 struct RemoteServer: Equatable {
     let name: String
@@ -118,7 +117,7 @@ enum RemoteServers {
     }
 }
 
-struct TailscaleDevice: Identifiable, Hashable, Sendable {
+nonisolated struct TailscaleDevice: Identifiable, Hashable, Sendable {
     let name: String
     let address: String
     let os: String
@@ -128,27 +127,93 @@ struct TailscaleDevice: Identifiable, Hashable, Sendable {
     var isLinux: Bool { os.lowercased() == "linux" }
 }
 
-nonisolated struct TailscaleStatus: Sendable {
-    enum Backend: Sendable { case running, stopped, needsLogin, unavailable }
+nonisolated enum TailscaleFailure: Equatable, Sendable {
+    case executableNotFound
+    case timedOut(command: String)
+    case commandFailed(command: String, exitStatus: Int32, detail: String?)
+    case launchFailed(command: String, detail: String)
+    case malformedStatus
+    case outputLimitExceeded(command: String)
+
+    var userMessage: String {
+        switch self {
+        case .executableNotFound:
+            return "Tailscale CLI was not found."
+        case .timedOut(let command):
+            let hint = command.hasSuffix(" up")
+                ? " If this node needs to sign in again, open the Tailscale app."
+                : ""
+            return "\(command) timed out.\(hint)"
+        case .commandFailed(let command, let exitStatus, let detail):
+            let prefix = "\(command) failed with exit status \(exitStatus)."
+            guard let detail, !detail.isEmpty else { return prefix }
+            return "\(prefix) \(detail)"
+        case .launchFailed(let command, let detail):
+            return "Could not run \(command): \(detail)"
+        case .malformedStatus:
+            return "Tailscale returned malformed status JSON."
+        case .outputLimitExceeded(let command):
+            return "\(command) returned more data than FinderPath can safely process."
+        }
+    }
+}
+
+nonisolated enum TailscaleCommandOutcome: Equatable, Sendable {
+    case success
+    case failure(TailscaleFailure)
+}
+
+nonisolated struct TailscaleStatus: Equatable, Sendable {
+    enum Backend: Equatable, Sendable { case running, stopped, needsLogin, unavailable }
 
     let backend: Backend
     let selfAddress: String?
     let devices: [TailscaleDevice]
+    let failure: TailscaleFailure?
 
-    static let unavailable = TailscaleStatus(backend: .unavailable, selfAddress: nil, devices: [])
+    static let unavailable = TailscaleStatus(
+        backend: .unavailable,
+        selfAddress: nil,
+        devices: [],
+        failure: nil
+    )
+
+    static func failed(_ failure: TailscaleFailure) -> TailscaleStatus {
+        TailscaleStatus(
+            backend: .unavailable,
+            selfAddress: nil,
+            devices: [],
+            failure: failure
+        )
+    }
 
     var isRunning: Bool { backend == .running }
 }
 
 nonisolated enum TailscaleBridge {
     static let appExecutablePath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    static let statusCommand = "tailscale status --json"
 
     // How long a fetched status stays fresh. Reopening the Connect to Server
     // window within this interval reuses the cached result instead of
     // respawning the tailscale CLI.
     private static let statusCacheMaxAge: TimeInterval = 8
+    private static let statusProcessLimits = BoundedProcessRunner.Limits(
+        timeout: 10,
+        terminationGrace: 1,
+        maximumStandardOutputBytes: 2 * 1_024 * 1_024,
+        maximumStandardErrorBytes: 64 * 1_024
+    )
+    private static let commandProcessLimits = BoundedProcessRunner.Limits(
+        timeout: 20,
+        terminationGrace: 1,
+        maximumStandardOutputBytes: 64 * 1_024,
+        maximumStandardErrorBytes: 64 * 1_024
+    )
 
-    private static let statusCache = TailscaleStatusCache()
+    private static let statusCache = TailscaleStatusCache {
+        TailscaleBridge.fetchStatus()
+    }
 
     static func executablePath() -> String? {
         if let resolved = AgentLauncher.availability(for: "tailscale", defaultExecutable: "tailscale").resolvedPath {
@@ -173,25 +238,77 @@ nonisolated enum TailscaleBridge {
         await statusCache.status(forceRefresh: forceRefresh, maxAge: statusCacheMaxAge)
     }
 
-    static func up() async -> String? {
-        await Task.detached { runVoid(arguments: ["up"]) }.value
+    static func up() async -> TailscaleCommandOutcome {
+        await Task.detached(priority: .userInitiated) {
+            runCommand(arguments: ["up"])
+        }.value
     }
 
-    static func down() async -> String? {
-        await Task.detached { runVoid(arguments: ["down"]) }.value
+    static func down() async -> TailscaleCommandOutcome {
+        await Task.detached(priority: .userInitiated) {
+            runCommand(arguments: ["down"])
+        }.value
     }
 
     // Blocking status fetch. Spawns the tailscale CLI and waits for it to
     // exit, so only call this off the main thread (the cache actor does).
     fileprivate static func fetchStatus() -> TailscaleStatus {
-        guard let path = executablePath(),
-              let data = run(path, arguments: ["status", "--json"]),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .unavailable
+        guard let path = executablePath() else {
+            return .failed(.executableNotFound)
+        }
+
+        let outcome = BoundedProcessRunner.run(
+            executable: path,
+            arguments: ["status", "--json"],
+            limits: statusProcessLimits
+        )
+        return status(from: outcome, command: statusCommand)
+    }
+
+    /// Converts the process layer's fully typed result into user-visible
+    /// Tailscale state. Keeping this boundary pure makes every failure and
+    /// output-cap path deterministic rather than requiring a locally installed
+    /// and authenticated Tailscale daemon in the test suite.
+    static func status(
+        from outcome: BoundedProcessRunner.Outcome,
+        command: String = statusCommand
+    ) -> TailscaleStatus {
+        let output: BoundedProcessRunner.CapturedOutput
+        switch outcome {
+        case .executableNotFound:
+            return .failed(.executableNotFound)
+        case .launchFailed(let message):
+            return .failed(.launchFailed(command: command, detail: message))
+        case .timedOut:
+            return .failed(.timedOut(command: command))
+        case .exited(let status, let captured):
+            guard status == 0 else {
+                return .failed(.commandFailed(
+                    command: command,
+                    exitStatus: status,
+                    detail: commandDetail(from: captured)
+                ))
+            }
+            output = captured
+        }
+
+        guard !output.standardOutputWasTruncated else {
+            return .failed(.outputLimitExceeded(command: command))
+        }
+        return decodeStatus(output.standardOutput)
+    }
+
+    /// Decodes only the documented fields FinderPath consumes and supplies
+    /// stable defaults for optional peer metadata. A missing BackendState is a
+    /// malformed response because the UI cannot safely infer daemon state.
+    static func decodeStatus(_ data: Data) -> TailscaleStatus {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let backendState = json["BackendState"] as? String else {
+            return .failed(.malformedStatus)
         }
 
         let backend: TailscaleStatus.Backend
-        switch json["BackendState"] as? String {
+        switch backendState {
         case "Running": backend = .running
         case "NeedsLogin", "NoState": backend = .needsLogin
         default: backend = .stopped
@@ -223,98 +340,145 @@ nonisolated enum TailscaleBridge {
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
 
-        return TailscaleStatus(backend: backend, selfAddress: selfAddress, devices: devices)
+        return TailscaleStatus(
+            backend: backend,
+            selfAddress: selfAddress,
+            devices: devices,
+            failure: nil
+        )
     }
 
     // Runs a tailscale subcommand for its side effect and waits for it to
     // exit, so only call this off the main thread (the async wrappers do).
-    // Returns an error message on failure, nil on success.
-    private static func runVoid(arguments: [String]) -> String? {
+    private static func runCommand(arguments: [String]) -> TailscaleCommandOutcome {
         guard let path = executablePath() else {
-            return "Tailscale CLI was not found."
+            return .failure(.executableNotFound)
         }
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: path)
-        task.arguments = arguments
-        let errorPipe = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = errorPipe
-
-        do {
-            try task.run()
-        } catch {
-            return "Could not run tailscale: \(error.localizedDescription)"
-        }
-
-        // `tailscale up` blocks indefinitely when the node needs interactive
-        // browser re-authentication. Without a watchdog the Connect button in
-        // the Connect to Server window stayed disabled forever and the stray
-        // process leaked. Terminating the child also unblocks the read below.
-        let timedOutFlag = OSAllocatedUnfairLock(initialState: false)
-        let watchdog = DispatchWorkItem {
-            timedOutFlag.withLock { $0 = true }
-            task.terminate()
-        }
-        DispatchQueue.global(qos: .userInitiated)
-            .asyncAfter(deadline: .now() + commandTimeoutSeconds, execute: watchdog)
-
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        watchdog.cancel()
-
-        if task.terminationStatus == 0 { return nil }
-        if timedOutFlag.withLock({ $0 }) {
-            return "tailscale \(arguments.joined(separator: " ")) timed out. "
-                + "If this node needs to sign in again, open the Tailscale app."
-        }
-
-        let message = String(data: errorData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return message?.isEmpty == false ? message : "tailscale \(arguments.joined(separator: " ")) failed."
+        let command = "tailscale \(arguments.joined(separator: " "))"
+        return commandOutcome(from: BoundedProcessRunner.run(
+            executable: path,
+            arguments: arguments,
+            limits: commandProcessLimits
+        ), command: command)
     }
 
-    /// Upper bound on a `tailscale up`/`down` run before it is killed.
-    private static let commandTimeoutSeconds: TimeInterval = 20
+    static func commandOutcome(
+        from outcome: BoundedProcessRunner.Outcome,
+        command: String
+    ) -> TailscaleCommandOutcome {
+        switch outcome {
+        case .executableNotFound:
+            return .failure(.executableNotFound)
+        case .launchFailed(let message):
+            return .failure(.launchFailed(command: command, detail: message))
+        case .timedOut:
+            return .failure(.timedOut(command: command))
+        case .exited(let status, let output):
+            guard status == 0 else {
+                return .failure(.commandFailed(
+                    command: command,
+                    exitStatus: status,
+                    detail: commandDetail(from: output)
+                ))
+            }
+            return .success
+        }
+    }
 
-    private static func run(_ path: String, arguments: [String]) -> Data? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: path)
-        task.arguments = arguments
-        let outputPipe = Pipe()
-        task.standardOutput = outputPipe
-        task.standardError = FileHandle.nullDevice
+    private static func commandDetail(
+        from output: BoundedProcessRunner.CapturedOutput
+    ) -> String? {
+        let source: Data
+        let sourceWasTruncated: Bool
+        if !output.standardError.isEmpty {
+            source = output.standardError
+            sourceWasTruncated = output.standardErrorWasTruncated
+        } else {
+            source = output.standardOutput
+            sourceWasTruncated = output.standardOutputWasTruncated
+        }
 
-        do {
-            try task.run()
-        } catch {
+        guard var text = String(data: source, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
             return nil
         }
 
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
-        return data.isEmpty ? nil : data
+        let maximumCharacters = 500
+        let shortened = text.count > maximumCharacters || sourceWasTruncated
+        text = String(text.prefix(maximumCharacters))
+        return shortened ? text + "…" : text
     }
 }
 
 // Serializes Tailscale status fetches and briefly caches the latest result so
-// repeated lookups within a few seconds do not respawn the CLI.
-private actor TailscaleStatusCache {
+// repeated lookups within a few seconds do not respawn the CLI. A forced
+// refresh supersedes every older request: callers awaiting an older result are
+// redirected to the newest generation so stale UI tasks cannot overwrite a
+// manually refreshed status after it appears.
+actor TailscaleStatusCache {
+    typealias Fetcher = @Sendable () async -> TailscaleStatus
+
+    private struct InFlightRequest {
+        let generation: UInt64
+        let task: Task<TailscaleStatus, Never>
+    }
+
+    private let fetcher: Fetcher
     private var cachedStatus: TailscaleStatus?
     private var fetchedAt = Date.distantPast
+    private var generation: UInt64 = 0
+    private var inFlightRequest: InFlightRequest?
+
+    init(fetcher: @escaping Fetcher) {
+        self.fetcher = fetcher
+    }
 
     func status(forceRefresh: Bool, maxAge: TimeInterval) async -> TailscaleStatus {
+        if !forceRefresh, let request = inFlightRequest {
+            let status = await request.task.value
+            return await resolve(status, for: request.generation)
+        }
+
         if !forceRefresh,
            let cachedStatus,
            Date().timeIntervalSince(fetchedAt) < maxAge {
             return cachedStatus
         }
 
-        let fresh = await Task.detached { TailscaleBridge.fetchStatus() }.value
-        cachedStatus = fresh
+        generation &+= 1
+        let requestGeneration = generation
+        let fetcher = self.fetcher
+        let task = Task.detached(priority: .userInitiated) {
+            await fetcher()
+        }
+        inFlightRequest = InFlightRequest(generation: requestGeneration, task: task)
+
+        let fresh = await task.value
+        return await resolve(fresh, for: requestGeneration)
+    }
+
+    private func resolve(
+        _ status: TailscaleStatus,
+        for requestGeneration: UInt64
+    ) async -> TailscaleStatus {
+        guard requestGeneration == generation else {
+            if let newestRequest = inFlightRequest {
+                let newestStatus = await newestRequest.task.value
+                return await resolve(newestStatus, for: newestRequest.generation)
+            }
+            // The newer generation already committed while this task was
+            // resuming on the actor. Never leak the obsolete result back out.
+            return cachedStatus ?? status
+        }
+
+        cachedStatus = status
         fetchedAt = Date()
-        return fresh
+        if inFlightRequest?.generation == requestGeneration {
+            inFlightRequest = nil
+        }
+        return status
     }
 }
 

@@ -1,9 +1,28 @@
 import Darwin
 import Foundation
 
+private actor ControlledTailscaleFetcher {
+    private var nextRequestID = 0
+    private var continuations: [Int: CheckedContinuation<TailscaleStatus, Never>] = [:]
+
+    var requestCount: Int { nextRequestID }
+
+    func fetch() async -> TailscaleStatus {
+        let requestID = nextRequestID
+        nextRequestID += 1
+        return await withCheckedContinuation { continuation in
+            continuations[requestID] = continuation
+        }
+    }
+
+    func complete(requestID: Int, with status: TailscaleStatus) {
+        continuations.removeValue(forKey: requestID)?.resume(returning: status)
+    }
+}
+
 @main
 struct FinderPathLogicTests {
-    static func main() {
+    static func main() async {
         var failures: [String] = []
         var assertionCount = 0
 
@@ -19,6 +38,95 @@ struct FinderPathLogicTests {
         expect(UpdateChecker.versionsAreEquivalent("v1.6", "1.6.0"), "v prefix and trailing zero should match")
         expect(!UpdateChecker.versionsAreEquivalent("", "0"), "empty versions must not match")
         expect(!UpdateChecker.versionsAreEquivalent("release", "0"), "nonnumeric versions must not match")
+
+        // Browser recovery is a typed trust decision. Only an operational
+        // download failure may expose the manifest's external URL; packages
+        // that were rejected or never verified must remain fail-closed.
+        expect(
+            UpdateInstaller.InstallError.downloadFailed("network unavailable").browserRecoveryPolicy
+                == .offerManifestDownload,
+            "operational download failures may offer explicit browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.downloadRejected("unsafe redirect").browserRecoveryPolicy
+                == .unavailable,
+            "download safety rejections must not offer browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.extractionFailed("invalid archive").browserRecoveryPolicy
+                == .unavailable,
+            "unverified extraction failures must not offer browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.appNotFoundInArchive.browserRecoveryPolicy == .unavailable,
+            "an archive without FinderPath.app must not offer browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.verificationFailed("team mismatch").browserRecoveryPolicy
+                == .unavailable,
+            "security-verification failures must not offer browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.installFailed("unknown state").browserRecoveryPolicy == .unavailable,
+            "installation failures with unknown verification state must not offer browser recovery"
+        )
+        expect(
+            UpdateInstaller.InstallError.noArchiveURL.browserRecoveryPolicy == .unavailable,
+            "a missing archive must not gain browser recovery through the install-failure path"
+        )
+        expect(
+            UpdateInstaller.InstallError.unsupportedHostBundle("io.github.bhino50.FinderPathDev")
+                .browserRecoveryPolicy == .unavailable,
+            "a development build cannot escape isolation through browser recovery"
+        )
+        expect(
+            UpdateInstaller.installerHostIsEligible(bundleIdentifier: "io.github.bhino50.FinderPath"),
+            "the official bundle may install a verified update"
+        )
+        expect(
+            !UpdateInstaller.installerHostIsEligible(bundleIdentifier: "io.github.bhino50.FinderPathDev"),
+            "a development build cannot replace itself with the production bundle"
+        )
+        expect(
+            !UpdateInstaller.installerHostIsEligible(bundleIdentifier: nil),
+            "an unidentified host bundle fails closed before update download"
+        )
+        expect(
+            UpdateInstaller.classifyDownloadError(URLError(.notConnectedToInternet)).browserRecoveryPolicy
+                == .offerManifestDownload,
+            "an explicit offline error remains an operational recovery case"
+        )
+        expect(
+            UpdateInstaller.classifyDownloadError(URLError(.secureConnectionFailed)).browserRecoveryPolicy
+                == .unavailable,
+            "TLS failures must not be reclassified as browser-recoverable"
+        )
+        expect(
+            UpdateInstaller.classifyDownloadError(NSError(domain: "FinderPathTests", code: 1))
+                .browserRecoveryPolicy == .unavailable,
+            "unknown download errors must fail closed"
+        )
+
+        expect(
+            UpdateInstaller.operationTimeoutMessage(seconds: 120)
+                == "The update operation exceeded its 120-second safety limit.",
+            "the operation timeout message must interpolate its exact limit"
+        )
+        expect(
+            UpdateInstaller.expandedEntryCountMessage(maximumEntries: 50_000)
+                == "The expanded update contained more than 50000 entries.",
+            "the expanded-entry message must interpolate its exact limit"
+        )
+        expect(
+            UpdateInstaller.expandedPathDepthMessage(maximumDepth: 64)
+                == "The expanded update exceeded the maximum path depth of 64.",
+            "the expanded-depth message must interpolate its exact limit"
+        )
+        expect(
+            UpdateInstaller.expandedSizeLimitMessage(maximumSize: 1_024 * 1_024 * 1_024)
+                == "The expanded update exceeded the 1024 MB safety limit.",
+            "the expanded-size message must interpolate its exact limit"
+        )
 
         // Extraction is monitored before an update bundle is trusted. Exercise
         // each quota against a tiny temporary tree rather than installing.
@@ -98,6 +206,204 @@ struct FinderPathLogicTests {
         UserDefaults.standard.set(true, forKey: showAllKey)
         expect(FinderPathPreferences.showAllTailscaleDevices, "re-enabling show all must persist")
         UserDefaults.standard.removeObject(forKey: showAllKey)
+
+        // MARK: - Tailscale process decoding and refresh ordering
+
+        func capturedOutput(
+            stdout: String = "",
+            stderr: String = "",
+            stdoutWasTruncated: Bool = false,
+            stderrWasTruncated: Bool = false
+        ) -> BoundedProcessRunner.CapturedOutput {
+            BoundedProcessRunner.CapturedOutput(
+                standardOutput: Data(stdout.utf8),
+                standardError: Data(stderr.utf8),
+                standardOutputWasTruncated: stdoutWasTruncated,
+                standardErrorWasTruncated: stderrWasTruncated
+            )
+        }
+
+        let tailscaleJSON = """
+        {
+          "BackendState": "Running",
+          "Self": { "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"] },
+          "Peer": {
+            "peer-z": {
+              "DNSName": "zeta.example.ts.net.",
+              "HostName": "IGNORED-HOSTNAME",
+              "TailscaleIPs": ["100.64.0.3"],
+              "OS": "windows",
+              "Online": false
+            },
+            "peer-a": {
+              "HostName": "Alpha",
+              "TailscaleIPs": ["100.64.0.2"],
+              "OS": "linux",
+              "Online": true
+            },
+            "peer-b": {
+              "DNSName": "beta.example.ts.net.",
+              "OS": "macOS",
+              "Online": true
+            }
+          }
+        }
+        """
+        let decodedStatus = TailscaleBridge.status(from: .exited(
+            status: 0,
+            output: capturedOutput(stdout: tailscaleJSON)
+        ))
+        expect(decodedStatus.backend == .running, "Tailscale Running JSON maps to a running backend")
+        expect(decodedStatus.selfAddress == "100.64.0.1", "the first self Tailscale address is retained")
+        expect(
+            decodedStatus.devices.map(\.name) == ["Alpha", "beta", "zeta"],
+            "online peers sort first and MagicDNS short names take precedence"
+        )
+        expect(
+            decodedStatus.devices.map(\.online) == [true, true, false],
+            "peer online state survives JSON decoding"
+        )
+        expect(
+            decodedStatus.devices[1].address.isEmpty && decodedStatus.devices[1].os == "macOS",
+            "optional peer fields receive stable defaults without dropping the peer"
+        )
+        expect(decodedStatus.failure == nil, "valid Tailscale status has no typed failure")
+
+        let noState = TailscaleBridge.decodeStatus(Data(#"{"BackendState":"NoState"}"#.utf8))
+        expect(noState.backend == .needsLogin, "NoState maps to the sign-in-required state")
+        let stopped = TailscaleBridge.decodeStatus(Data(#"{"BackendState":"Starting"}"#.utf8))
+        expect(stopped.backend == .stopped, "non-running daemon states map to stopped")
+        expect(
+            TailscaleBridge.decodeStatus(Data(#"{"Peer":{}}"#.utf8)).failure == .malformedStatus,
+            "a status payload without BackendState fails as malformed"
+        )
+        expect(
+            TailscaleBridge.decodeStatus(Data("not json".utf8)).failure == .malformedStatus,
+            "invalid status JSON fails as malformed"
+        )
+
+        expect(
+            TailscaleBridge.status(from: .executableNotFound(path: "/missing")).failure
+                == .executableNotFound,
+            "a missing Tailscale executable remains a typed failure"
+        )
+        expect(
+            TailscaleBridge.status(from: .timedOut(output: capturedOutput())).failure
+                == .timedOut(command: TailscaleBridge.statusCommand),
+            "a Tailscale status timeout remains a typed failure"
+        )
+        expect(
+            TailscaleBridge.status(from: .launchFailed(message: "spawn denied")).failure
+                == .launchFailed(command: TailscaleBridge.statusCommand, detail: "spawn denied"),
+            "a Tailscale launch failure retains its detail"
+        )
+        expect(
+            TailscaleBridge.status(from: .exited(
+                status: 7,
+                output: capturedOutput(stderr: "permission denied\n")
+            )).failure == .commandFailed(
+                command: TailscaleBridge.statusCommand,
+                exitStatus: 7,
+                detail: "permission denied"
+            ),
+            "a nonzero Tailscale status retains exit status and trimmed stderr"
+        )
+        expect(
+            TailscaleBridge.status(from: .exited(
+                status: 0,
+                output: capturedOutput(stdout: tailscaleJSON, stdoutWasTruncated: true)
+            )).failure == .outputLimitExceeded(command: TailscaleBridge.statusCommand),
+            "truncated successful status output fails closed before JSON decoding"
+        )
+
+        let longDiagnostic = String(repeating: "x", count: 700)
+        let failedCommand = TailscaleBridge.commandOutcome(
+            from: .exited(
+                status: 9,
+                output: capturedOutput(
+                    stderr: longDiagnostic,
+                    stderrWasTruncated: true
+                )
+            ),
+            command: "tailscale up"
+        )
+        if case .failure(.commandFailed(let command, let exitStatus, let detail)) = failedCommand {
+            expect(command == "tailscale up", "command failure identifies the exact subcommand")
+            expect(exitStatus == 9, "command failure retains its exit status")
+            expect(detail?.count == 501, "a truncated diagnostic is capped and marked with an ellipsis")
+            expect(detail?.hasSuffix("…") == true, "a truncated diagnostic visibly reports shortening")
+        } else {
+            expect(false, "a failed side-effect command remains a typed command failure")
+        }
+        expect(
+            TailscaleBridge.commandOutcome(
+                from: .exited(status: 0, output: capturedOutput(stdoutWasTruncated: true)),
+                command: "tailscale down"
+            ) == .success,
+            "unused side-effect command output may be discarded even when capped"
+        )
+
+        let controlledFetcher = ControlledTailscaleFetcher()
+        let refreshCache = TailscaleStatusCache {
+            await controlledFetcher.fetch()
+        }
+        let staleStatus = TailscaleStatus(
+            backend: .stopped,
+            selfAddress: nil,
+            devices: [],
+            failure: nil
+        )
+        let freshStatus = TailscaleStatus(
+            backend: .running,
+            selfAddress: "100.64.0.99",
+            devices: [],
+            failure: nil
+        )
+
+        let originalRefresh = Task {
+            await refreshCache.status(forceRefresh: false, maxAge: 60)
+        }
+        for _ in 0..<1_000 {
+            if await controlledFetcher.requestCount >= 1 { break }
+            await Task.yield()
+        }
+        let initialRequestCount = await controlledFetcher.requestCount
+        expect(initialRequestCount == 1, "the initial status lookup starts one fetch")
+
+        let forcedRefresh = Task {
+            await refreshCache.status(forceRefresh: true, maxAge: 60)
+        }
+        for _ in 0..<1_000 {
+            if await controlledFetcher.requestCount >= 2 { break }
+            await Task.yield()
+        }
+        let joinedRefresh = Task {
+            await refreshCache.status(forceRefresh: false, maxAge: 60)
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let overlappingRequestCount = await controlledFetcher.requestCount
+        expect(
+            overlappingRequestCount == 2,
+            "a non-forced lookup joins the newest forced refresh instead of spawning a third fetch"
+        )
+
+        // Resolve the obsolete request first. It must wait for and return the
+        // forced result instead of exposing stale state to its original caller.
+        await controlledFetcher.complete(requestID: 0, with: staleStatus)
+        for _ in 0..<100 { await Task.yield() }
+        await controlledFetcher.complete(requestID: 1, with: freshStatus)
+
+        let originalResult = await originalRefresh.value
+        let forcedResult = await forcedRefresh.value
+        let joinedResult = await joinedRefresh.value
+        expect(originalResult == freshStatus, "an older overlapping caller is redirected to the forced result")
+        expect(forcedResult == freshStatus, "the forced caller receives its fresh result")
+        expect(joinedResult == freshStatus, "a non-forced overlapping caller receives the fresh result")
+
+        let cachedResult = await refreshCache.status(forceRefresh: false, maxAge: 60)
+        let finalRequestCount = await controlledFetcher.requestCount
+        expect(cachedResult == freshStatus, "the newest forced result is the value committed to cache")
+        expect(finalRequestCount == 2, "a fresh cache hit does not invoke the fetcher again")
 
         // Prerelease builds of the same version must not be treated as equal:
         // UpdateInstaller.verify uses this to gate replacing the running app.
@@ -297,14 +603,34 @@ struct FinderPathLogicTests {
             ).path == FinderBridge.finderStalledMessage,
             "a watchdog kill should report Finder as not responding"
         )
+        let deniedFinderResult = FinderBridge.interpretScriptResult(
+            terminationStatus: 1,
+            timedOut: false,
+            stdout: "",
+            stderr: "execution error: Not authorized to send Apple events to Finder. (-1743)"
+        )
         expect(
-            FinderBridge.interpretScriptResult(
+            deniedFinderResult.path == FinderBridge.permissionDeniedMessage,
+            "Finder permission denial should keep its actionable message"
+        )
+        expect(
+            deniedFinderResult.failure == .permissionDenied,
+            "Finder permission denial must be typed separately from operational failures"
+        )
+
+        let failedFinderResult = FinderBridge.interpretScriptResult(
                 terminationStatus: 1,
                 timedOut: false,
                 stdout: "",
                 stderr: "execution error: Finder got an error: AppleEvent timed out. (-1712)"
-            ).path.hasPrefix("Finder AppleScript error:"),
+            )
+        expect(
+            failedFinderResult.path.hasPrefix("Finder AppleScript error:"),
             "other script failures should surface as error strings"
+        )
+        expect(
+            failedFinderResult.failure == .queryFailed,
+            "non-permission Finder failures must not route users to Automation settings"
         )
         expect(
             FinderBridge.interpretScriptResult(
@@ -377,14 +703,148 @@ struct FinderPathLogicTests {
             "a legal trailing space in a folder name is preserved"
         )
 
-        expect(
-            FinderBridge.interpretScriptResult(
+        let stalledFinderResult = FinderBridge.interpretScriptResult(
                 terminationStatus: 15,
                 timedOut: true,
                 stdout: "",
                 stderr: ""
-            ).isFallback,
+            )
+        expect(
+            stalledFinderResult.isFallback,
             "a stalled Finder is a fallback, never a recordable path"
+        )
+        expect(
+            stalledFinderResult.failure == .timedOut,
+            "a stalled Finder must be distinguishable from permission denial"
+        )
+
+        // Beginning a new Finder refresh must synchronously retire the previous
+        // path. An older asynchronous completion may never make it actionable.
+        var refreshState = FinderPathRefreshState()
+        let firstRefresh = refreshState.begin()
+        expect(refreshState.isRefreshing && refreshState.currentPath.isEmpty, "refresh begins in a loading state")
+        expect(
+            refreshState.complete(
+                FinderPathQueryResult(path: "/tmp/old", isFallback: false),
+                generation: firstRefresh
+            ),
+            "the active Finder refresh may complete"
+        )
+        expect(refreshState.currentPath == "/tmp/old", "a completed refresh exposes its path")
+        let secondRefresh = refreshState.begin()
+        expect(
+            refreshState.currentPath.isEmpty && refreshState.isRefreshing,
+            "starting another refresh immediately clears the stale actionable path"
+        )
+        expect(
+            !refreshState.complete(
+                FinderPathQueryResult(path: "/tmp/too-late", isFallback: false),
+                generation: firstRefresh
+            ),
+            "an older Finder completion is rejected"
+        )
+        expect(refreshState.currentPath.isEmpty, "a rejected completion cannot revive the previous path")
+        expect(
+            refreshState.complete(
+                FinderPathQueryResult(path: "/tmp/current", isFallback: false),
+                generation: secondRefresh
+            ),
+            "the newest Finder completion wins"
+        )
+        expect(refreshState.currentPath == "/tmp/current", "the winning completion becomes actionable")
+
+        let directoryTarget = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FinderPathDirectoryTargetTests-\(UUID().uuidString)")
+        let regularFileTarget = directoryTarget.appendingPathComponent("file")
+        try? FileManager.default.createDirectory(at: directoryTarget, withIntermediateDirectories: true)
+        try? Data([0x41]).write(to: regularFileTarget)
+        let directoryValidation = await FinderPathDirectoryTarget.validate(directoryTarget.path)
+        expect(
+            directoryValidation == .available,
+            "an existing action target directory is accepted"
+        )
+        let fileValidation = await FinderPathDirectoryTarget.validate(regularFileTarget.path)
+        expect(
+            fileValidation == .unavailable,
+            "a regular file cannot become a terminal working directory"
+        )
+        try? FileManager.default.removeItem(at: directoryTarget)
+        let deletedValidation = await FinderPathDirectoryTarget.validate(directoryTarget.path)
+        expect(
+            deletedValidation == .unavailable,
+            "a deleted Recent Path is rejected at action time"
+        )
+
+        // Duplicate processes must elect one global winner using a total
+        // ordering. This also gives URL forwarding an exact destination PID.
+        let now = Date()
+        let release = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.releaseBundleIdentifier,
+            launchDate: now,
+            processIdentifier: 400
+        )
+        let olderDevelopment = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.developmentBundleIdentifier,
+            launchDate: now.addingTimeInterval(-60),
+            processIdentifier: 100
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(olderDevelopment, over: release),
+            "an already-running development build outranks a newer release"
+        )
+        let olderRelease = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.releaseBundleIdentifier,
+            launchDate: now.addingTimeInterval(-1),
+            processIdentifier: 900
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(olderRelease, over: release),
+            "the older launch wins between builds with the same identity"
+        )
+        let unknownLaunchDate = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.releaseBundleIdentifier,
+            launchDate: nil,
+            processIdentifier: 1
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(unknownLaunchDate, over: release),
+            "missing launch metadata conservatively represents an existing instance"
+        )
+        let currentWithoutLaunchDate = FinderPathInstanceIdentity.current(
+            bundleIdentifier: FinderPathInstanceIdentity.releaseBundleIdentifier,
+            observedLaunchDate: nil,
+            processIdentifier: 1,
+            fallbackLaunchDate: now
+        )
+        expect(
+            currentWithoutLaunchDate.launchDate == now,
+            "a current process with missing metadata is normalized to its known startup time"
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(olderDevelopment, over: currentWithoutLaunchDate),
+            "missing current metadata cannot displace a known incumbent"
+        )
+        let simultaneousDevelopment = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.developmentBundleIdentifier,
+            launchDate: now,
+            processIdentifier: 1
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(release, over: simultaneousDevelopment),
+            "release identity breaks an exact launch-time tie"
+        )
+        let lowerPID = FinderPathInstanceIdentity(
+            bundleIdentifier: FinderPathInstanceIdentity.releaseBundleIdentifier,
+            launchDate: now,
+            processIdentifier: 399
+        )
+        expect(
+            FinderPathInstanceIdentity.isPreferred(lowerPID, over: release),
+            "PID deterministically breaks an exact launch-time tie"
+        )
+        expect(
+            !FinderPathInstanceIdentity.isPreferred(release, over: release),
+            "an instance never outranks itself"
         )
 
         // Recent Paths remembers the folders FinderPath saw. Order is recency,
@@ -531,6 +991,10 @@ struct FinderPathLogicTests {
         expect(
             boundedQueue.drain().count == PendingURLQueue.capacity,
             "early URL buffer is capped at PendingURLQueue.capacity"
+        )
+        expect(
+            boundedQueue.accept(flood).count == PendingURLQueue.capacity,
+            "a ready queue also bounds one forwarded URL batch"
         )
 
         // The queue is deliberately scheme-agnostic; FinderPathActionRouter

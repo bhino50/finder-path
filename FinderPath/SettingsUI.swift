@@ -339,6 +339,7 @@ struct SettingsView: View {
         hideUnavailableAgentItems = true
         showTerminalsSection = true
         rightClickOpensTerminals = true
+        hoverShowsTerminals = true
         terminalFontSize = 12
         terminalScrollbackLimit = 2000
         terminalShellOverride = ""
@@ -466,15 +467,19 @@ struct WelcomeView: View {
     var onFinish: () -> Void = {}
 
     @AppStorage(FinderPathPreferences.completedWelcomeKey) private var completedWelcome = false
-    @State private var finderPath = ""
+    @State private var finderResult: FinderPathQueryResult?
     @State private var isCheckingFinder = false
 
+    private var finderPath: String { finderResult?.path ?? "" }
+
     private var finderAccessGranted: Bool {
-        !finderPath.isEmpty && !finderPath.hasPrefix("Finder AppleScript error:")
+        finderResult?.failure == nil
+            && !finderPath.isEmpty
+            && !finderPath.hasPrefix("Finder AppleScript error:")
     }
 
     private var finderAccessDenied: Bool {
-        FinderBridge.isPermissionDenied(finderPath)
+        finderResult?.failure == .permissionDenied
     }
 
     var body: some View {
@@ -577,6 +582,12 @@ struct WelcomeView: View {
         } else if finderAccessDenied {
             Label("Finder access denied", systemImage: "xmark.octagon.fill")
                 .foregroundStyle(.red)
+        } else if finderResult?.failure == .timedOut {
+            Label("Finder is not responding", systemImage: "clock.badge.exclamationmark")
+                .foregroundStyle(.orange)
+        } else if finderResult?.failure == .queryFailed {
+            Label("Finder check failed", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
         } else {
             Label("Waiting for permission…", systemImage: "ellipsis.circle")
                 .foregroundStyle(.secondary)
@@ -592,9 +603,10 @@ struct WelcomeView: View {
         NSApp.activate(ignoringOtherApps: true)
         isCheckingFinder = true
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath().path
+            let result = await FinderBridge.fetchCurrentPath()
+            finderResult = result
             isCheckingFinder = false
-            if !finderAccessGranted {
+            if result.failure == .permissionDenied {
                 FinderBridge.openAutomationSettings()
             }
         }
@@ -602,7 +614,7 @@ struct WelcomeView: View {
 
     private func refreshFinderAccess() {
         Task { @MainActor in
-            finderPath = await FinderBridge.fetchCurrentPath().path
+            finderResult = await FinderBridge.fetchCurrentPath()
         }
     }
 }
@@ -670,9 +682,28 @@ enum UpdatePrompt {
     private static func presentInstallFailure(_ error: UpdateInstaller.InstallError, manifest: UpdateManifest) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "The update could not be installed."
-        alert.informativeText = error.localizedDescription
-        if manifest.downloadURL != nil {
+
+        switch error {
+        case .verificationFailed:
+            alert.messageText = "The update failed security verification."
+            alert.informativeText = "\(error.localizedDescription)\n\nFinderPath will not open an external download after a security-verification failure."
+        case .downloadRejected, .extractionFailed, .appNotFoundInArchive:
+            alert.messageText = "The update package was rejected."
+            alert.informativeText = "\(error.localizedDescription)\n\nThe package was not verified, so FinderPath will not open a browser fallback."
+        default:
+            alert.messageText = "The update could not be installed."
+            alert.informativeText = error.localizedDescription
+        }
+
+        let browserRecoveryURL: URL?
+        switch error.browserRecoveryPolicy {
+        case .offerManifestDownload:
+            browserRecoveryURL = manifest.downloadURL
+        case .unavailable:
+            browserRecoveryURL = nil
+        }
+
+        if browserRecoveryURL != nil {
             alert.addButton(withTitle: "Download in Browser")
             alert.addButton(withTitle: "Cancel")
         } else {
@@ -682,7 +713,7 @@ enum UpdatePrompt {
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
 
-        if response == .alertFirstButtonReturn, let url = manifest.downloadURL {
+        if response == .alertFirstButtonReturn, let url = browserRecoveryURL {
             NSWorkspace.shared.open(url)
         }
     }

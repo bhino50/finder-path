@@ -40,8 +40,11 @@ final class StatusItemController: NSObject {
     private lazy var terminalPanelController = TerminalPanelController(
         store: .shared,
         newSessionDirectory: { [weak self] in
-            guard let self, self.state.hasCopyablePath else { return NSHomeDirectory() }
-            return self.state.currentPath
+            guard let self else { return nil }
+            let candidate = self.state.hasCopyablePath
+                ? self.state.actionTargetCandidate()
+                : NSHomeDirectory()
+            return await self.state.validatedActionTarget(candidate)
         }
     )
 
@@ -148,8 +151,10 @@ final class StatusItemController: NSObject {
         // rightMouseUp); refresh keeps the new-session directory current.
         if FinderPathPreferences.rightClickOpensTerminals,
            NSApp.currentEvent?.type == .rightMouseUp {
-            state.refresh()
-            terminalPanelController.toggle(relativeTo: sender)
+            state.refresh { [weak self, weak sender] in
+                guard let self, let sender else { return }
+                self.terminalPanelController.toggle(relativeTo: sender)
+            }
             return
         }
 
@@ -160,12 +165,7 @@ final class StatusItemController: NSObject {
         menuOptionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
         isMenuTracking = true
         state.refresh { [weak self] in
-            guard let self, self.isMenuTracking else { return }
-            // Re-read the live modifier state: this rebuild runs mid-track, so a
-            // stale menuOptionHeld would rebuild the harness rows in the wrong
-            // (external vs terminal) form until the next poll corrects it.
-            self.menuOptionHeld = NSEvent.modifierFlags.contains(.option)
-            self.rebuildMenu(self.menu, optionHeld: self.menuOptionHeld)
+            self?.rebuildTrackedMenuIfNeeded()
         }
         rebuildMenu(menu, optionHeld: menuOptionHeld)
 
@@ -198,6 +198,14 @@ final class StatusItemController: NSObject {
         guard optionHeld != menuOptionHeld else { return }
         menuOptionHeld = optionHeld
         updateHarnessMenuItems(optionHeld: optionHeld)
+    }
+
+    private func rebuildTrackedMenuIfNeeded() {
+        guard isMenuTracking else { return }
+        // Re-read the live modifier state: a refresh rebuild runs mid-track, so
+        // stale state would put agent rows back into the wrong launch mode.
+        menuOptionHeld = NSEvent.modifierFlags.contains(.option)
+        rebuildMenu(menu, optionHeld: menuOptionHeld)
     }
 
     /// The agents the menu may offer, in display order. Availability stats every
@@ -528,21 +536,25 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func refreshMenuItem() {
-        state.refresh()
+        state.refresh { [weak self] in
+            self?.rebuildTrackedMenuIfNeeded()
+        }
+        // begin() retires the prior actionable path synchronously. Reflect that
+        // loading state immediately so the visible header and enabled actions
+        // can never describe different folders while Finder is responding.
+        rebuildTrackedMenuIfNeeded()
     }
 
     @objc private func copyPathMenuItem() {
         guard state.hasCopyablePath else { return }
 
-        state.copyCurrentPath()
-        showCopyConfirmation()
+        state.copyCurrentPath { [weak self] in self?.showCopyConfirmation() }
     }
 
     @objc private func copyCDMenuItem() {
         guard state.hasCopyablePath else { return }
 
-        state.copyChangeDirectoryCommand()
-        showCopyConfirmation()
+        state.copyChangeDirectoryCommand { [weak self] in self?.showCopyConfirmation() }
     }
 
     // Briefly swaps the status icon for a checkmark so copy actions give
@@ -618,14 +630,18 @@ final class StatusItemController: NSObject {
             )
             return
         }
-        let workingDirectory = directory ?? (state.hasCopyablePath ? state.currentPath : NSHomeDirectory())
-        let session = TerminalSessionStore.shared.newSession(
-            name: name,
-            workingDirectory: workingDirectory,
-            initialCommand: ShellCommand.argument(resolvedPath)
-        )
-        DispatchQueue.main.async { [weak self] in
-            self?.terminalPanelController.show(session: session, relativeTo: button)
+        let requestedDirectory = directory ?? (state.hasCopyablePath ? state.currentPath : NSHomeDirectory())
+        state.withResolvedActionTarget(requestedDirectory) { [weak self, weak button] workingDirectory in
+            guard let self, let button else { return }
+            let session = TerminalSessionStore.shared.newSession(
+                name: name,
+                workingDirectory: workingDirectory,
+                initialCommand: ShellCommand.argument(resolvedPath)
+            )
+            DispatchQueue.main.async { [weak self, weak button] in
+                guard let button else { return }
+                self?.terminalPanelController.show(session: session, relativeTo: button)
+            }
         }
     }
 
@@ -644,9 +660,12 @@ final class StatusItemController: NSObject {
     @objc private func newTerminalHereMenuItem() {
         guard let button = statusItem.button else { return }
 
-        let directory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
-        let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: directory)
-        terminalPanelController.show(session: session, relativeTo: button)
+        let requestedDirectory = state.hasCopyablePath ? state.currentPath : NSHomeDirectory()
+        state.withResolvedActionTarget(requestedDirectory) { [weak self, weak button] directory in
+            guard let self, let button else { return }
+            let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: directory)
+            self.terminalPanelController.show(session: session, relativeTo: button)
+        }
     }
 
     @objc private func showTerminalsMenuItem() {
@@ -664,14 +683,12 @@ final class StatusItemController: NSObject {
 
     @objc private func copyRecentPathMenuItem(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
-        state.copyCurrentPath(at: path)
-        showCopyConfirmation()
+        state.copyCurrentPath(at: path) { [weak self] in self?.showCopyConfirmation() }
     }
 
     @objc private func copyRecentCDCommandMenuItem(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
-        state.copyChangeDirectoryCommand(at: path)
-        showCopyConfirmation()
+        state.copyChangeDirectoryCommand(at: path) { [weak self] in self?.showCopyConfirmation() }
     }
 
     @objc private func openRecentInCmuxMenuItem(_ sender: NSMenuItem) {
@@ -701,8 +718,11 @@ final class StatusItemController: NSObject {
 
     @objc private func newTerminalAtRecentPathMenuItem(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String, let button = statusItem.button else { return }
-        let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: path)
-        terminalPanelController.show(session: session, relativeTo: button)
+        state.withResolvedActionTarget(path) { [weak self, weak button] directory in
+            guard let self, let button else { return }
+            let session = TerminalSessionStore.shared.newSession(name: nil, workingDirectory: directory)
+            self.terminalPanelController.show(session: session, relativeTo: button)
+        }
     }
 
     @objc private func revealRecentPathMenuItem(_ sender: NSMenuItem) {
