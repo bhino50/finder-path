@@ -754,15 +754,18 @@ private final class ResizeGripView: NSView {
     private var startSize: CGSize = .zero
 
     override func mouseDown(with event: NSEvent) {
-        startMouse = event.locationInWindow
+        // Track the drag in screen coordinates. The popover's own window
+        // moves and resizes while the corner is dragged, so window-relative
+        // points fed the delta back into itself: drag 100 px, grow 200 px.
+        startMouse = NSEvent.mouseLocation
         startSize = onResizeBegan?() ?? .zero
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let now = event.locationInWindow
+        let now = NSEvent.mouseLocation
         let dx = now.x - startMouse.x
         let dy = now.y - startMouse.y
-        // Window coordinates increase upward, so dragging the corner down
+        // Screen coordinates increase upward, so dragging the corner down
         // (negative dy) must grow the height.
         onResize?(CGSize(width: startSize.width + dx, height: startSize.height - dy))
     }

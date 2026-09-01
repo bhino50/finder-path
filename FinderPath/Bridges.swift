@@ -270,6 +270,16 @@ nonisolated enum AgentLauncher {
         )
     }
 
+    /// `isExecutableFile(atPath:)` is true for any searchable directory, so a
+    /// folder named `claude` on PATH reported the agent as installed and then
+    /// failed at launch. Only a regular file with the execute bit counts.
+    static func isExecutableRegularFile(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && !isDirectory.boolValue
+            && FileManager.default.isExecutableFile(atPath: path)
+    }
+
     static func availability(for executable: String, defaultExecutable: String? = nil) -> AgentAvailability {
         let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
@@ -282,14 +292,14 @@ nonisolated enum AgentLauncher {
             let path = URL(fileURLWithPath: expandedCommand).standardizedFileURL.path
             return AgentAvailability(
                 executable: commandName,
-                resolvedPath: FileManager.default.isExecutableFile(atPath: path) ? path : nil
+                resolvedPath: isExecutableRegularFile(atPath: path) ? path : nil
             )
         }
 
         let resolvedPath = executableSearchDirectories()
             .lazy
             .map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(commandName).path }
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
+            .first { isExecutableRegularFile(atPath: $0) }
 
         return AgentAvailability(
             executable: commandName,
@@ -342,7 +352,9 @@ enum TerminalBridge {
             return resolved
         }
 
-        return FileManager.default.isExecutableFile(atPath: cmuxBundleExecutablePath) ? cmuxBundleExecutablePath : nil
+        return AgentLauncher.isExecutableRegularFile(atPath: cmuxBundleExecutablePath)
+            ? cmuxBundleExecutablePath
+            : nil
     }
 
     static func open(at path: String, completion: @escaping (String?) -> Void) {

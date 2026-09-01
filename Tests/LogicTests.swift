@@ -585,6 +585,14 @@ struct FinderPathLogicTests {
         expect(AgentLauncher.availability(for: "/bin/sh").resolvedPath == "/bin/sh", "absolute executables should resolve")
         expect(AgentLauncher.availability(for: "sh").isInstalled, "PATH executables should resolve")
         expect(!AgentLauncher.availability(for: "finderpath-command-that-does-not-exist").isInstalled, "missing executables should not resolve")
+        let directoryNamedLikeAgent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FinderPathAgentDir-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: directoryNamedLikeAgent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryNamedLikeAgent) }
+        expect(
+            !AgentLauncher.availability(for: directoryNamedLikeAgent.path).isInstalled,
+            "a directory is never an installed agent, even with the search bit set"
+        )
         expect(
             AgentLauncher.menuPresentation(name: "Codex", optionHeld: false)
                 == .init(title: "Open with Codex", usesBuiltInTerminal: false),
