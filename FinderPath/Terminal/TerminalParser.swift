@@ -46,6 +46,9 @@ struct TerminalParser {
 
     private var state: State = .ground
     private var csiBuffer = ""
+    /// Unsupported intermediates and oversized parameters invalidate the whole
+    /// command. Keep consuming through its final byte without executing a prefix.
+    private var csiIgnored = false
     private var oscBuffer: [UInt8] = []
     private var utf8Buffer: [UInt8] = []
     private var utf8Expected = 0
@@ -76,6 +79,28 @@ struct TerminalParser {
         var actions: [TerminalAction] = []
 
         for byte in bytes {
+            // CAN and SUB cancel any in-flight control sequence or string.
+            // Without this, an interrupted OSC/DCS can swallow subsequent output.
+            if byte == 0x18 || byte == 0x1A {
+                state = .ground
+                csiBuffer = ""
+                csiIgnored = false
+                oscBuffer = []
+                utf8Buffer = []
+                utf8Expected = 0
+                continue
+            }
+            // C0 controls remain executable inside ESC/CSI sequences without
+            // ending them. String payloads have separate termination rules.
+            if (byte < 0x20 && byte != 0x1B) || byte == 0x7F {
+                switch state {
+                case .escape, .escapeIntermediate, .escapeCharset, .csi:
+                    parseGround(byte, into: &actions)
+                    continue
+                default:
+                    break
+                }
+            }
             switch state {
             case .ground:
                 parseGround(byte, into: &actions)
@@ -88,6 +113,10 @@ struct TerminalParser {
                     state = byte == 0x1B ? .escape : .ground
                 }
             case .escapeCharset:
+                if byte == 0x1B {
+                    state = .escape
+                    continue
+                }
                 // ESC ( X or ESC ) X — record which charset was designated.
                 // The designator used to be consumed and thrown away, which is
                 // why line drawing printed as the raw letters.
@@ -108,10 +137,10 @@ struct TerminalParser {
             case .deviceStringEscape:
                 if byte == UInt8(ascii: "\\") {
                     state = .ground // ST
-                } else if byte == 0x1B {
-                    state = .deviceStringEscape
                 } else {
-                    state = .deviceString
+                    // ESC starts a new command even if the old string never
+                    // received ST (for example after an interrupted program).
+                    parseEscape(byte, into: &actions)
                 }
             case .oscEscape:
                 if byte == UInt8(ascii: "\\") {
@@ -119,8 +148,7 @@ struct TerminalParser {
                 } else {
                     // Not a string terminator; drop the OSC and reprocess.
                     oscBuffer = []
-                    state = .ground
-                    parseGround(byte, into: &actions)
+                    parseEscape(byte, into: &actions)
                 }
             }
         }
@@ -205,6 +233,7 @@ struct TerminalParser {
         switch byte {
         case UInt8(ascii: "["):
             csiBuffer = ""
+            csiIgnored = false
             state = .csi
         case UInt8(ascii: "]"):
             oscBuffer = []
@@ -260,16 +289,21 @@ struct TerminalParser {
     private mutating func parseCSI(_ byte: UInt8, into actions: inout [TerminalAction]) {
         switch byte {
         case 0x30...0x3F: // digits ; : ? > < =
-            if csiBuffer.count < 64 {
+            if !csiIgnored, csiBuffer.count < 64 {
                 csiBuffer.append(Character(UnicodeScalar(byte)))
+            } else {
+                csiIgnored = true
             }
         case 0x20...0x2F:
-            break // intermediates collected but unused
+            csiIgnored = true // no CSI commands with intermediates are implemented
         case 0x40...0x7E:
             let buffer = csiBuffer
             csiBuffer = ""
             state = .ground
-            dispatchCSI(final: Character(UnicodeScalar(byte)), buffer: buffer, into: &actions)
+            if !csiIgnored {
+                dispatchCSI(final: Character(UnicodeScalar(byte)), buffer: buffer, into: &actions)
+            }
+            csiIgnored = false
         case 0x1B:
             csiBuffer = ""
             state = .escape
@@ -295,6 +329,12 @@ struct TerminalParser {
         // them by their ANSI final byte applied real SGR attributes or
         // teleported the cursor mid-draw.
         if let marker = buffer.first, "><=".contains(marker) { return }
+        // DEC-private save/restore, erase, and query commands are distinct from
+        // ANSI commands with the same final byte. Only private h/l is supported.
+        if isPrivate, final != "h", final != "l" { return }
+        let parameterBody = isPrivate ? buffer.dropFirst() : buffer[...]
+        guard parameterBody.utf8.allSatisfy({ (0x30...0x39).contains($0) || $0 == 0x3B || $0 == 0x3A }),
+              final == "m" || !parameterBody.contains(":") else { return }
         let params = Self.parameters(from: buffer)
         func param(_ index: Int, default defaultValue: Int) -> Int {
             guard index < params.count, let value = params[index] else { return defaultValue }
@@ -382,7 +422,7 @@ struct TerminalParser {
     /// collapsed into one non-numeric token that would reset all attributes.
     private static func sgrParameters(from buffer: String) -> [Int?] {
         let trimmed = buffer.drop(while: { "?><=".contains($0) })
-        guard !trimmed.isEmpty else { return [] }
+        guard !trimmed.isEmpty else { return [0] }
         var values: [Int?] = []
         for parameter in trimmed.split(separator: ";", omittingEmptySubsequences: false) {
             let subparameters = parameter.split(separator: ":", omittingEmptySubsequences: false)
@@ -439,8 +479,9 @@ struct TerminalParser {
     }
 
     private mutating func applySGR(_ params: [Int?], into actions: inout [TerminalAction]) {
-        var values = params.map { $0 ?? 0 }
-        if values.isEmpty { values = [0] }
+        // An empty CSI m explicitly supplies reset above. An empty list here
+        // means only unsupported colon attributes were consumed; retain style.
+        let values = params.map { $0 ?? 0 }
 
         var index = 0
         while index < values.count {
@@ -462,11 +503,13 @@ struct TerminalParser {
             case 49: currentStyle.background = .defaultBackground
             case 90...97: currentStyle.foreground = .ansi(UInt8(value - 90 + 8))
             case 100...107: currentStyle.background = .ansi(UInt8(value - 100 + 8))
-            case 38, 48:
+            case 38, 48, 58:
                 let isForeground = value == 38
+                let isBackground = value == 48
                 if index + 1 < values.count, values[index + 1] == 5, index + 2 < values.count {
                     let color = TerminalColor.palette(UInt8(clamping: values[index + 2]))
-                    if isForeground { currentStyle.foreground = color } else { currentStyle.background = color }
+                    if isForeground { currentStyle.foreground = color }
+                    if isBackground { currentStyle.background = color }
                     index += 2
                 } else if index + 1 < values.count, values[index + 1] == 2, index + 4 < values.count {
                     let color = TerminalColor.rgb(
@@ -474,7 +517,8 @@ struct TerminalParser {
                         UInt8(clamping: values[index + 3]),
                         UInt8(clamping: values[index + 4])
                     )
-                    if isForeground { currentStyle.foreground = color } else { currentStyle.background = color }
+                    if isForeground { currentStyle.foreground = color }
+                    if isBackground { currentStyle.background = color }
                     index += 4
                 } else {
                     index = values.count // malformed extended color, stop
