@@ -115,6 +115,55 @@ struct FinderPathTerminalTests {
         expect(TerminalInputEncoder.encodeControl(character: "@") == [0x00], "Control-@ sends NUL")
         expect(TerminalInputEncoder.encodeControl(character: "1") == nil, "Control-1 has no C0 mapping")
 
+        // CSI intermediates and DEC-private commands have their own meanings;
+        // sharing an ANSI final byte must never turn them into screen edits.
+        for sequence in ["\u{1B}[1 @", "\u{1B}[1;2;3;4$r", "\u{1B}[?1;4r", "\u{1B}[?31m", "\u{1B}[?6n"] {
+            parser = TerminalParser()
+            expect(parser.parse(Array((sequence + "OK").utf8)) == [.print("O"), .print("K")],
+                   "unsupported CSI is consumed without dispatching its ANSI counterpart: \(sequence.debugDescription)")
+        }
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}[1;2$".utf8)).isEmpty, "CSI intermediate may end a PTY read")
+        expect(parser.parse(Array("rOK".utf8)) == [.print("O"), .print("K")], "split CSI intermediate stays ignored through its final byte")
+        parser = TerminalParser()
+        let oversizedCSI = "\u{1B}[31" + String(repeating: ";", count: 70) + "mOK"
+        expect(parser.parse(Array(oversizedCSI.utf8)) == [.print("O"), .print("K")], "oversized CSI is discarded, not executed as a truncated command")
+
+        // CAN/SUB abort incomplete sequences, including strings. Real output
+        // after cancellation must not disappear into the old parser state.
+        for cancellation: UInt8 in [0x18, 0x1A] {
+            for prefix in ["\u{1B}", "\u{1B}(", "\u{1B}#", "\u{1B}[31", "\u{1B}]2;title", "\u{1B}Ppayload", "\u{1B}]2;title\u{1B}", "\u{1B}Ppayload\u{1B}"] {
+                parser = TerminalParser()
+                expect(parser.parse(Array(prefix.utf8)).isEmpty, "partial cancelled sequence emits nothing")
+                expect(parser.parse([cancellation] + Array("OK".utf8)) == [.print("O"), .print("K")],
+                       "CAN/SUB recovers after \(prefix.debugDescription)")
+            }
+        }
+        parser = TerminalParser()
+        var italic = CellStyle.plain
+        italic.italic = true
+        expect(parser.parse(Array("\u{1B}[3\nmOK".utf8)) == [.lineFeed, .setStyle(italic), .print("O"), .print("K")],
+               "C0 controls execute without discarding an incomplete CSI")
+        for prefix in ["\u{1B}]2;unfinished", "\u{1B}Punfinished", "\u{1B}("] {
+            parser = TerminalParser()
+            expect(parser.parse(Array((prefix + "\u{1B}[2JOK").utf8)) == [.eraseInDisplay(2), .print("O"), .print("K")],
+                   "a new ESC sequence recovers from an unfinished string or charset sequence")
+        }
+        parser = TerminalParser()
+        expect(parser.parse(Array("\u{1B}\u{7F}[2J".utf8)) == [.eraseInDisplay(2)], "DEL does not terminate an ESC sequence")
+
+        // Unsupported underline colors must leave the active brush alone and
+        // consume their color arguments instead of interpreting them as SGR.
+        parser = TerminalParser()
+        _ = parser.parse(Array("\u{1B}[31;1m".utf8))
+        expect(parser.parse(Array("\u{1B}[58:2::1:2:3m".utf8)) == [.setStyle(redBold)], "colon underline color preserves existing foreground and bold")
+        expect(parser.parse(Array("\u{1B}[58;2;0;4;7m".utf8)) == [.setStyle(redBold)], "semicolon underline RGB does not reset, underline, or invert the brush")
+        expect(parser.parse(Array("\u{1B}[58;5;0m".utf8)) == [.setStyle(redBold)], "underline palette index zero does not reset the brush")
+        var redBoldUnderline = redBold
+        redBoldUnderline.underline = true
+        expect(parser.parse(Array("\u{1B}[58;5;2;4m".utf8)) == [.setStyle(redBoldUnderline)], "SGR after an unsupported color still executes")
+        expect(parser.parse(Array("\u{1B}[m".utf8)) == [.setStyle(.plain)], "an empty SGR still resets the brush")
+
         // MARK: - Parser: modes
 
         parser = TerminalParser()
@@ -1928,6 +1977,27 @@ struct FinderPathTerminalTests {
             "restart() bumps the screen generation so views can drop stale absolute anchors"
         )
         restartable.terminate()
+
+        let screenTransitions = TerminalSession(name: "screen-transitions", workingDirectory: NSTemporaryDirectory())
+        var notifiedGeneration = -1
+        screenTransitions.onScreenUpdate = { [weak screenTransitions] in
+            notifiedGeneration = screenTransitions?.screenGeneration ?? -1
+        }
+        screenTransitions.handleOutput(Array("shell output".utf8))
+        expect(screenTransitions.screenGeneration == 0, "ordinary output preserves selection anchors")
+        screenTransitions.handleOutput(Array("\u{1B}[?1049hTUI".utf8))
+        expect(screenTransitions.screenGeneration == 1, "entering a TUI invalidates primary-screen selections")
+        expect(notifiedGeneration == 1, "the new screen identity reaches observers before drawing")
+        screenTransitions.handleOutput(Array("\u{1B}[?1049h".utf8))
+        expect(screenTransitions.screenGeneration == 1, "a redundant alternate-screen enable preserves anchors")
+        screenTransitions.handleOutput(Array("\u{1B}[?1049l".utf8))
+        expect(screenTransitions.screenGeneration == 2, "leaving a TUI invalidates alternate-screen selections")
+        screenTransitions.handleOutput(Array("\u{1B}[?25l\u{1B}[31m".utf8))
+        expect(screenTransitions.screenGeneration == 2, "cursor visibility and color changes preserve anchors")
+        screenTransitions.handleOutput(Array("\u{1B}c".utf8))
+        expect(screenTransitions.screenGeneration == 3 && notifiedGeneration == 3, "RIS invalidates anchors even though the session object is unchanged")
+        screenTransitions.handleOutput(Array("\u{1B}[?1049h\u{1B}[?1049l".utf8))
+        expect(screenTransitions.screenGeneration == 5 && notifiedGeneration == 5, "a complete TUI round trip in one read still invalidates anchors")
 
         // MARK: - Parser: DEC Special Graphics charset
         //

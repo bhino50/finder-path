@@ -30,13 +30,13 @@ final class TerminalSession: Identifiable {
     private(set) var status: Status = .notStarted
     private(set) var screen: TerminalScreen
 
-    /// Bumped whenever `screen` is replaced wholesale rather than mutated.
+    /// Bumped when the screen is reset, replaced, or switched between primary
+    /// and alternate buffers.
     ///
     /// Views hold absolute line numbers — selection anchors and the
     /// scrolled-back viewport — and those only mean anything within a single
-    /// screen's lifetime. `restart()` swaps in a fresh screen on the *same*
-    /// session object, so a view watching for a new session never notices and
-    /// would keep applying dead line numbers to live text.
+    /// screen's lifetime. A view watching only for a new session object would
+    /// apply old line numbers to unrelated text after a restart, RIS, or switch.
     private(set) var screenGeneration = 0
 
     var onScreenUpdate: (() -> Void)?
@@ -295,12 +295,19 @@ final class TerminalSession: Identifiable {
 
     // MARK: - Output
 
-    private func handleOutput(_ bytes: [UInt8]) {
+    /// Applies an ordered PTY read on the main actor before notifying the view.
+    func handleOutput(_ bytes: [UInt8]) {
         logRawBytes(bytes)
         let actions = parser.parse(bytes)
         guard !actions.isEmpty else { return }
         for action in actions {
+            let wasUsingAlternateScreen = screen.usingAlternateScreen
             screen.apply(action)
+            if case .hardReset = action {
+                screenGeneration += 1
+            } else if screen.usingAlternateScreen != wasUsingAlternateScreen {
+                screenGeneration += 1
+            }
             if case .reportDeviceStatus(let code) = action {
                 replyToDeviceStatus(code)
             }

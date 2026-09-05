@@ -191,9 +191,8 @@ final class TerminalView: NSView {
         // taking it here would clobber the controller's exit/Restart handling.
         session?.onScreenUpdate = { [weak self] in
             guard let self else { return }
-            // restart() replaces the screen and fires this before any redraw,
-            // which is the one chance to drop anchors that belong to the screen
-            // it just discarded.
+            // Restarts, resets, and buffer switches notify before any redraw,
+            // so anchors from the old screen cannot select unrelated text.
             self.dropAnchorsIfScreenReplaced()
             self.screenDirty = true
         }
@@ -585,14 +584,9 @@ final class TerminalView: NSView {
         needsDisplay = true
     }
 
-    /// Discards absolute line anchors when the session swaps in a fresh screen.
-    ///
-    /// `TerminalSession.restart()` replaces the screen on the same session
-    /// object, so the `session` didSet never fires. Line numbering starts over,
-    /// which is the one time `scrollbackBase + scrollbackCount` goes backwards:
-    /// without this the viewport stays pinned to a line number from the dead
-    /// screen and silently stops following output once the new screen grows
-    /// past it, and an old selection re-materializes over unrelated new text.
+    /// Discards anchors after a restart, reset, or primary/alternate switch.
+    /// These reuse the session object, so `session` didSet cannot retire a
+    /// selection or viewport that now names unrelated text in another buffer.
     private func dropAnchorsIfScreenReplaced() {
         guard let session, session.screenGeneration != anchoredScreenGeneration else { return }
         anchoredScreenGeneration = session.screenGeneration

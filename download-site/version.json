@@ -1,5 +1,5 @@
 {
-  "version": "1.9",
-  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.9/FinderPath-1.9.dmg",
-  "notes": "FinderPath 1.9."
+  "version": "1.9.1",
+  "downloadURL": "https://github.com/bhino50/finder-path/releases/download/v1.9.1/FinderPath-1.9.1.dmg",
+  "notes": "Improves terminal control parsing, interrupted-sequence recovery, text styling, and selection handling after resets or screen switches."
 }
