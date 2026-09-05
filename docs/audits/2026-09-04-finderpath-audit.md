@@ -36,6 +36,8 @@ terminal protocol features.
 - `Tests/TerminalLogicTests.swift`: regression cases for the repaired behavior,
   including split PTY reads, observer timing, and a buffer round trip in one read.
 - `FinderPath.xcodeproj/project.pbxproj`: prepare patch version 1.9.1/build 11.
+- `download-site/version.json` and `download-site/index.html`: point downloads
+  and update metadata to the signed, notarized 1.9.1 release.
 - This audit report.
 
 ## Verification
@@ -121,9 +123,48 @@ The temporary shell and test app were stopped after the check.
 At the completion of the initial audit, the fixes were local source changes
 and build artifacts. FinderPath 1.9 remained installed and running. The user
 then requested GitHub synchronization and installation of the updated app;
-version 1.9.1/build 11 contains these repairs. Release and installation evidence
-will be recorded after that work completes.
+version 1.9.1/build 11 contains these repairs. Packaging and installation
+evidence is recorded below. The GitHub release and PR records provide the
+publication and merge timestamps.
 
 The unsigned Xcode artifacts above establish build verification. Full
 Finder-menu interactions, external terminal/SSH launches, and an actual
 in-place updater run were not exercised during the initial audit.
+
+## Version 1.9.1 packaging and installation
+
+The universal release app was built from commit
+`52f6a7f13c9aeb1a0001aa8e7d491e1986637923`, tagged `v1.9.1`, using
+`script/package_release.sh` with the per-command Xcode 27 developer directory.
+Only the download metadata and this report changed after that source commit.
+
+Both artifacts passed Developer ID signing, Apple notarization, stapled-ticket
+validation, and Gatekeeper acceptance (`source=Notarized Developer ID`). The
+package checks also verified the exact app identity inside the ZIP and DMG.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `FinderPath-1.9.1.dmg` | `e668227917db00c634f63394606a9266502267c1f2f7f6f3ff15c587480b53c6` |
+| `FinderPath-1.9.1-macOS13-notarized.zip` | `b9c442e864cfc6662c13432eac932bd766600024fe6c23dc8364d53d03617026` |
+
+Apple accepted app submission `9ad169d8-d593-4db1-a4e4-f4b8d09053ad` and DMG
+submission `034a65f4-01b1-462c-896e-b717e6b7d029`. The release is available at
+[FinderPath 1.9.1](https://github.com/bhino50/finder-path/releases/tag/v1.9.1).
+Publication precedes merging the download manifest.
+
+On this Mac, the existing FinderPath process had no terminal child processes
+before it was stopped. Version 1.9 was preserved as
+`~/FinderPath-1.9-backup-20260904.app`, and the verified new bundle was installed
+at `/Applications/FinderPath.app`.
+
+Installed verification confirmed version 1.9.1/build 11, release bundle ID
+`io.github.bhino50.FinderPath`, team `VJPMCBH6NX`, strict signature validity,
+a valid stapled ticket, Gatekeeper acceptance, and the same executable bytes
+as the release ZIP. Finder's native Get Info window showed **Version: 1.9.1**,
+**Application (Universal)**, and **Macintosh HD > Applications**. Opening the
+selected app in Finder launched the executable from the installed path.
+
+This was a verified manual bundle replacement. The in-app automatic update
+installation flow was not exercised. Local evidence is retained in
+`.build/package-release-1.9.1.log` and
+`.build/release-verification-1.9.1.json`.
