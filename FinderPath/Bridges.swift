@@ -239,7 +239,7 @@ nonisolated enum FinderBridge {
     }
 }
 
-struct AgentAvailability: Equatable, Sendable {
+nonisolated struct AgentAvailability: Equatable, Sendable {
     let executable: String
     let resolvedPath: String?
 
@@ -252,7 +252,106 @@ struct AgentAvailability: Equatable, Sendable {
     }
 }
 
+nonisolated struct AgentAvailabilityRequest: Hashable, Sendable {
+    let executable: String
+    var defaultExecutable: String? = nil
+    var fallbackPaths: [String] = []
+}
+
+/// Shares bounded background probes across menu rebuilds and launch actions.
+/// A cache miss never runs filesystem work on the caller's actor, and repeated
+/// requests for a stalled executable share one worker instead of piling up.
+actor AgentAvailabilityCache {
+    typealias Resolver = @Sendable (AgentAvailabilityRequest) -> AgentAvailability
+
+    private struct CachedResult {
+        let availability: AgentAvailability
+        let fetchedAt: Date
+    }
+
+    private let resolver: Resolver
+    private let maximumAge: TimeInterval
+    private let capacity: Int
+    private var cached: [AgentAvailabilityRequest: CachedResult] = [:]
+    private var inFlight: [AgentAvailabilityRequest: Task<AgentAvailability, Never>] = [:]
+
+    init(maximumAge: TimeInterval = 8, capacity: Int = 32, resolver: @escaping Resolver) {
+        self.maximumAge = maximumAge
+        self.capacity = max(1, capacity)
+        self.resolver = resolver
+    }
+
+    func availability(for request: AgentAvailabilityRequest) async -> AgentAvailability {
+        if let task = inFlight[request] { return await task.value }
+        if let result = cached[request], Date().timeIntervalSince(result.fetchedAt) < maximumAge {
+            return result.availability
+        }
+        // Each production worker has a process timeout. Also cap distinct
+        // pending requests so rapid preference changes cannot exhaust workers.
+        guard inFlight.count < capacity else {
+            return .unknown(executable: request.executable)
+        }
+        let resolver = self.resolver
+        let task = Task.detached(priority: .userInitiated) { resolver(request) }
+        inFlight[request] = task
+        let result = await task.value
+        inFlight[request] = nil
+        if cached.count >= capacity,
+           let oldest = cached.min(by: { $0.value.fetchedAt < $1.value.fetchedAt })?.key {
+            cached[oldest] = nil
+        }
+        cached[request] = CachedResult(availability: result, fetchedAt: Date())
+        return result
+    }
+}
+
+/// Menu results belong to the exact request set that produced them. A slower
+/// lookup from an earlier click or executable edit cannot replace newer rows.
+nonisolated struct LauncherAvailabilityState {
+    private(set) var generation: UInt64 = 0
+    private var requests: [String: AgentAvailabilityRequest] = [:]
+    private var results: [String: AgentAvailability] = [:]
+
+    mutating func begin(_ requests: [String: AgentAvailabilityRequest]) -> UInt64 {
+        generation &+= 1
+        results = results.filter { self.requests[$0.key] == requests[$0.key] }
+        self.requests = requests
+        return generation
+    }
+
+    @discardableResult
+    mutating func complete(_ results: [String: AgentAvailability], generation: UInt64) -> Bool {
+        guard generation == self.generation else { return false }
+        self.results = results
+        return true
+    }
+
+    func availability(for key: String, request: AgentAvailabilityRequest) -> AgentAvailability {
+        guard requests[key] == request, let result = results[key] else {
+            return .unknown(executable: request.executable)
+        }
+        return result
+    }
+}
+
 nonisolated enum AgentLauncher {
+    private static let availabilityCache = AgentAvailabilityCache { resolveAvailability($0) }
+    private static let probeLimits = BoundedProcessRunner.Limits(
+        timeout: 2,
+        terminationGrace: 0.2,
+        maximumStandardOutputBytes: 64 * 1_024,
+        maximumStandardErrorBytes: 1_024
+    )
+    private static let executableProbeSource = """
+    for candidate do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\\0' "$candidate"
+            exit 0
+        fi
+    done
+    exit 1
+    """
+
     struct MenuPresentation: Equatable {
         let title: String
         let usesBuiltInTerminal: Bool
@@ -281,37 +380,79 @@ nonisolated enum AgentLauncher {
     }
 
     static func availability(for executable: String, defaultExecutable: String? = nil) -> AgentAvailability {
-        let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
-        let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
-        guard !commandName.isEmpty else {
-            return AgentAvailability(executable: executable, resolvedPath: nil)
-        }
-
-        let expandedCommand = NSString(string: commandName).expandingTildeInPath
-        if expandedCommand.contains("/") {
-            let path = URL(fileURLWithPath: expandedCommand).standardizedFileURL.path
-            return AgentAvailability(
-                executable: commandName,
-                resolvedPath: isExecutableRegularFile(atPath: path) ? path : nil
-            )
-        }
-
-        let resolvedPath = executableSearchDirectories()
-            .lazy
-            .map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(commandName).path }
-            .first { isExecutableRegularFile(atPath: $0) }
-
+        let (commandName, candidates) = executableCandidates(for: executable, defaultExecutable: defaultExecutable)
         return AgentAvailability(
             executable: commandName,
-            resolvedPath: resolvedPath
+            resolvedPath: candidates.first { isExecutableRegularFile(atPath: $0) }
         )
     }
 
-    // Retain an async API for UI call sites. Resolution is now a fast filesystem
-    // lookup rather than a login-shell subprocess, so opening the menu cannot be
-    // delayed by shell startup files or a stuck command probe.
-    static func checkAvailability(for executable: String, defaultExecutable: String? = nil) async -> AgentAvailability {
-        availability(for: executable, defaultExecutable: defaultExecutable)
+    private static func executableCandidates(
+        for executable: String,
+        defaultExecutable: String?
+    ) -> (String, [String]) {
+        let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
+        guard !commandName.isEmpty else { return (executable, []) }
+
+        let expandedCommand = NSString(string: commandName).expandingTildeInPath
+        if expandedCommand.contains("/") {
+            let path = URL(fileURLWithPath: expandedCommand, isDirectory: false).standardizedFileURL.path
+            return (commandName, [path])
+        }
+
+        let candidates = executableSearchDirectories().map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+                .appendingPathComponent(commandName, isDirectory: false).path
+        }
+        return (commandName, candidates)
+    }
+
+    /// The fixed shell program receives paths only as argv. A disconnected
+    /// mount can block test(1), so the checks live in a time-limited subprocess,
+    /// not in the menu process. NUL termination preserves newlines in filenames.
+    private static func resolveAvailability(_ request: AgentAvailabilityRequest) -> AgentAvailability {
+        let (commandName, candidates) = executableCandidates(
+            for: request.executable, defaultExecutable: request.defaultExecutable
+        )
+        let paths = candidates + request.fallbackPaths
+        guard !paths.isEmpty else { return .unknown(executable: commandName) }
+        let outcome = BoundedProcessRunner.run(
+            executable: "/bin/sh",
+            arguments: ["-c", executableProbeSource, "FinderPath executable check"] + paths,
+            limits: probeLimits
+        )
+        guard case .exited(let status, let output) = outcome,
+              status == 0, !output.standardOutputWasTruncated,
+              output.standardOutput.last == 0,
+              let path = String(data: output.standardOutput.dropLast(), encoding: .utf8),
+              paths.contains(path) else {
+            return .unknown(executable: commandName)
+        }
+        return AgentAvailability(executable: commandName, resolvedPath: path)
+    }
+
+    static func checkAvailability(
+        for executable: String,
+        defaultExecutable: String? = nil,
+        fallbackPaths: [String] = []
+    ) async -> AgentAvailability {
+        await availabilityCache.availability(for: AgentAvailabilityRequest(
+            executable: executable, defaultExecutable: defaultExecutable, fallbackPaths: fallbackPaths
+        ))
+    }
+
+    static func checkAvailability(
+        for requests: [String: AgentAvailabilityRequest]
+    ) async -> [String: AgentAvailability] {
+        await withTaskGroup(of: (String, AgentAvailability).self) { group in
+            for (key, request) in requests {
+                group.addTask { (key, await availabilityCache.availability(for: request)) }
+            }
+            var results: [String: AgentAvailability] = [:]
+            for await (key, availability) in group { results[key] = availability }
+            return results
+        }
     }
 
     private static func executableSearchDirectories() -> [String] {
@@ -405,23 +546,25 @@ enum TerminalBridge {
 
     static func openCmux(at path: String, completion: @escaping (String?) -> Void) {
         let directoryPath = URL(fileURLWithPath: path, isDirectory: true).path
-
-        guard let cmuxPath = cmuxExecutablePath() else {
-            completion("cmux CLI was not found. Install cmux or add it to your shell PATH.")
-            return
-        }
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: cmuxPath)
-        task.arguments = [directoryPath]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-
-        do {
-            try task.run()
-            completion(nil)
-        } catch {
-            completion("Could not open cmux: \(error.localizedDescription)")
+        Task.detached {
+            let availability = await AgentLauncher.checkAvailability(
+                for: "cmux", fallbackPaths: [cmuxBundleExecutablePath]
+            )
+            guard let cmuxPath = availability.resolvedPath else {
+                completion("cmux CLI could not be found. Install cmux or reconnect the volume that contains it.")
+                return
+            }
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: cmuxPath)
+            task.arguments = [directoryPath]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            do {
+                try task.run()
+                completion(nil)
+            } catch {
+                completion("Could not open cmux: \(error.localizedDescription)")
+            }
         }
     }
 

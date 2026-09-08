@@ -1,6 +1,5 @@
 import AppKit
 import Darwin
-import os
 
 // Installs an update archive in place and relaunches the app.
 //
@@ -17,6 +16,28 @@ enum UpdateInstaller {
     private static let maximumExpandedEntryCount = 50_000
     private static let maximumExpandedPathDepth = 64
     private static let extractionTimeout: TimeInterval = 120
+    private static let commandTimeout: TimeInterval = 30
+    private static let maximumCommandErrorBytes = 64 * 1_024
+    private static let installationGate = InstallationGate()
+
+    private final class InstallationGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isInstalling = false
+
+        func begin() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isInstalling else { return false }
+            isInstalling = true
+            return true
+        }
+
+        func end() {
+            lock.lock()
+            isInstalling = false
+            lock.unlock()
+        }
+    }
 
     enum BrowserRecoveryPolicy: Equatable {
         case unavailable
@@ -30,6 +51,7 @@ enum UpdateInstaller {
         private let maximumSize: Int64
         private let lock = NSLock()
         private var exceeded = false
+        private var rejectedRedirect = false
 
         init(maximumSize: Int64) {
             self.maximumSize = maximumSize
@@ -39,6 +61,29 @@ enum UpdateInstaller {
             lock.lock()
             defer { lock.unlock() }
             return exceeded
+        }
+
+        var didRejectRedirect: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return rejectedRedirect
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url, UpdateChecker.isHTTPSWebURL(url) else {
+                lock.lock()
+                rejectedRedirect = true
+                lock.unlock()
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
         }
 
         func urlSession(
@@ -128,14 +173,21 @@ enum UpdateInstaller {
             Task { @MainActor in completion(.failure(.noArchiveURL)) }
             return
         }
-        guard isHTTPSWebURL(archiveURL) else {
+        guard UpdateChecker.isHTTPSWebURL(archiveURL) else {
             Task { @MainActor in
                 completion(.failure(.downloadRejected("Update packages must be served over HTTPS.")))
             }
             return
         }
 
+        guard installationGate.begin() else {
+            Task { @MainActor in
+                completion(.failure(.installFailed("An update installation is already in progress.")))
+            }
+            return
+        }
         let finish: (Result<Void, InstallError>) -> Void = { result in
+            installationGate.end()
             Task { @MainActor in completion(result) }
         }
 
@@ -143,13 +195,20 @@ enum UpdateInstaller {
         // persisted HTTP/3 mappings, so the download cannot stall on networks
         // that silently drop UDP 443 (QUIC).
         let sizeLimiter = DownloadSizeLimiter(maximumSize: maximumArchiveSize)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = commandTimeout
+        configuration.timeoutIntervalForResource = 5 * 60
         let session = URLSession(
-            configuration: .ephemeral,
+            configuration: configuration,
             delegate: sizeLimiter,
             delegateQueue: nil
         )
         session.downloadTask(with: archiveURL) { location, response, error in
             defer { session.finishTasksAndInvalidate() }
+            if sizeLimiter.didRejectRedirect {
+                finish(.failure(.downloadRejected("The update redirected to an unsafe location.")))
+                return
+            }
             if let error {
                 if sizeLimiter.didExceedLimit {
                     finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
@@ -166,7 +225,7 @@ enum UpdateInstaller {
                 finish(.failure(.downloadRejected("Update server returned HTTP \(httpResponse.statusCode).")))
                 return
             }
-            guard let finalURL = httpResponse.url, isHTTPSWebURL(finalURL) else {
+            guard let finalURL = httpResponse.url, UpdateChecker.isHTTPSWebURL(finalURL) else {
                 finish(.failure(.downloadRejected("The update redirected to a non-HTTPS location.")))
                 return
             }
@@ -199,8 +258,7 @@ enum UpdateInstaller {
 
                 let newApp = try extractApp(from: archiveFile, into: workDir)
                 try verify(appAt: newApp, expectedVersion: manifest.latestVersion)
-                try removeQuarantine(at: newApp)
-                try swapAndScheduleRelaunch(newApp: newApp)
+                try swapAndScheduleRelaunch(newApp: newApp, expectedVersion: manifest.latestVersion)
                 finish(.success(()))
             } catch let error as InstallError {
                 finish(.failure(error))
@@ -295,6 +353,15 @@ enum UpdateInstaller {
     private static func extractFromDiskImage(_ image: URL, into extractDir: URL) throws {
         let mountPoint = extractDir.deletingLastPathComponent()
             .appendingPathComponent("mount")
+        var didDetach = false
+        // Attach can mount the volume before its process times out or reports
+        // a later error. Attempt cleanup on every exit path, including those
+        // where attach did not return a successful status.
+        defer {
+            if !didDetach {
+                _ = run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-force"], timeout: 15)
+            }
+        }
         let attach = run(
             "/usr/bin/hdiutil",
             [
@@ -307,8 +374,6 @@ enum UpdateInstaller {
         guard attach.status == 0 else {
             throw InstallError.extractionFailed(attach.errorOutput)
         }
-        defer { _ = run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-force"]) }
-
         guard let mountedApp = try findApp(in: mountPoint) else {
             throw InstallError.appNotFoundInArchive
         }
@@ -322,15 +387,43 @@ enum UpdateInstaller {
         guard copy.status == 0 else {
             throw InstallError.extractionFailed(copy.errorOutput)
         }
+        let detach = run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-force"], timeout: 15)
+        guard detach.status == 0 else {
+            throw InstallError.extractionFailed("Could not detach the temporary update image: \(detach.errorOutput)")
+        }
+        didDetach = true
     }
 
-    private static func findApp(in directory: URL) throws -> URL? {
-        let contents = try FileManager.default.contentsOfDirectory(
+    static func findApp(in directory: URL) throws -> URL? {
+        var inspectionFailed = false
+        guard let contents = FileManager.default.enumerator(
             at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        return contents.first { $0.lastPathComponent == appBundleName }
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in
+                inspectionFailed = true
+                return false
+            }
+        ) else {
+            throw InstallError.extractionFailed("FinderPath could not inspect the update package.")
+        }
+        var entryCount = 0
+        while let entry = contents.nextObject() as? URL {
+            entryCount += 1
+            guard entryCount <= maximumExpandedEntryCount else {
+                throw InstallError.extractionFailed(expandedEntryCountMessage(maximumEntries: maximumExpandedEntryCount))
+            }
+            guard entry.lastPathComponent == appBundleName else { continue }
+            let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw InstallError.extractionFailed("The package did not contain a real FinderPath app bundle.")
+            }
+            return entry
+        }
+        if inspectionFailed {
+            throw InstallError.extractionFailed("FinderPath could not inspect the update package.")
+        }
+        return nil
     }
 
     private static func verify(appAt app: URL, expectedVersion: String) throws {
@@ -376,10 +469,57 @@ enum UpdateInstaller {
         }
     }
 
-    private static func swapAndScheduleRelaunch(newApp: URL) throws {
-        let target = Bundle.main.bundleURL
+    private static func swapAndScheduleRelaunch(newApp: URL, expectedVersion: String) throws {
+        _ = try stageAndReplaceApp(
+            at: Bundle.main.bundleURL,
+            with: newApp,
+            prepareStagedApp: { source, stagedApp in
+                let copy = run("/usr/bin/ditto", [source.path, stagedApp.path], timeout: extractionTimeout)
+                guard copy.status == 0 else {
+                    throw InstallError.installFailed(copy.errorOutput)
+                }
+                try verify(appAt: stagedApp, expectedVersion: expectedVersion)
+                try removeQuarantine(at: stagedApp)
+            },
+            scheduleRelaunch: scheduleRelaunch
+        )
+    }
+
+    @discardableResult
+    static func stageAndReplaceApp(
+        at target: URL,
+        with newApp: URL,
+        prepareStagedApp: (URL, URL) throws -> Void,
+        scheduleRelaunch: (URL) throws -> Void
+    ) throws -> URL {
         let parent = target.deletingLastPathComponent()
-        let retired = parent.appendingPathComponent(".\(target.lastPathComponent).old-\(ProcessInfo.processInfo.processIdentifier)")
+        let stagingDirectory = parent.appendingPathComponent(".FinderPathUpdate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: stagingDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let stagedApp = stagingDirectory.appendingPathComponent(appBundleName)
+        // Finish and verify the entire copy on the destination volume before
+        // moving the running app. Replacement then consists only of renames;
+        // a slow or interrupted copy never exposes a partial installed bundle.
+        try prepareStagedApp(newApp, stagedApp)
+        return try replaceApp(at: target, with: stagedApp, scheduleRelaunch: scheduleRelaunch)
+    }
+
+    /// The transaction is testable with temporary fixture directories. Keep
+    /// the previous bundle available for recovery because scheduling a launch
+    /// is not proof that Launch Services or the new app started successfully.
+    @discardableResult
+    static func replaceApp(
+        at target: URL,
+        with stagedApp: URL,
+        scheduleRelaunch: (URL) throws -> Void
+    ) throws -> URL {
+        let retired = target.deletingLastPathComponent().appendingPathComponent(
+            ".\(target.lastPathComponent).old-\(UUID().uuidString)"
+        )
 
         do {
             try FileManager.default.moveItem(at: target, to: retired)
@@ -387,38 +527,53 @@ enum UpdateInstaller {
             throw InstallError.installFailed("Could not move the current app aside: \(error.localizedDescription)")
         }
 
-        let copy = run("/usr/bin/ditto", [newApp.path, target.path])
-        guard copy.status == 0 else {
-            // Roll the old version back so the user is never left without an app.
-            try restore(retiredApp: retired, to: target, after: copy.errorOutput)
-            throw InstallError.installFailed(copy.errorOutput)
+        do {
+            try FileManager.default.moveItem(at: stagedApp, to: target)
+        } catch {
+            try restore(retiredApp: retired, to: target, after: error.localizedDescription)
+            throw InstallError.installFailed(error.localizedDescription)
         }
 
         do {
-            try scheduleRelaunch(of: target)
+            try scheduleRelaunch(target)
         } catch {
             try restore(retiredApp: retired, to: target, after: error.localizedDescription)
             throw error
         }
 
-        try? FileManager.default.removeItem(at: retired)
+        return retired
     }
 
     private static func restore(retiredApp: URL, to target: URL, after failure: String) throws {
-        try? FileManager.default.removeItem(at: target)
-        do {
-            try FileManager.default.moveItem(at: retiredApp, to: target)
-        } catch {
+        // Preserve the complete replacement until restoration succeeds. If
+        // the previous bundle is unavailable or its rename fails, deleting
+        // the replacement first would leave the user without either app.
+        guard FileManager.default.fileExists(atPath: retiredApp.path) else {
             throw InstallError.installFailed(
-                "\(failure) The previous app also could not be restored: \(error.localizedDescription)"
+                "\(failure) The previous app could not be found at \(retiredApp.path); the replacement was retained at \(target.path)."
             )
         }
+        let displaced = target.deletingLastPathComponent().appendingPathComponent(
+            ".\(target.lastPathComponent).failed-\(UUID().uuidString)"
+        )
+        let hadReplacement = FileManager.default.fileExists(atPath: target.path)
+        do {
+            if hadReplacement { try FileManager.default.moveItem(at: target, to: displaced) }
+            try FileManager.default.moveItem(at: retiredApp, to: target)
+        } catch {
+            if hadReplacement, !FileManager.default.fileExists(atPath: target.path) {
+                try? FileManager.default.moveItem(at: displaced, to: target)
+            }
+            throw InstallError.installFailed(
+                "\(failure) The previous app also could not be restored: \(error.localizedDescription) Check the recovery bundle at \(retiredApp.path) and the replacement at \(target.path) or \(displaced.path)."
+            )
+        }
+        if hadReplacement { try? FileManager.default.removeItem(at: displaced) }
     }
 
     private static func scheduleRelaunch(of app: URL) throws {
         let pid = ProcessInfo.processInfo.processIdentifier
-        let quotedPath = ShellCommand.argument(app.path, quoteStyle: "single")
-        let script = "while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \(quotedPath)"
+        let script = relaunchScript(of: app, processIdentifier: pid)
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -432,90 +587,75 @@ enum UpdateInstaller {
         }
     }
 
-    // MARK: - Process helper
-
-    private static func isHTTPSWebURL(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == "https" && url.host?.isEmpty == false
+    static func relaunchScript(
+        of app: URL,
+        processIdentifier: pid_t,
+        maximumWaitAttempts: Int = 150
+    ) -> String {
+        let quotedPath = ShellCommand.argument(app.path, quoteStyle: "single")
+        // Termination may be cancelled or a numeric PID may be reused. Either
+        // case must expire the waiter instead of leaving a permanent helper.
+        return """
+        attempts=0
+        while /bin/kill -0 \(processIdentifier) 2>/dev/null; do
+          [ "$attempts" -lt \(max(maximumWaitAttempts, 0)) ] || exit 1
+          attempts=$((attempts + 1))
+          /bin/sleep 0.2
+        done
+        exec /usr/bin/open \(quotedPath)
+        """
     }
 
-    private struct CommandResult {
+    // MARK: - Process helper
+
+    struct CommandResult {
         let status: Int32
         let errorOutput: String
     }
 
-    private static func run(
+    static func run(
         _ executable: String,
         _ arguments: [String],
-        timeout: TimeInterval? = nil,
+        timeout: TimeInterval = commandTimeout,
         expansionRoot: URL? = nil
     ) -> CommandResult {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: executable)
-        task.arguments = arguments
-
-        let errorPipe = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = errorPipe
-
-        do {
-            try task.run()
-        } catch {
-            return CommandResult(status: -1, errorOutput: error.localizedDescription)
-        }
-
-        // Drain stderr while the child runs. A command that fills the pipe must
-        // not deadlock before the timeout or expansion monitor can stop it.
-        let reads = DispatchGroup()
-        let errorData = OSAllocatedUnfairLock(initialState: Data())
-        reads.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            errorData.withLock { $0 = data }
-            reads.leave()
-        }
-
-        let deadline = timeout.map { Date().addingTimeInterval($0) }
         var nextExpansionCheck = Date()
-        var monitorFailure: String?
-        while task.isRunning {
-            let now = Date()
-            if let deadline, now >= deadline {
-                monitorFailure = operationTimeoutMessage(seconds: timeout ?? 0)
-                stop(task)
-                break
+        let monitored = BoundedProcessRunner.runMonitored(
+            executable: executable,
+            arguments: arguments,
+            limits: .init(
+                timeout: timeout,
+                maximumStandardOutputBytes: 0,
+                maximumStandardErrorBytes: maximumCommandErrorBytes
+            ),
+            stopReason: {
+                guard let expansionRoot, Date() >= nextExpansionCheck else { return nil }
+                nextExpansionCheck = Date().addingTimeInterval(0.25)
+                return expandedContentsViolation(at: expansionRoot)
             }
-            if let expansionRoot, now >= nextExpansionCheck {
-                if let violation = expandedContentsViolation(at: expansionRoot) {
-                    monitorFailure = violation
-                    stop(task)
-                    break
-                }
-                nextExpansionCheck = now.addingTimeInterval(0.25)
-            }
-            Thread.sleep(forTimeInterval: 0.05)
+        )
+        let status: Int32
+        let output: BoundedProcessRunner.CapturedOutput
+        let failure: String?
+        switch monitored {
+        case .stopped(let reason, let captured):
+            (status, output, failure) = (-1, captured, reason)
+        case .completed(.exited(let exitStatus, let captured)):
+            (status, output, failure) = (exitStatus, captured, nil)
+        case .completed(.timedOut(let captured)):
+            (status, output, failure) = (-1, captured, operationTimeoutMessage(seconds: timeout))
+        case .completed(.executableNotFound(let path)):
+            return CommandResult(status: -1, errorOutput: "The update tool is unavailable: \(path)")
+        case .completed(.launchFailed(let message)):
+            return CommandResult(status: -1, errorOutput: message)
         }
-
-        task.waitUntilExit()
-        reads.wait()
-        let stderr = String(data: errorData.withLock { $0 }, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let detail = [monitorFailure, stderr]
+        let stderr = String(decoding: output.standardError, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = [failure, stderr, output.standardErrorWasTruncated ? "Tool diagnostics were truncated." : nil]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        return CommandResult(status: task.terminationStatus, errorOutput: detail)
-    }
-
-    private static func stop(_ task: Process) {
-        guard task.isRunning else { return }
-        task.terminate()
-        let graceDeadline = Date().addingTimeInterval(1)
-        while task.isRunning, Date() < graceDeadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if task.isRunning {
-            Darwin.kill(task.processIdentifier, SIGKILL)
-        }
+        return CommandResult(status: status, errorOutput: detail)
     }
 
     static func operationTimeoutMessage(seconds: TimeInterval) -> String {
@@ -535,6 +675,7 @@ enum UpdateInstaller {
     }
 
     static let escapedContainmentMessage = "The expanded update contained an entry outside the package."
+    static let unsupportedEntryMessage = "The expanded update contained an unsupported file type."
 
     private static func isContained(_ path: String, within root: String) -> Bool {
         path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
@@ -573,10 +714,14 @@ enum UpdateInstaller {
         maximumEntries: Int,
         maximumDepth: Int
     ) -> String? {
+        guard let rootValues = try? root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
+            return "FinderPath could not inspect the expanded update."
+        }
         var enumerationFailed = false
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey, .isRegularFileKey],
             options: [],
             errorHandler: { _, _ in
                 enumerationFailed = true
@@ -602,7 +747,9 @@ enum UpdateInstaller {
 
             let values: URLResourceValues
             do {
-                values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey])
+                values = try entry.resourceValues(
+                    forKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey, .isRegularFileKey]
+                )
             } catch {
                 return "FinderPath could not inspect the expanded update."
             }
@@ -616,7 +763,11 @@ enum UpdateInstaller {
                 continue
             }
             guard values.isDirectory != true else { continue }
-            let fileSize = Int64(max(values.fileSize ?? 0, 0))
+            guard values.isRegularFile == true else { return unsupportedEntryMessage }
+            guard let size = values.fileSize, size >= 0 else {
+                return "FinderPath could not inspect the expanded update."
+            }
+            let fileSize = Int64(size)
             let (newTotal, overflow) = totalSize.addingReportingOverflow(fileSize)
             if overflow || newTotal > maximumSize {
                 return expandedSizeLimitMessage(maximumSize: maximumSize)

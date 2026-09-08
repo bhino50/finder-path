@@ -127,6 +127,29 @@ nonisolated struct TailscaleDevice: Identifiable, Hashable, Sendable {
     var isLinux: Bool { os.lowercased() == "linux" }
 }
 
+/// Resolve the selection against the rows currently displayed. Keeping a second
+/// cached target can connect to an old hostname after a Tailscale refresh, or to
+/// a device that the user has hidden with the platform filter.
+enum RemoteConnectionSelection {
+    static func target(
+        for selection: String?,
+        servers: [RemoteServer],
+        visibleDevices: [TailscaleDevice]
+    ) -> String? {
+        guard let selection else { return nil }
+        if selection.hasPrefix("srv:"),
+           let index = Int(selection.dropFirst(4)),
+           servers.indices.contains(index) {
+            return servers[index].target
+        }
+        if selection.hasPrefix("ts:"),
+           let device = visibleDevices.first(where: { $0.id == String(selection.dropFirst(3)) }) {
+            return device.name.isEmpty ? device.address : device.name
+        }
+        return nil
+    }
+}
+
 nonisolated enum TailscaleFailure: Equatable, Sendable {
     case executableNotFound
     case timedOut(command: String)
@@ -486,6 +509,10 @@ nonisolated enum ShellCommand {
     static func argument(_ value: String, quoteStyle: String = "single") -> String {
         switch quoteStyle {
         case "double":
+            // Interactive zsh/bash expand history inside double quotes. A
+            // backslash is not portable here, so preserve the literal filename
+            // with the existing single-quote encoder when it contains a bang.
+            if value.contains("!") { return argument(value) }
             let escaped = value
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")

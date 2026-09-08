@@ -91,10 +91,7 @@ final class TerminalSessionStore {
     /// Renames are metadata changes, so they persist immediately instead of
     /// waiting for the next add or remove.
     func rename(_ session: TerminalSession, to newName: String) {
-        guard session.name != newName else { return }
-        session.name = newName
-        // A manual rename pins the label so the shell title stops overriding it.
-        session.hasCustomName = true
+        guard session.rename(to: newName) else { return }
         persist()
         onChange?()
     }

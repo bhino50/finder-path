@@ -2110,6 +2110,179 @@ struct FinderPathTerminalTests {
             "a wide status glyph advances two columns, so following text is not off by one"
         )
 
+        // MARK: - Parser: colon color groups cannot consume neighbouring attributes
+
+        var colorScopeParser = TerminalParser()
+        var retainedColorStyle = CellStyle.plain
+        retainedColorStyle.foreground = .ansi(1)
+        retainedColorStyle.bold = true
+        _ = colorScopeParser.parse(Array("\u{1B}[31;1m".utf8))
+        retainedColorStyle.underline = true
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[38:5;4m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an incomplete colon indexed color cannot steal the following underline attribute"
+        )
+        retainedColorStyle.italic = true
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[48:2:1:2;3m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an incomplete colon RGB color cannot steal the following italic attribute"
+        )
+        retainedColorStyle.foreground = .palette(9)
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[38:5:9:0m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an extra colon color component cannot execute as a top-level style reset"
+        )
+        retainedColorStyle.background = .rgb(3, 4, 5)
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[48:2:3:4:5;22m".utf8)) == [.setStyle({
+                var expected = retainedColorStyle
+                expected.bold = false
+                return expected
+            }())],
+            "a complete colon RGB group leaves later semicolon attributes independent"
+        )
+
+        // MARK: - Screen: streamed width-changing graphemes at the right margin
+
+        for glyph in ["❤️", "☹️", "↔️", "#️⃣", "1️⃣"] {
+            let text = "abc" + glyph + "X"
+            var completeGlyphScreen = TerminalScreen(rows: 2, columns: 4)
+            for character in text { completeGlyphScreen.apply(.print(character)) }
+            var streamedGlyphScreen = TerminalScreen(rows: 2, columns: 4)
+            var streamedGlyphParser = TerminalParser()
+            for byte in text.utf8 {
+                for action in streamedGlyphParser.parse([byte]) { streamedGlyphScreen.apply(action) }
+            }
+            expect(
+                (0..<2).allSatisfy { row in
+                    (0..<4).allSatisfy { column in
+                        streamedGlyphScreen.cell(atRow: row, column: column)
+                            == completeGlyphScreen.cell(atRow: row, column: column)
+                    }
+                },
+                "streamed \(glyph) keeps the same cells and wrap padding as one complete grapheme"
+            )
+            expect(
+                streamedGlyphScreen.cursorRow == completeGlyphScreen.cursorRow
+                    && streamedGlyphScreen.cursorColumn == completeGlyphScreen.cursorColumn,
+                "streamed \(glyph) leaves the cursor after the complete two-column grapheme"
+            )
+        }
+
+        var styledMargin = TerminalScreen(rows: 2, columns: 4)
+        var styledMarginParser = TerminalParser()
+        for action in styledMarginParser.parse(Array("abc\u{1B}[31m❤\u{1B}[34m\u{FE0F}X".utf8)) {
+            styledMargin.apply(action)
+        }
+        expect(
+            styledMargin.cell(atRow: 1, column: 0).character == "❤️"
+                && styledMargin.cell(atRow: 1, column: 0).style.foreground == .ansi(1),
+            "moving a widened grapheme to the next row retains the base character's style"
+        )
+        expect(
+            styledMargin.cell(atRow: 1, column: 2).character == "X"
+                && styledMargin.cell(atRow: 1, column: 2).style.foreground == .ansi(4),
+            "moving a widened grapheme does not change the active brush for following text"
+        )
+
+        for columns in [1, 4] {
+            var clippedGlyphScreen = TerminalScreen(rows: 2, columns: columns)
+            clippedGlyphScreen.apply(.setMode(.autowrap, false))
+            clippedGlyphScreen.apply(.moveCursor(row: 1, column: columns))
+            var clippedGlyphParser = TerminalParser()
+            for action in clippedGlyphParser.parse(Array("❤️".utf8)) { clippedGlyphScreen.apply(action) }
+            expect(
+                clippedGlyphScreen.cell(atRow: 0, column: columns - 1).character == "❤️",
+                "a clipped \(columns)-column terminal retains a grapheme's presentation selector"
+            )
+            expect(clippedGlyphScreen.cursorRow == 0, "disabled autowrap does not move a widened grapheme")
+        }
+
+        var toggledWrapScreen = TerminalScreen(rows: 2, columns: 4)
+        for character in "abcd" { toggledWrapScreen.apply(.print(character)) }
+        toggledWrapScreen.apply(.setMode(.autowrap, false))
+        toggledWrapScreen.apply(.print("X"))
+        toggledWrapScreen.apply(.setMode(.autowrap, true))
+        toggledWrapScreen.apply(.print("Y"))
+        expect(toggledWrapScreen.lineText(0) == "abcY", "reenabling autowrap does not wrap a prior clipped print")
+        toggledWrapScreen.apply(.print("Z"))
+        expect(toggledWrapScreen.lineText(1).hasPrefix("Z"), "new output wraps normally after autowrap is reenabled")
+
+        // MARK: - Screen: saved cursor follows rows retained by resize
+
+        var savedBeforeResize = TerminalScreen(rows: 6, columns: 8)
+        for row in 1...6 {
+            savedBeforeResize.apply(.moveCursor(row: row, column: 1))
+            for character in "ROW\(row)" { savedBeforeResize.apply(.print(character)) }
+        }
+        savedBeforeResize.apply(.moveCursor(row: 4, column: 2))
+        savedBeforeResize.apply(.saveCursor)
+        savedBeforeResize.apply(.moveCursor(row: 6, column: 5))
+        var parkedSavedBeforeResize = savedBeforeResize
+        savedBeforeResize.resize(rows: 3, columns: 8)
+        savedBeforeResize.apply(.restoreCursor)
+        parkedSavedBeforeResize.apply(.setMode(.alternateScreen, true))
+        parkedSavedBeforeResize.resize(rows: 3, columns: 8)
+        parkedSavedBeforeResize.apply(.setMode(.alternateScreen, false))
+        parkedSavedBeforeResize.apply(.restoreCursor)
+        expect(
+            savedBeforeResize.cursorRow == 0 && savedBeforeResize.cursorColumn == 1,
+            "restoring after a shrinking resize returns to the saved text's retained row"
+        )
+        expect(
+            savedBeforeResize.cursorRow == parkedSavedBeforeResize.cursorRow
+                && savedBeforeResize.cursorColumn == parkedSavedBeforeResize.cursorColumn,
+            "primary and parked-primary resize preserve saved cursor positions identically"
+        )
+
+        // MARK: - Selection: highlight and copy cover complete wide glyphs
+
+        var selectedWideScreen = TerminalScreen(rows: 1, columns: 6)
+        for character in "A界B" { selectedWideScreen.apply(.print(character)) }
+        let selectedWideCells = (0..<6).map { selectedWideScreen.cell(atRow: 0, column: $0) }
+        let startsOnContinuation = TerminalRowText.selectedColumns(in: selectedWideCells, from: 2, through: 3)
+        expect(
+            startsOnContinuation.map {
+                TerminalRowText.string(from: selectedWideCells[$0], trimmingTrailingSpaces: true)
+            } == "界B",
+            "copy starting on a wide glyph's right half includes that whole glyph"
+        )
+        expect(
+            startsOnContinuation?.contains(1) == true && startsOnContinuation?.contains(2) == true
+                && startsOnContinuation?.contains(0) == false,
+            "selection highlights both cells of its first wide glyph without selecting the preceding letter"
+        )
+        let endsOnBase = TerminalRowText.selectedColumns(in: selectedWideCells, from: 0, through: 1)
+        expect(
+            endsOnBase?.contains(2) == true && endsOnBase?.contains(3) == false,
+            "selection ending on a wide glyph's left half highlights its continuation too"
+        )
+        let onlyContinuation = TerminalRowText.selectedColumns(in: selectedWideCells, from: 2, through: 2)
+        expect(
+            onlyContinuation.map {
+                TerminalRowText.string(from: selectedWideCells[$0], trimmingTrailingSpaces: true)
+            } == "界",
+            "a selection containing only a continuation cell copies its visible glyph"
+        )
+        expect(
+            TerminalRowText.selectedColumns(in: selectedWideCells, from: 6, through: 8) == nil,
+            "a selection completely beyond a resized row stays empty"
+        )
+
+        // MARK: - Session: confirming the fallback name pins it over a shell title
+
+        let renamedFallbackSession = TerminalSession(name: "Terminal 1", workingDirectory: NSTemporaryDirectory())
+        renamedFallbackSession.handleOutput(Array("\u{1B}]2;running command\u{07}".utf8))
+        expect(renamedFallbackSession.displayName == "running command", "the shell initially supplies the tab title")
+        expect(renamedFallbackSession.rename(to: "Terminal 1"), "confirming the fallback name changes an unpinned session")
+        expect(
+            renamedFallbackSession.hasCustomName && renamedFallbackSession.displayName == "Terminal 1",
+            "an explicit fallback-name rename overrides the shell title"
+        )
+        renamedFallbackSession.handleOutput(Array("\u{1B}]2;another command\u{07}".utf8))
+        expect(renamedFallbackSession.displayName == "Terminal 1", "later shell titles cannot replace the explicit name")
+        expect(!renamedFallbackSession.rename(to: "Terminal 1"), "confirming an already pinned name is a metadata no-op")
+
         // MARK: - Result
 
         if failures.isEmpty {

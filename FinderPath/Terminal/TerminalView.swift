@@ -129,8 +129,8 @@ final class TerminalView: NSView {
         )
     }
 
-    // Selection anchors in content-line space (scrollback lines first, then
-    // grid rows); mutated by the mouse handlers in TerminalViewSelection.swift.
+    // Selection anchors use absolute line numbers so trimming scrollback does
+    // not move them onto unrelated text; the companion file handles the mouse.
     var selectionAnchor: TerminalSelectionPoint?
     var selectionHead: TerminalSelectionPoint?
     var hasActiveSelection = false
@@ -195,6 +195,11 @@ final class TerminalView: NSView {
             // so anchors from the old screen cannot select unrelated text.
             self.dropAnchorsIfScreenReplaced()
             self.screenDirty = true
+            // A view can attach before its window is shown, and AppKit does
+            // not always deliver a later occlusion notification to arm the
+            // timer. Output is another authoritative chance to observe the
+            // now-visible window, so its first frame cannot stay stale.
+            self.updateRedrawTimer()
         }
     }
 
@@ -396,7 +401,7 @@ final class TerminalView: NSView {
         while column < rowCells.count {
             guard let fill = backgroundColor(
                 for: rowCells[column].style,
-                selected: isSelected(contentLine: contentLine, column: column)
+                selected: isSelected(contentLine: contentLine, column: column, rowCells: rowCells)
             ) else {
                 column += 1
                 continue
@@ -405,7 +410,7 @@ final class TerminalView: NSView {
             while runEnd < rowCells.count,
                   backgroundColor(
                       for: rowCells[runEnd].style,
-                      selected: isSelected(contentLine: contentLine, column: runEnd)
+                      selected: isSelected(contentLine: contentLine, column: runEnd, rowCells: rowCells)
                   ) == fill {
                 runEnd += 1
             }

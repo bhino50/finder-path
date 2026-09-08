@@ -418,8 +418,8 @@ struct TerminalParser {
     // MARK: - SGR
 
     /// SGR sub-parameters may be colon-delimited (ITU-T), e.g. `38:5:n` or
-    /// `38:2:r:g:b`. Treat ':' like ';' so extended-color values are not
-    /// collapsed into one non-numeric token that would reset all attributes.
+    /// `38:2:r:g:b`. Resolve each colon group before flattening the supported
+    /// attributes so its arguments cannot consume a neighbouring parameter.
     private static func sgrParameters(from buffer: String) -> [Int?] {
         let trimmed = buffer.drop(while: { "?><=".contains($0) })
         guard !trimmed.isEmpty else { return [0] }
@@ -450,16 +450,24 @@ struct TerminalParser {
         }
         switch head {
         case 38, 48:
-            if parts.count >= 6, parts[1] == "2" {
+            switch clampedParameter(parts[1]) {
+            case 5:
+                guard parts.count >= 3, let index = clampedParameter(parts[2]) else { return [] }
+                // Extra sub-parameters still belong to this color, not to the
+                // surrounding SGR list (e.g. 38:5:9:0 must not execute reset).
+                return [head, 5, index]
+            case 2:
                 // ISO-8613-6 truecolor permits a colorspace-id slot:
                 // 38:2:<colorspace>:r:g:b. xterm commonly leaves it empty.
                 // The renderer supports sRGB, so ignore that slot deliberately.
-                var expanded: [Int?] = [head, clampedParameter(parts[1])]
-                expanded.append(contentsOf: parts[3...5].map(clampedParameter))
-                return expanded
+                let firstComponent = parts.count >= 6 ? 3 : 2
+                guard parts.count >= firstComponent + 3 else { return [] }
+                let components = parts[firstComponent..<(firstComponent + 3)].map(clampedParameter)
+                guard components.allSatisfy({ $0 != nil }) else { return [] }
+                return [head, 2] + components
+            default:
+                return [] // unsupported or incomplete color group
             }
-            // 38:5:n and 38:2:r:g:b already line up with what applySGR expects.
-            return parts.map(clampedParameter)
         case 58, 59:
             // Underline colour is not rendered. Swallow the whole group so its
             // arguments cannot be executed as unrelated attributes.

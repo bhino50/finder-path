@@ -76,6 +76,23 @@ struct TerminalCell: Equatable, Sendable {
 /// Converts grid cells into user-visible text without leaking structural
 /// cells into the clipboard or VoiceOver output.
 enum TerminalRowText {
+    /// The selected columns within one row, shared by highlighting and copy.
+    /// Touching either half of a wide glyph selects the whole glyph. Returning
+    /// nil preserves empty selections after a narrowing resize.
+    static func selectedColumns(
+        in cells: [TerminalCell],
+        from firstColumn: Int,
+        through lastColumn: Int
+    ) -> Range<Int>? {
+        guard !cells.isEmpty, firstColumn <= lastColumn,
+              firstColumn < cells.count, lastColumn >= 0 else { return nil }
+        var first = max(firstColumn, 0)
+        var last = min(lastColumn, cells.count - 1)
+        if first > 0, cells[first].isContinuation { first -= 1 }
+        if last + 1 < cells.count, cells[last + 1].isContinuation { last += 1 }
+        return first..<(last + 1)
+    }
+
     static func string<C: Collection>(
         from cells: C,
         trimmingTrailingSpaces: Bool

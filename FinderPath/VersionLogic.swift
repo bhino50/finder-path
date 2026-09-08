@@ -44,6 +44,7 @@ enum UpdateChecker {
         private let maximumSize: Int64
         private let lock = NSLock()
         private var exceeded = false
+        private var rejectedRedirect = false
 
         init(maximumSize: Int64) {
             self.maximumSize = maximumSize
@@ -53,6 +54,29 @@ enum UpdateChecker {
             lock.lock()
             defer { lock.unlock() }
             return exceeded
+        }
+
+        var didRejectRedirect: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return rejectedRedirect
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url, UpdateChecker.isHTTPSWebURL(url) else {
+                lock.lock()
+                rejectedRedirect = true
+                lock.unlock()
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
         }
 
         func urlSession(
@@ -88,7 +112,7 @@ enum UpdateChecker {
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 15
-        if url.host?.contains("api.github.com") == true {
+        if url.host?.lowercased() == "api.github.com" {
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
             request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
             request.setValue("FinderPath/\(AppVersion.shortVersionString)", forHTTPHeaderField: "User-Agent")
@@ -99,13 +123,20 @@ enum UpdateChecker {
         // mappings make it attempt QUIC, which stalls for the full timeout on
         // networks that silently drop UDP 443.
         let sizeLimiter = ManifestSizeLimiter(maximumSize: maximumManifestSize)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
         let session = URLSession(
-            configuration: .ephemeral,
+            configuration: configuration,
             delegate: sizeLimiter,
             delegateQueue: nil
         )
         session.downloadTask(with: request) { location, response, error in
             defer { session.finishTasksAndInvalidate() }
+            if sizeLimiter.didRejectRedirect {
+                completion(.failed(message: "The update manifest redirected to an unsafe location."))
+                return
+            }
             if let error {
                 if sizeLimiter.didExceedLimit {
                     completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
@@ -166,7 +197,7 @@ enum UpdateChecker {
         }.resume()
     }
 
-    private static func parseManifest(_ data: Data) -> UpdateManifest? {
+    static func parseManifest(_ data: Data) -> UpdateManifest? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -180,7 +211,7 @@ enum UpdateChecker {
             ?? (json["latestVersion"] as? String)
 
         guard let version = versionString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !version.isEmpty else {
+              parsedVersion(version) != nil else {
             return nil
         }
 
@@ -207,7 +238,7 @@ enum UpdateChecker {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
 
-        guard !version.isEmpty else { return nil }
+        guard parsedVersion(version) != nil else { return nil }
 
         let assets = (json["assets"] as? [[String: Any]]) ?? []
         let dmgURL = assets
@@ -231,13 +262,16 @@ enum UpdateChecker {
     }
 
     static func compare(_ candidate: String, isNewerThan installed: String) -> Bool {
-        let lhs = numericComponents(candidate)
-        let rhs = numericComponents(installed)
+        guard let candidate = parsedVersion(candidate),
+              let installed = parsedVersion(installed) else { return false }
+        let lhs = candidate.components
+        let rhs = installed.components
         let length = max(lhs.count, rhs.count)
 
         for index in 0..<length {
-            let l = index < lhs.count ? lhs[index] : 0
-            let r = index < rhs.count ? rhs[index] : 0
+            let l = index < lhs.count ? lhs[index] : "0"
+            let r = index < rhs.count ? rhs[index] : "0"
+            if l.count != r.count { return l.count > r.count }
             if l != r { return l > r }
         }
 
@@ -245,37 +279,23 @@ enum UpdateChecker {
     }
 
     static func versionsAreEquivalent(_ lhs: String, _ rhs: String) -> Bool {
-        guard isRecognizableVersion(lhs), isRecognizableVersion(rhs) else {
+        guard let lhs = parsedVersion(lhs), let rhs = parsedVersion(rhs) else {
             return false
         }
 
-        // numericComponents truncates each component at its first non-digit, so
-        // "1.7-beta" and "1.7-rc" both reduce to [1, 7]. UpdateInstaller.verify
-        // uses this call to confirm a downloaded bundle matches the manifest,
-        // so without a suffix check a manifest advertising one prerelease would
-        // accept a different prerelease build of the same version. `compare`
-        // deliberately keeps ignoring suffixes, which is right for ordering.
-        guard prereleaseSuffix(lhs) == prereleaseSuffix(rhs) else { return false }
+        // Verification must preserve the full suffix, while release ordering
+        // compares only the dotted numeric core. Suffix numbers must never
+        // become extra core components (for example, 1.9-rc.99 vs 1.9.1).
+        guard lhs.suffix == rhs.suffix else { return false }
 
-        let left = numericComponents(lhs)
-        let right = numericComponents(rhs)
+        let left = lhs.components
+        let right = rhs.components
         let length = max(left.count, right.count)
 
         return (0..<length).allSatisfy { index in
-            let leftComponent = index < left.count ? left[index] : 0
-            let rightComponent = index < right.count ? right[index] : 0
+            let leftComponent = index < left.count ? left[index] : "0"
+            let rightComponent = index < right.count ? right[index] : "0"
             return leftComponent == rightComponent
-        }
-    }
-
-    private static func isRecognizableVersion(_ version: String) -> Bool {
-        let cleaned = version
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
-        guard !cleaned.isEmpty else { return false }
-
-        return cleaned.split(separator: ".").allSatisfy { component in
-            component.first?.isNumber == true
         }
     }
 
@@ -289,31 +309,41 @@ enum UpdateChecker {
         return url
     }
 
-    private static func isHTTPSWebURL(_ url: URL) -> Bool {
+    static func isHTTPSWebURL(_ url: URL) -> Bool {
         url.scheme?.lowercased() == "https" && url.host?.isEmpty == false
+            && url.user == nil && url.password == nil
     }
 
-    /// Everything after the dotted numeric prefix, normalized: "v1.7-rc.2"
-    /// yields "-rc.2" and "1.7" yields "". Only used for equality, never for
-    /// ordering, so no precedence between suffixes is implied.
-    private static func prereleaseSuffix(_ version: String) -> String {
+    private struct ParsedVersion {
+        let components: [String]
+        let suffix: String
+    }
+
+    /// Keep decimal components as normalized strings. Converting to Int used
+    /// to turn an overflowing component into zero at the verification gate.
+    private static func parsedVersion(_ version: String) -> ParsedVersion? {
         let cleaned = version
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
-        let numericPrefix = cleaned.prefix { $0.isNumber || $0 == "." }
-        return String(cleaned.dropFirst(numericPrefix.count)).lowercased()
-    }
+        let numericPrefix = cleaned.prefix { $0.isASCII && ($0.isNumber || $0 == ".") }
+        let components = numericPrefix.split(separator: ".", omittingEmptySubsequences: false)
+        guard !components.isEmpty, components.allSatisfy({ !$0.isEmpty }) else { return nil }
 
-    private static func numericComponents(_ version: String) -> [Int] {
-        let cleaned = version
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "v", with: "", options: [.caseInsensitive, .anchored])
-
-        return cleaned
-            .split(separator: ".")
-            .map { component -> Int in
-                let digits = component.prefix { $0.isNumber }
-                return Int(digits) ?? 0
-            }
+        let suffix = String(cleaned.dropFirst(numericPrefix.count)).lowercased()
+        if !suffix.isEmpty {
+            guard suffix.first == "-" || suffix.first == "+",
+                  suffix.dropFirst().first?.isLetter == true || suffix.dropFirst().first?.isNumber == true,
+                  suffix.utf8.allSatisfy({
+                      (48...57).contains($0) || (97...122).contains($0)
+                          || $0 == 45 || $0 == 46 || $0 == 43
+                  }) else { return nil }
+        }
+        return ParsedVersion(
+            components: components.map { component in
+                let significantDigits = component.drop(while: { $0 == "0" })
+                return significantDigits.isEmpty ? "0" : String(significantDigits)
+            },
+            suffix: suffix
+        )
     }
 }

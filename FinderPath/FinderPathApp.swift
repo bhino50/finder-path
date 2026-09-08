@@ -124,9 +124,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // session take effect on the next new terminal.
         TerminalSessionStore.shared.configurationProvider = {
             let override = FinderPathPreferences.terminalShellOverride.trimmingCharacters(in: .whitespaces)
-            let usesOverride = !override.isEmpty && FileManager.default.isExecutableFile(atPath: override)
             return TerminalSessionConfiguration(
-                shellPath: usesOverride ? override : PTYProcess.defaultShell(),
+                // PTY launch validates this on its background worker. Probing
+                // an override on a stalled volume here would freeze the menu;
+                // an invalid explicit override should report its launch error.
+                shellPath: override.isEmpty ? PTYProcess.defaultShell() : override,
                 scrollbackLimit: FinderPathPreferences.terminalScrollbackLimit
             )
         }
@@ -580,14 +582,21 @@ final class FinderPathState {
     /// only in which preference they read and which name they reported.
     func openWithAgent(named name: String, executable: String, at path: String? = nil) {
         withResolvedActionTarget(path) { [weak self] target in
-            let resolvedExecutable = AgentLauncher.availability(for: executable).resolvedPath ?? executable
-
-            TerminalBridge.openAgent(
-                displayName: name,
-                executable: resolvedExecutable,
-                at: target
-            ) { error in
-                self?.presentLaunchFailure(error, displayName: name)
+            Task { @MainActor [weak self] in
+                let availability = await AgentLauncher.checkAvailability(for: executable)
+                guard !Task.isCancelled, let self else { return }
+                guard let resolvedExecutable = availability.resolvedPath else {
+                    self.presentLaunchFailure(
+                        "\(name) CLI could not be found. Check its command or path and reconnect any volume it uses.",
+                        displayName: name
+                    )
+                    return
+                }
+                TerminalBridge.openAgent(
+                    displayName: name, executable: resolvedExecutable, at: target
+                ) { [weak self] error in
+                    self?.presentLaunchFailure(error, displayName: name)
+                }
             }
         }
     }

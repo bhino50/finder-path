@@ -33,9 +33,7 @@ struct PendingURLQueue {
         guard !isReady else { return Array(incoming.prefix(Self.capacity)) }
         // Keep the earliest URLs: the one that launched the app is the one the
         // user actually asked for.
-        for url in incoming where buffered.count < Self.capacity {
-            buffered.append(url)
-        }
+        buffered.append(contentsOf: incoming.prefix(max(Self.capacity - buffered.count, 0)))
         return []
     }
 

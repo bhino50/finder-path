@@ -43,6 +43,22 @@ PROCESS_RUNNER_TEST_BINARY="$BUILD_DIR/BoundedProcessRunnerTests"
 
 "$PROCESS_RUNNER_TEST_BINARY"
 
+# Launcher discovery must leave the main actor responsive and reject obsolete
+# asynchronous menu results when command preferences change.
+LAUNCHER_TEST_BINARY="$BUILD_DIR/LauncherAvailabilityTests"
+"$SWIFTC" \
+  -parse-as-library \
+  -O \
+  -target "$TARGET" \
+  "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
+  "$ROOT_DIR/FinderPath/Bridges.swift" \
+  "$ROOT_DIR/FinderPath/RemoteServers.swift" \
+  "$ROOT_DIR/Tests/LauncherAvailabilityTests.swift" \
+  -framework AppKit \
+  -o "$LAUNCHER_TEST_BINARY"
+
+"$LAUNCHER_TEST_BINARY"
+
 # Terminal emulator logic tests build as a second binary so the terminal
 # subsystem's UI-free files stay covered without linking the whole app.
 TERMINAL_TEST_BINARY="$BUILD_DIR/FinderPathTerminalTests"
@@ -74,3 +90,6 @@ done
 # inside a here-document. Execute it against fixtures so a broken release
 # script fails here rather than after a full Apple notarization round trip.
 /usr/bin/python3 "$ROOT_DIR/script/test_release_manifest.py"
+
+# Packaging failures and repeated versions must preserve previous artifacts.
+/bin/bash "$ROOT_DIR/script/test_packaging_safety.sh"

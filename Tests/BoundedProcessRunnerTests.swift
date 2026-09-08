@@ -5,6 +5,12 @@ import Foundation
 struct BoundedProcessRunnerTests {
     static func main() {
         if CommandLine.arguments.count == 3,
+           CommandLine.arguments[1] == "--descriptor-is-open",
+           let descriptor = Int32(CommandLine.arguments[2]) {
+            print(fcntl(descriptor, F_GETFD) == -1 ? "closed" : "open")
+            return
+        }
+        if CommandLine.arguments.count == 3,
            CommandLine.arguments[1] == "--setsid-child-fixture" {
             runSetsidChildFixture(
                 pidFilePath: CommandLine.arguments[2],
@@ -78,6 +84,75 @@ struct BoundedProcessRunnerTests {
         } else {
             expect(false, "a normal child returns an exited outcome")
         }
+
+        // C strings cannot represent embedded NUL. Reject it before spawning
+        // instead of checking or executing a different, truncated path.
+        let nulArgument = BoundedProcessRunner.run(
+            executable: "/bin/test",
+            arguments: ["-d", "/tmp\u{0}/finderpath-nonexistent"],
+            limits: normalLimits
+        )
+        expect(
+            { if case .launchFailed = nulArgument { return true }; return false }(),
+            "an embedded NUL argument cannot validate its truncated path"
+        )
+        let nulExecutable = BoundedProcessRunner.run(
+            executable: "/bin/echo\u{0}/finderpath-nonexistent",
+            limits: normalLimits
+        )
+        expect(
+            { if case .launchFailed = nulExecutable { return true }; return false }(),
+            "an embedded NUL executable is rejected before launch"
+        )
+
+        // The descriptor deliberately lacks FD_CLOEXEC. A child must still
+        // receive only its explicit standard streams, not app files or PTYs.
+        let fixtureDescriptor = open("/dev/null", O_RDONLY)
+        let inheritedDescriptor = fcntl(fixtureDescriptor, F_DUPFD, 200)
+        if fixtureDescriptor >= 0 { close(fixtureDescriptor) }
+        if inheritedDescriptor >= 0 {
+            defer { close(inheritedDescriptor) }
+            let descriptorProbe = BoundedProcessRunner.run(
+                executable: CommandLine.arguments[0],
+                arguments: ["--descriptor-is-open", String(inheritedDescriptor)],
+                limits: normalLimits
+            )
+            if case .exited(let status, let output) = descriptorProbe {
+                expect(status == 0, "the descriptor isolation fixture exits normally")
+                expect(
+                    String(decoding: output.standardOutput, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines) == "closed",
+                    "unrelated file descriptors are not inherited by a child"
+                )
+            } else {
+                expect(false, "the descriptor isolation fixture returns an exited outcome")
+            }
+        } else {
+            expect(false, "the descriptor isolation fixture creates its owned descriptor")
+        }
+
+        let monitorStart = Date()
+        let monitored = BoundedProcessRunner.runMonitored(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                "trap 'exit 0' TERM; printf 'ready' >&2; while :; do /bin/sleep 1; done",
+            ],
+            limits: normalLimits,
+            stopReason: {
+                Date().timeIntervalSince(monitorStart) >= 0.15 ? "fixture quota exceeded" : nil
+            }
+        )
+        if case .stopped(let reason, let output) = monitored {
+            expect(reason == "fixture quota exceeded", "the monitor's failure reason is preserved")
+            expect(
+                String(decoding: output.standardError, as: UTF8.self).contains("ready"),
+                "a monitored stop retains output emitted before cancellation"
+            )
+        } else {
+            expect(false, "a zero-exit TERM handler cannot turn a policy stop into success")
+        }
+        expect(Date().timeIntervalSince(monitorStart) < 2, "a policy stop returns within its cleanup bound")
 
         let boundedScript = """
         i=0

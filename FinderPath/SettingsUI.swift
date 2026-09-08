@@ -72,7 +72,7 @@ struct SettingsView: View {
     @State private var hermesAvailability = AgentAvailability.unknown(executable: "hermes")
     @State private var isCheckingForUpdates = false
     @State private var agentAvailabilityCheckTask: Task<Void, Never>?
-    @State private var launchAtLogin = false
+    @State private var launchAtLoginStatus: SMAppService.Status = .notRegistered
     @State private var launchAtLoginError: String?
 
     // Wait for a pause in typing before probing the shell so editing the
@@ -82,7 +82,19 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("General") {
-                Toggle("Launch FinderPath at login", isOn: $launchAtLogin)
+                Toggle("Launch FinderPath at login", isOn: Binding(
+                    get: { launchAtLoginStatus == .enabled || launchAtLoginStatus == .requiresApproval },
+                    set: { setLaunchAtLogin($0) }
+                ))
+
+                if launchAtLoginStatus == .requiresApproval {
+                    Text("FinderPath is registered to launch at login and needs approval in System Settings.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button("Open Login Items Settings") {
+                        SMAppService.openSystemSettingsLoginItems()
+                    }
+                }
 
                 Toggle("Allow shortcut URLs to launch terminal apps", isOn: $allowExternalLaunchURLs)
 
@@ -272,11 +284,11 @@ struct SettingsView: View {
         .padding(20)
         .frame(width: 560, height: 700)
         .onAppear {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            refreshLaunchAtLoginStatus()
             scheduleAgentAvailabilityCheck()
         }
-        .onChange(of: launchAtLogin) { isEnabled in
-            setLaunchAtLogin(isEnabled)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshLaunchAtLoginStatus()
         }
         .onChange(of: codexExecutable) { _ in
             scheduleAgentAvailabilityCheck(debounce: true)
@@ -289,11 +301,19 @@ struct SettingsView: View {
         }
     }
 
-    // Registers or unregisters the app as a login item, keeping the toggle in
-    // sync with the real SMAppService status when the system rejects a change.
+    private func refreshLaunchAtLoginStatus() {
+        launchAtLoginStatus = SMAppService.mainApp.status
+    }
+
+    // Readback updates only the status, never the custom binding's setter.
+    // A pending registration still needs unregistering when switched off.
     private func setLaunchAtLogin(_ isEnabled: Bool) {
         let service = SMAppService.mainApp
-        guard isEnabled != (service.status == .enabled) else { return }
+        let status = service.status
+        defer { refreshLaunchAtLoginStatus() }
+        launchAtLoginError = nil
+        if isEnabled && (status == .enabled || status == .requiresApproval) { return }
+        if !isEnabled && (status == .notRegistered || status == .notFound) { return }
 
         do {
             if isEnabled {
@@ -301,10 +321,8 @@ struct SettingsView: View {
             } else {
                 try service.unregister()
             }
-            launchAtLoginError = nil
         } catch {
             launchAtLoginError = "Could not \(isEnabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
-            launchAtLogin = service.status == .enabled
         }
     }
 

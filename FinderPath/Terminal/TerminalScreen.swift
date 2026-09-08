@@ -45,8 +45,9 @@ struct TerminalScreen {
     private var brush = CellStyle.plain
     private var savedCursor: (row: Int, column: Int)?
 
-    /// Deferred autowrap: printing in the last column parks the cursor there
-    /// until the next print, which wraps first (matches xterm).
+    /// Printing in the last column parks the cursor there. Retain that fact
+    /// even with autowrap disabled so combining marks extend the margin cell;
+    /// the next non-combining print wraps only when autowrap is enabled.
     private var pendingWrap = false
 
     var scrollbackCount: Int { scrollback.count - scrollbackHead }
@@ -261,7 +262,7 @@ struct TerminalScreen {
 
     // MARK: - Printing and scrolling
 
-    private mutating func printCharacter(_ character: Character) {
+    private mutating func printCharacter(_ character: Character, style: CellStyle? = nil) {
         if shouldExtendPreviousCell(with: character), appendToPreviousCell(character) {
             return
         }
@@ -286,19 +287,20 @@ struct TerminalScreen {
 
         discardHiddenColumns(in: cursorRow)
         clearGlyph(atRow: cursorRow, column: cursorColumn)
-        grid[cursorRow][cursorColumn] = TerminalCell(character: character, style: brush)
+        let printStyle = style ?? brush
+        grid[cursorRow][cursorColumn] = TerminalCell(character: character, style: printStyle)
 
         if width == 2, cursorColumn + 1 < columns {
             clearGlyph(atRow: cursorRow, column: cursorColumn + 1)
-            grid[cursorRow][cursorColumn + 1] = .continuation(with: brush)
+            grid[cursorRow][cursorColumn + 1] = .continuation(with: printStyle)
             if cursorColumn + 1 == columns - 1 {
                 cursorColumn = columns - 1
-                pendingWrap = autowrap
+                pendingWrap = true
             } else {
                 cursorColumn += 2
             }
         } else if cursorColumn == columns - 1 {
-            pendingWrap = autowrap
+            pendingWrap = true
         } else {
             cursorColumn += 1
         }
@@ -421,7 +423,8 @@ struct TerminalScreen {
 
     private mutating func appendToPreviousCell(_ character: Character) -> Bool {
         guard let column = previousBaseColumn() else { return false }
-        let existing = grid[cursorRow][column].character
+        let existingCell = grid[cursorRow][column]
+        let existing = existingCell.character
         if existing.unicodeScalars.count + character.unicodeScalars.count > Self.maximumScalarsPerCell {
             // Treat the extender as consumed so a wide ZWJ component cannot
             // spill into a new cell after the cap is reached.
@@ -434,12 +437,29 @@ struct TerminalScreen {
         let newWidth = Self.columnWidth(of: combined)
         if oldWidth == 1, newWidth == 2 {
             let continuationColumn = column + 1
-            guard continuationColumn < columns else { return false }
+            guard continuationColumn < columns else {
+                if columns > 1, autowrap {
+                    // A later emoji selector can widen a base already printed
+                    // at the right edge. Move the complete grapheme just as
+                    // printCharacter would have done if it arrived together.
+                    // Keep its original style even if SGR changed in between.
+                    clearGlyph(atRow: cursorRow, column: column)
+                    markCurrentLineWrapped(paddingColumns: 1)
+                    cursorColumn = 0
+                    lineFeed()
+                    printCharacter(combined, style: existingCell.style)
+                } else {
+                    // The ordinary print path clips a wide glyph in a single
+                    // cell when wrapping is unavailable; retain its full text.
+                    grid[cursorRow][column].character = combined
+                }
+                return true
+            }
             clearGlyph(atRow: cursorRow, column: continuationColumn)
             grid[cursorRow][continuationColumn] = .continuation(with: grid[cursorRow][column].style)
             if cursorColumn == continuationColumn {
                 if continuationColumn == columns - 1 {
-                    pendingWrap = autowrap
+                    pendingWrap = true
                 } else {
                     cursorColumn += 1
                 }
@@ -696,6 +716,7 @@ struct TerminalScreen {
             regionBottom = rows - 1
             pendingWrap = false
         case .autowrap:
+            if enabled != autowrap { pendingWrap = false }
             autowrap = enabled
         case .bracketedPaste:
             bracketedPaste = enabled
@@ -804,6 +825,9 @@ struct TerminalScreen {
         // up by the same amount to keep it on its own line.
         cursorRow = clampRow(cursorRow - firstRetained)
         cursorColumn = clampColumn(cursorColumn)
+        savedCursor = savedCursor.map { saved in
+            (clampRow(saved.row - firstRetained), clampColumn(saved.column))
+        }
         pendingWrap = false
     }
 

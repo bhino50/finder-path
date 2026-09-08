@@ -37,7 +37,6 @@ struct RemoteConnectionView: View {
     @AppStorage(FinderPathPreferences.showAllTailscaleDevicesKey) private var showAllDevices = true
 
     @State private var selection: String?
-    @State private var selectedTarget = ""
     @State private var user = ""
     @State private var tailscale = TailscaleStatus.unavailable
     @State private var isLoadingTailscale = false
@@ -63,7 +62,16 @@ struct RemoteConnectionView: View {
 
     private var selectedServerIndex: Int? {
         guard let selection, selection.hasPrefix("srv:") else { return nil }
-        return Int(selection.dropFirst(4))
+        guard let index = Int(selection.dropFirst(4)), servers.indices.contains(index) else { return nil }
+        return index
+    }
+
+    private var selectedTarget: String? {
+        RemoteConnectionSelection.target(
+            for: selection,
+            servers: servers,
+            visibleDevices: visibleDevices
+        )
     }
 
     var body: some View {
@@ -88,6 +96,14 @@ struct RemoteConnectionView: View {
         .padding(20)
         .frame(width: 460, height: 580)
         .onAppear { Task { await refreshTailscale() } }
+        .onChange(of: showAllDevices) { _ in
+            if selectedTarget == nil { selection = nil }
+        }
+        .onChange(of: remoteServersText) { _ in
+            // Saved rows use list indices. A changed list must not silently
+            // retarget a selection to whichever server now occupies that index.
+            if selection?.hasPrefix("srv:") == true { selection = nil }
+        }
         .alert("Connection problem", isPresented: Binding(
             get: { errorMessage != nil },
             set: { if !$0 { errorMessage = nil } }
@@ -101,7 +117,7 @@ struct RemoteConnectionView: View {
             isPresented: $isConfirmingVPNDisconnect,
             titleVisibility: .visible
         ) {
-            Button("Disconnect", role: .destructive) { toggleVPN() }
+            Button("Disconnect", role: .destructive) { setVPNEnabled(false) }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("FinderPath will run `tailscale down`, which disconnects this Mac from your tailnet.")
@@ -134,7 +150,7 @@ struct RemoteConnectionView: View {
                     if tailscale.isRunning {
                         isConfirmingVPNDisconnect = true
                     } else {
-                        toggleVPN()
+                        setVPNEnabled(true)
                     }
                 }
                     .disabled(isTogglingVPN || tailscale.backend == .needsLogin)
@@ -216,8 +232,7 @@ struct RemoteConnectionView: View {
                         id: "ts:\(device.id)",
                         title: device.name,
                         subtitle: "\(device.address) · \(device.os)",
-                        online: device.online,
-                        target: device.name.isEmpty ? device.address : device.name
+                        online: device.online
                     )
                 }
             }
@@ -257,17 +272,16 @@ struct RemoteConnectionView: View {
                         id: "srv:\(index)",
                         title: server.name,
                         subtitle: server.target,
-                        online: nil,
-                        target: server.target
+                        online: nil
                     )
                 }
             }
         }
     }
 
-    private func connectionRow(id: String, title: String, subtitle: String, online: Bool?, target: String) -> some View {
+    private func connectionRow(id: String, title: String, subtitle: String, online: Bool?) -> some View {
         Button {
-            select(id: id, target: target)
+            selection = id
         } label: {
             HStack(spacing: 8) {
                 if let online {
@@ -300,7 +314,7 @@ struct RemoteConnectionView: View {
                 .fill(selection == id ? Color.accentColor.opacity(0.18) : Color.clear)
         )
         .onTapGesture(count: 2) {
-            select(id: id, target: target)
+            selection = id
             connect()
         }
         .accessibilityLabel(title)
@@ -333,7 +347,7 @@ struct RemoteConnectionView: View {
                 Spacer()
                 Button("Connect") { connect() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(selection == nil)
+                    .disabled(selectedTarget == nil)
             }
         }
     }
@@ -370,11 +384,6 @@ struct RemoteConnectionView: View {
         .frame(width: 360)
     }
 
-    private func select(id: String, target: String) {
-        selection = id
-        selectedTarget = target
-    }
-
     private func beginAddServer() {
         newServerName = ""
         newServerTarget = ""
@@ -407,11 +416,10 @@ struct RemoteConnectionView: View {
         current.remove(at: index)
         remoteServersText = RemoteServers.serialize(current)
         selection = nil
-        selectedTarget = ""
     }
 
     private func connect() {
-        guard !selectedTarget.isEmpty else { return }
+        guard let selectedTarget, !selectedTarget.isEmpty else { return }
 
         let target = RemoteServers.normalizedTarget(selectedTarget)
         guard !target.isEmpty else { return }
@@ -432,11 +440,13 @@ struct RemoteConnectionView: View {
         }
     }
 
-    private func toggleVPN() {
+    private func setVPNEnabled(_ enabled: Bool) {
+        guard !isTogglingVPN else { return }
         isTogglingVPN = true
-        let goingUp = !tailscale.isRunning
         Task {
-            let outcome = goingUp ? await TailscaleBridge.up() : await TailscaleBridge.down()
+            // Preserve the explicit action shown to the user even if an
+            // in-flight refresh changes the backend state during confirmation.
+            let outcome = enabled ? await TailscaleBridge.up() : await TailscaleBridge.down()
             if case .failure(let failure) = outcome {
                 errorMessage = failure.userMessage
             }
@@ -456,13 +466,7 @@ struct RemoteConnectionView: View {
         guard refreshGeneration == tailscaleRefreshGeneration else { return }
 
         tailscale = refreshedStatus
-        if let selection, selection.hasPrefix("ts:") {
-            let selectedDeviceID = String(selection.dropFirst(3))
-            if !refreshedStatus.devices.contains(where: { $0.id == selectedDeviceID }) {
-                self.selection = nil
-                selectedTarget = ""
-            }
-        }
+        if selectedTarget == nil { selection = nil }
         isLoadingTailscale = false
     }
 }
