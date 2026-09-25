@@ -304,7 +304,9 @@ enum FinderPathPreferences {
     }
 
     private static func compactPath(_ path: String) -> String {
-        let url = URL(fileURLWithPath: path).standardizedFileURL
+        // The header always shows a folder. The hint keeps Foundation from
+        // calling lstat on it during every menu build.
+        let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         let components = url.pathComponents.filter { $0 != "/" }
 
         // Only elide when something is actually being elided. With `>= 2` an

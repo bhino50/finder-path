@@ -971,6 +971,66 @@ struct FinderPathLogicTests {
             "a newline in a folder path should escape rather than collapse to a space"
         )
 
+        // Agent launches are typed into the user's login shell, which may be
+        // fish or tcsh. Every one of them reads `\x` outside quotes as x.
+        expect(ShellCommand.portableArgument("") == "''", "an empty portable argument stays one word")
+        expect(
+            ShellCommand.portableArgument("/tmp/plain dir") == "'/tmp/plain dir'",
+            "ordinary characters stay inside single quotes"
+        )
+        expect(
+            ShellCommand.portableArgument("it's a\\b!") == "'it'\\''s a'\\\\'b'\\!",
+            "quote, backslash, and bang are escaped outside the quotes"
+        )
+        expect(
+            ShellCommand.portableArgument("'\u{301}") == "\\''\u{301}'",
+            "a combining mark cannot hide a quote inside a quoted run"
+        )
+        expect(
+            ShellCommand.portableArgument(TerminalBridge.agentLaunchScript) == "'\(TerminalBridge.agentLaunchScript)'",
+            "the fixed launch program stays a single quoted word"
+        )
+        // Outside the quoted arguments only plain words may remain: `if`/`fi`,
+        // `&&`, and `${...}` are what fish and tcsh reject.
+        let agentCommand = TerminalBridge.agentLaunchCommand(
+            displayName: "Claude", executable: "/Users/u/.local/bin/claude", directoryPath: "/Users/u/it's a\\dir!"
+        )
+        var unquotedAgentText = ""
+        var insideQuotes = false
+        var afterBackslash = false
+        for scalar in agentCommand.unicodeScalars {
+            if afterBackslash {
+                afterBackslash = false
+            } else if insideQuotes {
+                insideQuotes = scalar != "'"
+            } else if scalar == "\\" {
+                afterBackslash = true
+            } else if scalar == "'" {
+                insideQuotes = true
+            } else {
+                unquotedAgentText.unicodeScalars.append(scalar)
+            }
+        }
+        expect(
+            unquotedAgentText == "exec /bin/sh -c     " && !insideQuotes && !afterBackslash,
+            "the agent launch line is plain words around balanced quoted arguments"
+        )
+        let missingAgentMessage = TerminalBridge.agentMissingMessage(
+            displayName: "Claude", executable: "/opt/homebrew/bin/claude"
+        )
+        expect(
+            missingAgentMessage.contains("/opt/homebrew/bin/claude") && missingAgentMessage.contains("Settings"),
+            "the missing-agent message names the checked path and where to change it"
+        )
+        expect(
+            !missingAgentMessage.contains("PATH"),
+            "the missing-agent message never asks for a file path to be added to PATH"
+        )
+        expect(
+            AgentLauncher.commonSearchDirectories.allSatisfy(AgentLauncher.searchLocationsSummary.contains),
+            "the Settings footnote lists every folder a bare command name is looked up in"
+        )
+
         // The Ghostty SSH path opens a throwaway script as a document so the
         // running instance is reused; the host must stay shell-quoted in it.
         expect(

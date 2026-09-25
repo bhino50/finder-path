@@ -133,6 +133,119 @@ struct LauncherAvailabilityTests {
         let shellResult = await AgentLauncher.checkAvailability(for: "sh")
         expect(shellResult.resolvedPath?.hasPrefix("/") == true, "PATH lookup returns an absolute executable for launch actions")
 
+        // FinderPath never reads shell startup files, so a CLI in a version
+        // manager's folder is found only by the full path Settings asks for.
+        let managerBin = directory.appendingPathComponent(".nvm/versions/node/v0/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: managerBin, withIntermediateDirectories: true)
+        let managedName = "finderpath-managed-\(UUID().uuidString)"
+        let managedAgent = managerBin.appendingPathComponent(managedName, isDirectory: false)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: managedAgent)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: managedAgent.path)
+        let bareManaged = await AgentLauncher.checkAvailability(for: managedName)
+        expect(!bareManaged.isInstalled, "a bare name is never looked up outside the documented search folders")
+        let fullManaged = await AgentLauncher.checkAvailability(for: managedAgent.path)
+        expect(fullManaged.resolvedPath == managedAgent.path, "a full path finds a version-managed CLI")
+
+        // Terminal types the agent launch line into the user's login shell,
+        // which may be zsh, bash, fish, or tcsh. Take the line back out of the
+        // AppleScript literal Terminal receives, run it in each shell with
+        // hostile folder names, and check where a stub agent starts.
+        guard let launchRootPath = realpath(directory.path, nil) else {
+            expect(false, "the launch fixture directory resolves")
+            exit(1)
+        }
+        let launchRoot = String(cString: launchRootPath)
+        free(launchRootPath)
+        let stubAgent = launchRoot + "/stub-agent"
+        let stubLoginShell = launchRoot + "/stub-login-shell"
+        try Data("#!/bin/sh\nexec /bin/pwd -P\n".utf8).write(to: URL(fileURLWithPath: stubAgent))
+        try Data("#!/bin/sh\nprintf 'login shell %s\\n' \"$*\"\n".utf8).write(to: URL(fileURLWithPath: stubLoginShell))
+        for stub in [stubAgent, stubLoginShell] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+        }
+        let shellLimits = BoundedProcessRunner.Limits(
+            timeout: 10, maximumStandardOutputBytes: 64 * 1_024, maximumStandardErrorBytes: 64 * 1_024
+        )
+        func typedCommand(executable: String, folder: String) -> String? {
+            let command = TerminalBridge.agentLaunchCommand(
+                displayName: "Claude", executable: executable, directoryPath: folder
+            )
+            let assignment = TerminalBridge.terminalLaunchScriptSource(command: command)
+                .components(separatedBy: "\n")[0]
+            let outcome = BoundedProcessRunner.run(
+                executable: "/usr/bin/osascript",
+                arguments: ["-e", assignment, "-e", "return launchCommand"],
+                limits: shellLimits
+            )
+            guard case .exited(0, let output) = outcome else { return nil }
+            let text = String(decoding: output.standardOutput, as: UTF8.self)
+            return text.hasSuffix("\n") ? String(text.dropLast()) : text
+        }
+        func runTyped(_ command: String, in shell: String) -> String {
+            let outcome = BoundedProcessRunner.run(
+                executable: "/usr/bin/env",
+                arguments: [
+                    "-i", "HOME=\(launchRoot)", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                    "SHELL=\(stubLoginShell)", shell, "-c", command
+                ],
+                limits: shellLimits
+            )
+            guard case .exited(_, let output) = outcome else { return "<\(shell) did not exit>" }
+            return String(decoding: output.standardOutput, as: UTF8.self)
+        }
+
+        var loginShells = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/tcsh"]
+            .filter { AgentLauncher.isExecutableRegularFile(atPath: $0) }
+        // fish is not part of macOS; cover it wherever it is installed.
+        if let fish = AgentLauncher.availability(for: "fish").resolvedPath {
+            loginShells.append(fish)
+        }
+        let folderNames = [
+            "it's a dir", "dq\"x", "back\\slash", "trail\\", "a\\'b", "dollar $HOME", "tick`x`",
+            "bang!x", "semi;colon && x", "-leading dash", "caf\u{E9} \u{65E5}\u{672C} \u{1F600}", "new\nline"
+        ]
+        for name in folderNames {
+            let folder = launchRoot + "/" + name
+            try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: false)
+            guard let command = typedCommand(executable: stubAgent, folder: folder) else {
+                expect(false, "the launch command survives the AppleScript string round trip for \(name.debugDescription)")
+                continue
+            }
+            // tcsh cannot hold a newline inside quotes; macOS allows the name
+            // but it is not worth a temporary script file per launch.
+            for shell in loginShells where !(name.contains("\n") && shell.hasSuffix("csh")) {
+                let output = runTyped(command, in: shell)
+                expect(
+                    output == folder + "\n",
+                    "\(shell) starts the agent in \(name.debugDescription), got \(output.debugDescription)"
+                )
+            }
+        }
+
+        let missingAgent = launchRoot + "/missing-agent"
+        if let missingCommand = typedCommand(executable: missingAgent, folder: launchRoot) {
+            for shell in loginShells {
+                let output = runTyped(missingCommand, in: shell)
+                expect(
+                    output.contains("CLI was not found") && output.hasSuffix("login shell -l\n"),
+                    "\(shell) reports a missing agent and opens a login shell, got \(output.debugDescription)"
+                )
+            }
+        } else {
+            expect(false, "the missing-agent command survives the AppleScript string round trip")
+        }
+        if let movedCommand = typedCommand(executable: stubAgent, folder: launchRoot + "/deleted folder") {
+            for shell in loginShells {
+                let output = runTyped(movedCommand, in: shell)
+                expect(
+                    output == "login shell -l\n",
+                    "\(shell) opens a login shell when the folder is gone, got \(output.debugDescription)"
+                )
+            }
+        } else {
+            expect(false, "the missing-folder command survives the AppleScript string round trip")
+        }
+
         if failures > 0 {
             print("\(failures) of \(assertions) launcher availability assertions failed")
             exit(1)

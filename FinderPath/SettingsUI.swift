@@ -249,7 +249,7 @@ struct SettingsView: View {
                     Spacer()
                 }
 
-                Text("Codex, Claude, and Hermes are optional. If a CLI is not installed, FinderPath can hide that menu action. Use a full executable path if your command is installed outside the normal shell PATH.")
+                Text("Codex, Claude, and Hermes are optional. If a CLI is not installed, FinderPath can hide that menu action. A command name is looked up in \(AgentLauncher.searchLocationsSummary). Shell startup files are not read, so for a CLI installed with nvm, Volta, bun, pnpm, or a custom npm prefix, enter its full path (run `command -v claude` in Terminal to find it).")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

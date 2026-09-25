@@ -52,7 +52,7 @@ nonisolated enum RecentPathsLogic {
 
         return zip(list, leaves).map { entry, leaf in
             guard (occurrences[leaf] ?? 0) > 1 else { return leaf }
-            let parent = URL(fileURLWithPath: entry.path)
+            let parent = URL(fileURLWithPath: entry.path, isDirectory: true)
                 .deletingLastPathComponent()
                 .lastPathComponent
             return parent.isEmpty ? leaf : "\(parent)/\(leaf)"
@@ -86,12 +86,17 @@ nonisolated enum RecentPathsLogic {
 
     /// Trailing slashes and relative components must not produce a second entry
     /// for a folder already in the list.
+    ///
+    /// Every entry is a folder, so the URLs here say so. Without the hint,
+    /// Foundation calls lstat on each saved path to find out, on the main
+    /// actor while the menu is built, and a saved folder on a stalled network
+    /// volume then freezes the app.
     private static func standardized(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
     }
 
     private static func leafName(for entry: RecentPath) -> String {
-        let name = URL(fileURLWithPath: entry.path).lastPathComponent
+        let name = URL(fileURLWithPath: entry.path, isDirectory: true).lastPathComponent
         return name.isEmpty ? entry.path : name
     }
 }

@@ -22,6 +22,7 @@ TARGET="$(uname -m)-apple-macos13.0"
   "$ROOT_DIR/FinderPath/RecentPaths.swift" \
   "$ROOT_DIR/FinderPath/RemoteServers.swift" \
   "$ROOT_DIR/FinderPath/SizeLimitedDownload.swift" \
+  "$ROOT_DIR/FinderPath/TerminalLaunchCommand.swift" \
   "$ROOT_DIR/FinderPath/UpdateInstaller.swift" \
   "$ROOT_DIR/FinderPath/UpdateLeftoverCleanup.swift" \
   "$ROOT_DIR/FinderPath/VersionLogic.swift" \
@@ -65,7 +66,8 @@ UPDATE_DOWNLOAD_TEST_BINARY="$BUILD_DIR/UpdateDownloadTests"
 "$UPDATE_DOWNLOAD_TEST_BINARY"
 
 # Launcher discovery must leave the main actor responsive and reject obsolete
-# asynchronous menu results when command preferences change.
+# asynchronous menu results when command preferences change. The Terminal
+# launch line is also run in every available login shell.
 LAUNCHER_TEST_BINARY="$BUILD_DIR/LauncherAvailabilityTests"
 "$SWIFTC" \
   -parse-as-library \
@@ -74,11 +76,37 @@ LAUNCHER_TEST_BINARY="$BUILD_DIR/LauncherAvailabilityTests"
   "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
   "$ROOT_DIR/FinderPath/Bridges.swift" \
   "$ROOT_DIR/FinderPath/RemoteServers.swift" \
+  "$ROOT_DIR/FinderPath/TerminalLaunchCommand.swift" \
   "$ROOT_DIR/Tests/LauncherAvailabilityTests.swift" \
   -framework AppKit \
   -o "$LAUNCHER_TEST_BINARY"
 
 "$LAUNCHER_TEST_BINARY"
+
+# Menu-building path logic must never stat a saved folder, which may be on a
+# stalled network volume. A DYLD interposer counts metadata calls on marker
+# paths; the binary fails on its own if the interposer is not loaded.
+CLANG="${CLANG:-$(command -v clang)}"
+PROBE_COUNTER_LIBRARY="$BUILD_DIR/libMetadataProbeCounter.dylib"
+"$CLANG" \
+  -dynamiclib \
+  -O2 \
+  -target "$TARGET" \
+  "$ROOT_DIR/Tests/Support/MetadataProbeCounter.c" \
+  -o "$PROBE_COUNTER_LIBRARY"
+
+NO_STAT_TEST_BINARY="$BUILD_DIR/RecentPathsNoStatTests"
+"$SWIFTC" \
+  -parse-as-library \
+  -O \
+  -target "$TARGET" \
+  "$ROOT_DIR/FinderPath/Preferences.swift" \
+  "$ROOT_DIR/FinderPath/RecentPaths.swift" \
+  "$ROOT_DIR/Tests/RecentPathsNoStatTests.swift" \
+  -framework AppKit \
+  -o "$NO_STAT_TEST_BINARY"
+
+DYLD_INSERT_LIBRARIES="$PROBE_COUNTER_LIBRARY" "$NO_STAT_TEST_BINARY"
 
 # Terminal emulator logic tests build as a second binary so the terminal
 # subsystem's UI-free files stay covered without linking the whole app.

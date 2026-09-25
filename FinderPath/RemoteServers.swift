@@ -524,4 +524,33 @@ nonisolated enum ShellCommand {
             return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
         }
     }
+
+    /// Quotes text typed into whatever login shell the user runs, so sh,
+    /// bash, zsh, fish, and tcsh all read back the same value. Ordinary
+    /// characters go inside single quotes. The three that one of those shells
+    /// still treats specially there (`'`, fish's `\`, and tcsh's history `!`)
+    /// are backslash-escaped outside the quotes, where all of them read `\x`
+    /// as a literal x. Scalars, not Characters, are scanned so a combining
+    /// mark cannot hide a quote. tcsh still rejects a newline inside quotes.
+    static func portableArgument(_ value: String) -> String {
+        guard !value.isEmpty else { return "''" }
+        var quoted = ""
+        var run = String.UnicodeScalarView()
+        func closeRun() {
+            guard !run.isEmpty else { return }
+            quoted += "'\(String(run))'"
+            run = String.UnicodeScalarView()
+        }
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "'", "\\", "!":
+                closeRun()
+                quoted += "\\\(scalar)"
+            default:
+                run.append(scalar)
+            }
+        }
+        closeRun()
+        return quoted
+    }
 }
