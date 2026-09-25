@@ -110,7 +110,9 @@ NO_STAT_TEST_BINARY="$BUILD_DIR/RecentPathsNoStatTests"
 DYLD_INSERT_LIBRARIES="$PROBE_COUNTER_LIBRARY" "$NO_STAT_TEST_BINARY"
 
 # Terminal emulator logic tests build as a second binary so the terminal
-# subsystem's UI-free files stay covered without linking the whole app.
+# subsystem stays covered without linking the whole app. TerminalView (and the
+# preferences it reads) is included so its keyboard and input-method client
+# can be driven directly.
 TERMINAL_TEST_BINARY="$BUILD_DIR/FinderPathTerminalTests"
 TERMINAL_SRCS=()
 for CANDIDATE in \
@@ -121,7 +123,11 @@ for CANDIDATE in \
   "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
   "$ROOT_DIR/FinderPath/Terminal/PTYProcess.swift" \
   "$ROOT_DIR/FinderPath/Terminal/TerminalSession.swift" \
-  "$ROOT_DIR/FinderPath/Terminal/TerminalSessionStore.swift"; do
+  "$ROOT_DIR/FinderPath/Terminal/TerminalSessionStore.swift" \
+  "$ROOT_DIR/FinderPath/Preferences.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalView.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalViewSelection.swift" \
+  "$ROOT_DIR/FinderPath/Terminal/TerminalViewTextInput.swift"; do
   [[ -f "$CANDIDATE" ]] && TERMINAL_SRCS+=("$CANDIDATE")
 done
 

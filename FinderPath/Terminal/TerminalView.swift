@@ -7,7 +7,8 @@ import CoreText
 // TerminalInputEncoder into the session. PTY-driven redraws are coalesced to
 // roughly 60 fps with a dirty flag checked by a main-queue timer that only
 // runs while a session is attached and the view's window is actually on
-// screen. Mouse selection and copy live in TerminalViewSelection.swift.
+// screen. Mouse selection and copy live in TerminalViewSelection.swift;
+// input-method composition lives in TerminalViewTextInput.swift.
 
 final class TerminalView: NSView {
     private static let defaultFontSize: CGFloat = 12
@@ -79,6 +80,7 @@ final class TerminalView: NSView {
             viewportAnchor = nil
             anchoredScreenGeneration = session?.screenGeneration ?? 0
             clearSelection()
+            discardMarkedText()
             // Grid de-duplication is per attached session. Reset it so the new
             // session receives this view's real geometry exactly once.
             lastPushedGrid = (rows: 0, columns: 0)
@@ -134,6 +136,13 @@ final class TerminalView: NSView {
     var selectionAnchor: TerminalSelectionPoint?
     var selectionHead: TerminalSelectionPoint?
     var hasActiveSelection = false
+
+    /// Uncommitted input-method text, drawn over the cursor and managed by
+    /// the NSTextInputClient methods in TerminalViewTextInput.swift.
+    var markedText = TerminalMarkedText()
+    /// The event interpretKeyEvents is processing, so a key the input method
+    /// hands back through doCommand(by:) keeps its terminal encoding.
+    private var interpretingKeyEvent: NSEvent?
 
     private var screenDirty = false
     private var redrawTimer: DispatchSourceTimer?
@@ -356,6 +365,7 @@ final class TerminalView: NSView {
         }
 
         drawCursorIfNeeded(screen: screen, offset: offset, context: context)
+        drawMarkedTextIfNeeded(screen: screen, offset: offset, context: context)
         drawStatusBannerIfNeeded(status: session.status)
     }
 
@@ -461,7 +471,7 @@ final class TerminalView: NSView {
 
     /// CTLineDraw in a flipped view needs a mirrored text matrix; the text
     /// position is the baseline measured from the row's top edge.
-    private func drawLine(_ attributed: NSAttributedString, atX x: CGFloat, rowTop: CGFloat, context: CGContext) {
+    func drawLine(_ attributed: NSAttributedString, atX x: CGFloat, rowTop: CGFloat, context: CGContext) {
         let line = CTLineCreateWithAttributedString(attributed)
         context.saveGState()
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
@@ -493,15 +503,12 @@ final class TerminalView: NSView {
 
     /// Block cursor: the cell inverted (textColor fill, glyph redrawn in the
     /// background color). Hidden while scrolled back or unfocused so stale
-    /// cursors never mislead.
+    /// cursors never mislead, and while composing, where the marked text
+    /// overlay draws its own caret.
     private func drawCursorIfNeeded(screen: TerminalScreen, offset: Int, context: CGContext) {
-        guard offset == 0, screen.cursorVisible, window?.firstResponder === self else { return }
-        let rect = NSRect(
-            x: CGFloat(screen.cursorColumn) * metrics.cellWidth,
-            y: CGFloat(screen.cursorRow) * metrics.cellHeight,
-            width: metrics.cellWidth,
-            height: metrics.cellHeight
-        )
+        guard offset == 0, screen.cursorVisible, !markedText.isActive,
+              window?.firstResponder === self else { return }
+        let rect = cursorCellRect(screen: screen)
         NSColor.textColor.setFill()
         rect.fill()
 
@@ -513,6 +520,16 @@ final class TerminalView: NSView {
         ]
         let glyph = NSAttributedString(string: String(cell.character), attributes: attributes)
         drawLine(glyph, atX: rect.minX, rowTop: rect.minY, context: context)
+    }
+
+    /// The live grid's cursor cell in view coordinates.
+    func cursorCellRect(screen: TerminalScreen) -> NSRect {
+        NSRect(
+            x: CGFloat(screen.cursorColumn) * metrics.cellWidth,
+            y: CGFloat(screen.cursorRow) * metrics.cellHeight,
+            width: metrics.cellWidth,
+            height: metrics.cellHeight
+        )
     }
 
     private func drawStatusBannerIfNeeded(status: TerminalSession.Status) {
@@ -597,9 +614,10 @@ final class TerminalView: NSView {
         anchoredScreenGeneration = session.screenGeneration
         viewportAnchor = nil
         clearSelection()
+        discardMarkedText()
     }
 
-    private func snapToLiveGrid() {
+    func snapToLiveGrid() {
         guard viewportAnchor != nil else { return }
         viewportAnchor = nil
         needsDisplay = true
@@ -619,108 +637,91 @@ final class TerminalView: NSView {
         return super.resignFirstResponder()
     }
 
+    /// Keys with a terminal encoding (Return, arrows, Control and Meta
+    /// combinations) are sent directly. Plain text and dead keys go through
+    /// the input method so accents, CJK composition, the emoji picker, and
+    /// dictation work; while a composition is open it receives every key.
     override func keyDown(with event: NSEvent) {
-        guard let session else {
+        guard session != nil else {
             super.keyDown(with: event)
             return
         }
+        let route = TerminalInputEncoder.route(
+            Self.keyPress(for: event),
+            optionAsMeta: FinderPathPreferences.terminalOptionAsMeta,
+            isComposing: markedText.isActive
+        )
+        perform(route, for: event)
+    }
 
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if modifiers.contains(.command) {
-            switch event.charactersIgnoringModifiers?.lowercased() {
-            case "c":
-                copySelection()
-            case "v":
-                snapToLiveGrid()
-                pasteFromGeneralPasteboard()
-            default:
-                super.keyDown(with: event)
-            }
+    /// The input method hands back keys it does not compose, such as Return
+    /// after a dead key or an arrow. Each keeps exactly the encoding it has
+    /// without an input method, so no key is swallowed.
+    override func doCommand(by selector: Selector) {
+        guard let event = interpretingKeyEvent else {
+            NSSound.beep()
             return
         }
+        let route = TerminalInputEncoder.directRoute(
+            Self.keyPress(for: event),
+            optionAsMeta: FinderPathPreferences.terminalOptionAsMeta
+        )
+        perform(route, for: event)
+    }
 
+    private func perform(_ route: TerminalInputEncoder.KeyRoute, for event: NSEvent) {
         // Typing while scrolled back always snaps to the live grid.
-        snapToLiveGrid()
-
-        let optionAsMeta = FinderPathPreferences.terminalOptionAsMeta
-        let terminalModifiers = Self.terminalModifiers(from: modifiers, optionAsMeta: optionAsMeta)
-        if let special = Self.specialKey(forKeyCode: event.keyCode) {
-            session.send(special: special, modifiers: terminalModifiers)
-            return
+        if route != .commandShortcut {
+            snapToLiveGrid()
         }
-
-        if modifiers.contains(.control),
-           let character = event.charactersIgnoringModifiers?.first,
-           let bytes = TerminalInputEncoder.encodeControl(
-               character: character,
-               meta: optionAsMeta && modifiers.contains(.option)
-           ) {
-            session.send(bytes: bytes)
-            return
+        switch route {
+        case .inputMethod:
+            let outerEvent = interpretingKeyEvent
+            interpretingKeyEvent = event
+            defer { interpretingKeyEvent = outerEvent }
+            interpretKeyEvents([event])
+        case .commandShortcut:
+            performCommandShortcut(event)
+        case .special(let key, let modifiers):
+            session?.send(special: key, modifiers: modifiers)
+        case .bytes(let bytes):
+            session?.send(bytes: bytes)
+        case .text(let text, let meta):
+            session?.send(text: text, meta: meta)
+        case .unhandled:
+            super.keyDown(with: event)
         }
+    }
 
-        let usesMeta = optionAsMeta && modifiers.contains(.option)
-        let text = usesMeta ? event.charactersIgnoringModifiers : event.characters
-        if let text, !text.isEmpty, Self.isPrintable(text) {
-            session.send(text: text, meta: usesMeta)
-            return
+    private func performCommandShortcut(_ event: NSEvent) {
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "c":
+            copySelection()
+        case "v":
+            snapToLiveGrid()
+            pasteFromGeneralPasteboard()
+        default:
+            super.keyDown(with: event)
         }
+    }
 
-        super.keyDown(with: event)
+    private static func keyPress(for event: NSEvent) -> TerminalInputEncoder.KeyPress {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return TerminalInputEncoder.KeyPress(
+            specialKey: TerminalInputEncoder.specialKey(forKeyCode: event.keyCode),
+            characters: event.characters,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            shift: modifiers.contains(.shift),
+            option: modifiers.contains(.option),
+            control: modifiers.contains(.control),
+            command: modifiers.contains(.command),
+            isRepeat: event.isARepeat
+        )
     }
 
     private func pasteFromGeneralPasteboard() {
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
         session?.paste(text)
-    }
-
-    /// HIToolbox kVK_* virtual key codes for the non-character keys.
-    private static func specialKey(forKeyCode keyCode: UInt16) -> TerminalInputEncoder.SpecialKey? {
-        switch keyCode {
-        case 126: return .up
-        case 125: return .down
-        case 123: return .left
-        case 124: return .right
-        case 115: return .home
-        case 119: return .end
-        case 116: return .pageUp
-        case 121: return .pageDown
-        case 117: return .forwardDelete
-        case 53: return .escape
-        case 48: return .tab
-        case 36, 76: return .enter // return and keypad enter
-        case 51: return .backspace
-        case 122: return .function(1)
-        case 120: return .function(2)
-        case 99: return .function(3)
-        case 118: return .function(4)
-        case 96: return .function(5)
-        case 97: return .function(6)
-        case 98: return .function(7)
-        case 100: return .function(8)
-        case 101: return .function(9)
-        case 109: return .function(10)
-        case 103: return .function(11)
-        case 111: return .function(12)
-        default: return nil
-        }
-    }
-
-    private static func terminalModifiers(
-        from flags: NSEvent.ModifierFlags,
-        optionAsMeta: Bool
-    ) -> TerminalInputEncoder.Modifiers {
-        var result: TerminalInputEncoder.Modifiers = []
-        if flags.contains(.shift) { result.insert(.shift) }
-        if optionAsMeta, flags.contains(.option) { result.insert(.option) }
-        if flags.contains(.control) { result.insert(.control) }
-        return result
-    }
-
-    /// NSEvent encodes non-character keys in the Unicode private-use range
-    /// 0xF700-0xF8FF; those must never reach the shell as text.
-    private static func isPrintable(_ characters: String) -> Bool {
-        !characters.unicodeScalars.contains { (0xF700...0xF8FF).contains($0.value) }
     }
 }
 

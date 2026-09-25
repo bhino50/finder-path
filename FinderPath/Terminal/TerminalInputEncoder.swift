@@ -1,8 +1,9 @@
 import Foundation
 
-// Translates key events into the byte sequences a PTY expects. Pure logic —
-// no AppKit — so encoding rules stay testable with the dependency-free test
-// runner. Sequences target TERM=xterm-256color.
+// Translates key events into the byte sequences a PTY expects, and decides
+// which keys the input method sees first. Pure logic — no AppKit — so
+// encoding rules stay testable with the dependency-free test runner.
+// Sequences target TERM=xterm-256color.
 
 enum TerminalInputEncoder {
     struct Modifiers: OptionSet, Equatable, Sendable {
@@ -31,7 +32,36 @@ enum TerminalInputEncoder {
         case function(Int)
     }
 
+    /// The parts of a key event that decide its route, so the keyboard policy
+    /// stays testable without constructing NSEvents.
+    struct KeyPress: Equatable, Sendable {
+        var specialKey: SpecialKey?
+        var characters: String?
+        var charactersIgnoringModifiers: String?
+        var shift = false
+        var option = false
+        var control = false
+        var command = false
+        var isRepeat = false
+    }
+
+    /// Where TerminalView sends one key press.
+    enum KeyRoute: Equatable, Sendable {
+        /// interpretKeyEvents: the input method composes dead keys, CJK text,
+        /// and anything else before the result comes back as insertText.
+        case inputMethod
+        /// Command shortcuts belong to the view's copy/paste and the menus.
+        case commandShortcut
+        case special(SpecialKey, Modifiers)
+        case bytes([UInt8])
+        case text(String, meta: Bool)
+        /// No terminal encoding; the responder chain decides.
+        case unhandled
+    }
+
     private static let esc: UInt8 = 0x1B
+    private static let carriageReturn: UInt8 = 0x0D
+    private static let lineFeed: UInt8 = 0x0A
     /// CSI introducer, ESC [.
     private static let csi: [UInt8] = [0x1B, 0x5B]
     /// SS3 introducer, ESC O — used by application cursor mode and F1-F4.
@@ -122,13 +152,117 @@ enum TerminalInputEncoder {
         return (meta ? [esc] : []) + [controlByte]
     }
 
+    // MARK: - Key routing
+
+    /// HIToolbox kVK_* virtual key codes for the non-character keys.
+    static func specialKey(forKeyCode keyCode: UInt16) -> SpecialKey? {
+        switch keyCode {
+        case 126: return .up
+        case 125: return .down
+        case 123: return .left
+        case 124: return .right
+        case 115: return .home
+        case 119: return .end
+        case 116: return .pageUp
+        case 121: return .pageDown
+        case 117: return .forwardDelete
+        case 53: return .escape
+        case 48: return .tab
+        case 36, 76: return .enter // return and keypad enter
+        case 51: return .backspace
+        case 122: return .function(1)
+        case 120: return .function(2)
+        case 99: return .function(3)
+        case 118: return .function(4)
+        case 96: return .function(5)
+        case 97: return .function(6)
+        case 98: return .function(7)
+        case 100: return .function(8)
+        case 101: return .function(9)
+        case 109: return .function(10)
+        case 103: return .function(11)
+        case 111: return .function(12)
+        default: return nil
+        }
+    }
+
+    /// A composition in progress owns every key, so Return commits, Backspace
+    /// edits, Escape cancels, and arrows move through candidates. Otherwise
+    /// only keys that would be typed as plain text (including dead keys,
+    /// which report no characters yet) go to the input method; everything
+    /// with a terminal encoding keeps it. Auto-repeats of plain text stay
+    /// direct so a held key keeps repeating, as terminals expect, instead of
+    /// opening the press-and-hold accent picker.
+    static func route(_ key: KeyPress, optionAsMeta: Bool, isComposing: Bool) -> KeyRoute {
+        if isComposing { return .inputMethod }
+        let direct = directRoute(key, optionAsMeta: optionAsMeta)
+        switch direct {
+        case .text(_, meta: false) where !key.isRepeat:
+            return .inputMethod
+        case .unhandled where (key.characters ?? "").isEmpty:
+            return .inputMethod
+        default:
+            return direct
+        }
+    }
+
+    /// The encoding a key has without an input method. It is also the answer
+    /// when the input method hands a key back through doCommand(by:), so a
+    /// key it declines produces exactly the bytes it always has.
+    static func directRoute(_ key: KeyPress, optionAsMeta: Bool) -> KeyRoute {
+        if key.command { return .commandShortcut }
+        let meta = optionAsMeta && key.option
+        if let special = key.specialKey {
+            var modifiers: Modifiers = []
+            if key.shift { modifiers.insert(.shift) }
+            if meta { modifiers.insert(.option) }
+            if key.control { modifiers.insert(.control) }
+            return .special(special, modifiers)
+        }
+        if key.control,
+           let character = key.charactersIgnoringModifiers?.first,
+           let bytes = encodeControl(character: character, meta: meta) {
+            return .bytes(bytes)
+        }
+        let text = meta ? key.charactersIgnoringModifiers : key.characters
+        if let text, !text.isEmpty, isPrintable(text) {
+            return .text(text, meta: meta)
+        }
+        return .unhandled
+    }
+
+    /// NSEvent encodes non-character keys in the Unicode private-use range
+    /// 0xF700-0xF8FF; those must never reach the shell as text.
+    static func isPrintable(_ characters: String) -> Bool {
+        !characters.unicodeScalars.contains { (0xF700...0xF8FF).contains($0.value) }
+    }
+
     /// Strip every ESC byte from pasted text so hostile clipboard content
     /// cannot inject terminal control sequences. Bracketed-paste mode also
     /// wraps the sanitized content in ESC[200~ / ESC[201~.
     static func encodePaste(_ text: String, bracketed: Bool) -> [UInt8] {
-        let sanitized = Array(text.utf8).filter { $0 != esc }
+        let sanitized = pasteLineBreaksAsReturn(Array(text.utf8)).filter { $0 != esc }
         guard bracketed else { return sanitized }
         return csi + Array("200~".utf8) + sanitized + csi + Array("201~".utf8)
+    }
+
+    /// A pasted line break is the Return key, as in xterm and Terminal.app:
+    /// CRLF and lone LF both become CR. Raw LF is Ctrl-J, which nano and pico
+    /// bind to justify, and CRLF would otherwise arrive as two line breaks.
+    private static func pasteLineBreaksAsReturn(_ bytes: [UInt8]) -> [UInt8] {
+        var result: [UInt8] = []
+        result.reserveCapacity(bytes.count)
+        var previous: UInt8?
+        for byte in bytes {
+            if byte != lineFeed {
+                result.append(byte)
+            } else if previous != carriageReturn {
+                // A CRLF pair's CR is already in the output.
+                result.append(carriageReturn)
+            }
+            previous = byte
+        }
+        return result
     }
 
     // MARK: - Sequence builders
@@ -212,5 +346,55 @@ enum TerminalInputEncoder {
         case 12: return tildeSequence(code: 24)
         default: return []
         }
+    }
+}
+
+/// Input-method composition state behind TerminalView's NSTextInputClient
+/// conformance. Marked text is drawn over the cursor but never enters the
+/// screen model or the PTY; only committed text reaches the shell. The
+/// terminal exposes no editable document, so the marked text is the whole
+/// addressable range, measured in UTF-16 units as AppKit expects.
+struct TerminalMarkedText: Sendable {
+    private(set) var text = ""
+    /// Caret or selection inside `text`, as the input method requested.
+    private(set) var selection = NSRange(location: 0, length: 0)
+
+    var isActive: Bool { !text.isEmpty }
+
+    /// {NSNotFound, 0} when nothing is marked, per NSTextInputClient.
+    var markedRange: NSRange {
+        isActive
+            ? NSRange(location: 0, length: text.utf16.count)
+            : NSRange(location: NSNotFound, length: 0)
+    }
+
+    var selectedRange: NSRange {
+        isActive ? selection : NSRange(location: 0, length: 0)
+    }
+
+    /// setMarkedText: replaces the composition. An empty string is how input
+    /// methods cancel one, so it ends composition without sending anything.
+    mutating func mark(_ newText: String, selectedRange: NSRange) {
+        text = newText
+        let length = newText.utf16.count
+        let location = min(max(selectedRange.location, 0), length)
+        selection = NSRange(
+            location: location,
+            length: min(max(selectedRange.length, 0), length - location)
+        )
+    }
+
+    /// unmarkText: accepts the composition as typed and returns it for the
+    /// shell; empty when nothing was marked.
+    mutating func unmark() -> String {
+        let accepted = text
+        discard()
+        return accepted
+    }
+
+    /// Ends the composition without sending it.
+    mutating func discard() {
+        text = ""
+        selection = NSRange(location: 0, length: 0)
     }
 }

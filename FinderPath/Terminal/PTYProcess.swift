@@ -214,8 +214,9 @@ nonisolated final class PTYProcess: @unchecked Sendable {
         try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, 0, 1), "dup stdout")
         try Self.checkSetup(posix_spawn_file_actions_adddup2(&fileActions, 0, 2), "dup stderr")
         if replica > 2 {
-            // The parent's replica fd is inherited at spawn; the child does not
-            // need it since it opens the tty by path, so close it there too.
+            // POSIX_SPAWN_CLOEXEC_DEFAULT below already keeps the parent's
+            // replica out of the child, which opens the tty by path; closing
+            // it explicitly keeps that true independently of the spawn flags.
             try Self.checkSetup(posix_spawn_file_actions_addclose(&fileActions, replica), "close inherited replica")
         }
         try Self.checkSetup(
@@ -228,7 +229,14 @@ nonisolated final class PTYProcess: @unchecked Sendable {
             throw LaunchError(message: "posix_spawnattr_init failed")
         }
         defer { posix_spawnattr_destroy(&attributes) }
-        try Self.checkSetup(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID)), "set SETSID")
+        // The shell receives only the terminal the file actions above install
+        // as 0-2. Any other inheritable app descriptor (such as the write end
+        // of a Pipe a concurrent Finder query is reading) would otherwise live
+        // as long as the shell and keep that reader from ever seeing EOF.
+        try Self.checkSetup(
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)),
+            "set SETSID and CLOEXEC_DEFAULT"
+        )
 
         var argv = ([executable] + arguments).map { strdup($0) }
         argv.append(nil)
