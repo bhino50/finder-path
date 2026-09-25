@@ -229,6 +229,112 @@ struct FinderPathLogicTests {
             )
             expect(waiter.status == 1, "the real relaunch waiter expires when the original process stays alive")
             expect(Date().timeIntervalSince(waiterStart) < 2, "a cancelled app termination cannot leave a permanent relaunch helper")
+
+            // Retired bundles stay until a newer FinderPath launches from the
+            // same folder. That launch trashes only exact updater leftovers
+            // proven to be FinderPath copies no newer than itself.
+            func makeBundle(_ url: URL, identifier: String = UpdateInstaller.expectedBundleID, version: String) throws {
+                let contents = url.appendingPathComponent("Contents")
+                try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+                try PropertyListSerialization.data(
+                    fromPropertyList: ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version],
+                    format: .xml,
+                    options: 0
+                ).write(to: contents.appendingPathComponent("Info.plist"))
+            }
+            func retiredName(_ uuid: String = UUID().uuidString) -> String { ".FinderPath.app.old-\(uuid)" }
+
+            let cleanupCase = try makeUpdateCase("leftover-cleanup")
+            let cleanupApp = cleanupCase.appendingPathComponent("FinderPath.app")
+            try makeBundle(cleanupApp, version: "1.9.1")
+            for version in ["1.9.2", "1.9.3"] {
+                let source = updateFixtures.appendingPathComponent("source-\(version).app")
+                try makeBundle(source, version: version)
+                try UpdateInstaller.stageAndReplaceApp(
+                    at: cleanupApp,
+                    with: source,
+                    prepareStagedApp: { try FileManager.default.copyItem(at: $0, to: $1) },
+                    scheduleRelaunch: { _ in }
+                )
+            }
+            let retiredByUpdates = try FileManager.default.contentsOfDirectory(atPath: cleanupCase.path)
+                .filter { $0.hasPrefix(".FinderPath.app.old-") }
+            expect(retiredByUpdates.count == 2, "each in-app update keeps the previous bundle beside the app")
+
+            let lowercaseRetired = retiredName(UUID().uuidString.lowercased())
+            try makeBundle(cleanupCase.appendingPathComponent(lowercaseRetired), version: "1.9.1")
+            let keptNames = [
+                "newer": retiredName(), "foreign": retiredName(), "running": retiredName(),
+                "malformed": ".FinderPath.app.old-12345", "failed": ".FinderPath.app.failed-\(UUID().uuidString)",
+                "staging": ".FinderPathUpdate-\(UUID().uuidString)", "untrashable": retiredName(),
+                "linked": retiredName(), "linkedPlist": retiredName(),
+            ]
+            let keptURL = keptNames.mapValues { cleanupCase.appendingPathComponent($0) }
+            try makeBundle(keptURL["newer"]!, version: "2.0")
+            try makeBundle(keptURL["foreign"]!, identifier: "com.example.Other", version: "1.0")
+            for key in ["running", "malformed", "failed", "untrashable"] {
+                try makeBundle(keptURL[key]!, version: "1.0")
+            }
+            try FileManager.default.createDirectory(at: keptURL["staging"]!, withIntermediateDirectories: false)
+            let externalBundle = updateFixtures.appendingPathComponent("external.app")
+            try makeBundle(externalBundle, version: "1.0")
+            try FileManager.default.createSymbolicLink(at: keptURL["linked"]!, withDestinationURL: externalBundle)
+            try FileManager.default.createDirectory(at: keptURL["linkedPlist"]!.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(
+                at: keptURL["linkedPlist"]!.appendingPathComponent("Contents/Info.plist"),
+                withDestinationURL: externalBundle.appendingPathComponent("Contents/Info.plist")
+            )
+
+            let fixtureTrash = updateFixtures.appendingPathComponent("Trash")
+            try FileManager.default.createDirectory(at: fixtureTrash, withIntermediateDirectories: false)
+            func moveToFixtureTrash(_ item: URL) throws {
+                if item.lastPathComponent == keptNames["untrashable"] { throw simulatedFailure }
+                try FileManager.default.moveItem(at: item, to: fixtureTrash.appendingPathComponent(item.lastPathComponent))
+            }
+            func runCleanup(identifier: String? = UpdateInstaller.expectedBundleID, app: URL = cleanupApp) -> [String] {
+                UpdateLeftoverCleanup.run(
+                    runningApp: app,
+                    runningBundleIdentifier: identifier,
+                    runningVersion: "1.9.3",
+                    runningBundlePaths: [keptURL["running"]!.standardizedFileURL.path],
+                    trash: moveToFixtureTrash
+                )
+            }
+
+            expect(runCleanup(identifier: "io.github.bhino50.FinderPathDev").isEmpty, "a development build never cleans the folder it runs from")
+            expect(runCleanup(app: cleanupCase.appendingPathComponent("Other.app")).isEmpty, "only a host named FinderPath.app cleans its folder")
+            var trashedDuringInstall = ["not run"]
+            let gateWasFree = UpdateInstaller.performExclusively { trashedDuringInstall = runCleanup() }
+            expect(gateWasFree && trashedDuringInstall.isEmpty, "cleanup never races an update installation")
+
+            let trashed = runCleanup()
+            expect(Set(trashed) == Set(retiredByUpdates + [lowercaseRetired]), "retired FinderPath bundles no newer than the running app are trashed")
+            let trashedEntries = try FileManager.default.contentsOfDirectory(atPath: fixtureTrash.path)
+            expect(Set(trashedEntries) == Set(trashed), "cleanup trashes exactly the bundles it reports")
+            for (reason, url) in keptURL {
+                expect(
+                    (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+                        || FileManager.default.fileExists(atPath: url.path),
+                    "cleanup keeps the \(reason) leftover"
+                )
+            }
+            expect(FileManager.default.fileExists(atPath: externalBundle.path), "cleanup never follows a link out of the app folder")
+            expect(FileManager.default.fileExists(atPath: cleanupApp.appendingPathComponent("Contents/Info.plist").path), "cleanup never touches the running app")
+
+            let boundCase = try makeUpdateCase("leftover-cleanup-bound")
+            let boundApp = boundCase.appendingPathComponent("FinderPath.app")
+            try makeBundle(boundApp, version: "2.0")
+            for _ in 0..<10 {
+                try makeBundle(boundCase.appendingPathComponent(retiredName()), version: "1.0")
+            }
+            let boundedRun = UpdateLeftoverCleanup.run(
+                runningApp: boundApp,
+                runningBundleIdentifier: UpdateInstaller.expectedBundleID,
+                runningVersion: "2.0",
+                runningBundlePaths: [],
+                trash: { try FileManager.default.removeItem(at: $0) }
+            )
+            expect(boundedRun.count == 8, "one launch trashes a bounded number of retired bundles")
         } catch {
             expect(false, "updater fixture setup or verification failed: \(error.localizedDescription)")
         }
@@ -273,6 +379,80 @@ struct FinderPathLogicTests {
             }
         } catch {
             expect(false, "archive fixture setup or verification failed: \(error.localizedDescription)")
+        }
+
+        // hdiutil attach exits while a helper it started keeps serving the
+        // mounted volume. The installer copies the app out afterwards, so the
+        // runner's post-exit cleanup must leave that helper alone.
+        do {
+            let imageFixtures = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FinderPathDiskImageTests-\(UUID().uuidString)")
+            let imageSource = imageFixtures.appendingPathComponent("source")
+            let image = imageFixtures.appendingPathComponent("update.dmg")
+            let work = imageFixtures.appendingPathComponent("work")
+            let mountPoints = [imageFixtures.appendingPathComponent("mount"), work.appendingPathComponent("mount")]
+            func runTool(_ arguments: [String]) -> Int32 {
+                let tool = Process()
+                tool.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                tool.arguments = arguments
+                tool.standardOutput = FileHandle.nullDevice
+                tool.standardError = FileHandle.nullDevice
+                guard (try? tool.run()) != nil else { return -1 }
+                tool.waitUntilExit()
+                return tool.terminationStatus
+            }
+            defer {
+                for mountPoint in mountPoints
+                where FileManager.default.fileExists(atPath: mountPoint.appendingPathComponent("FinderPath.app").path) {
+                    _ = runTool(["detach", mountPoint.path, "-force"])
+                }
+                try? FileManager.default.removeItem(at: imageFixtures)
+            }
+            let sourceContents = imageSource.appendingPathComponent("FinderPath.app/Contents")
+            try FileManager.default.createDirectory(at: sourceContents, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: sourceContents.appendingPathComponent("Info.plist"))
+
+            if runTool(["create", "-quiet", "-fs", "HFS+", "-format", "UDZO", "-srcfolder", imageSource.path, image.path]) != 0 {
+                print("Skipping disk-image update tests: hdiutil create is unavailable here.")
+            } else {
+                let attach = UpdateInstaller.run(
+                    "/usr/bin/hdiutil",
+                    ["attach", image.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mountPoints[0].path],
+                    timeout: 30,
+                    postExitDescendants: .preserve
+                )
+                if attach.status == 0 {
+                    expect(
+                        FileManager.default.fileExists(atPath: mountPoints[0].appendingPathComponent("FinderPath.app/Contents/Info.plist").path),
+                        "a preserved attach helper keeps the volume mounted after hdiutil exits"
+                    )
+                    let detach = UpdateInstaller.run("/usr/bin/hdiutil", ["detach", mountPoints[0].path, "-force"], timeout: 15)
+                    expect(detach.status == 0, "the preserved attach helper is torn down by detach")
+                } else {
+                    print("Skipping disk-image attach check: \(attach.errorOutput)")
+                }
+                do {
+                    let extracted = try UpdateInstaller.extractApp(from: image, into: work)
+                    expect(
+                        FileManager.default.fileExists(atPath: extracted.appendingPathComponent("Contents/Info.plist").path),
+                        "a disk-image update is copied out of its mounted volume"
+                    )
+                    expect(
+                        !FileManager.default.fileExists(atPath: mountPoints[1].appendingPathComponent("FinderPath.app").path),
+                        "disk-image extraction detaches its temporary volume"
+                    )
+                } catch {
+                    // Only a host that also refuses a plain attach may skip.
+                    if runTool(["attach", image.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mountPoints[0].path]) != 0 {
+                        print("Skipping disk-image update tests: hdiutil attach is not permitted here.")
+                    } else {
+                        expect(false, "disk-image extraction failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        } catch {
+            expect(false, "disk-image fixture setup failed: \(error.localizedDescription)")
         }
 
         // Browser recovery is a typed trust decision. Only an operational
@@ -721,8 +901,28 @@ struct FinderPathLogicTests {
             !UpdateChecker.versionsAreEquivalent("1.7-dev", "1.7-de"),
             "a v inside a prerelease suffix must not be stripped during verification"
         )
-        // Ordering deliberately keeps ignoring suffixes.
-        expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "ordering still ignores prerelease suffixes")
+        // Ordering follows SemVer precedence: the numeric core decides first,
+        // prerelease identifiers only break a tie, build metadata never counts.
+        expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "a higher-core prerelease is still offered")
+        expect(UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3-rc.1"), "a prerelease user is offered the matching final release")
+        expect(UpdateChecker.compare("v1.9.3.0", isNewerThan: "1.9.3-RC.1"), "a padded final release outranks its prerelease")
+        expect(UpdateChecker.compare("1.9.3+build.7", isNewerThan: "1.9.3-rc.1"), "build metadata does not make a release a prerelease")
+        expect(UpdateChecker.compare("1.9.3-rc.2", isNewerThan: "1.9.3-rc.1"), "later prereleases of one core are ordered")
+        expect(UpdateChecker.compare("1.9.3-rc.10", isNewerThan: "1.9.3-rc.2"), "numeric prerelease identifiers compare numerically")
+        expect(UpdateChecker.compare("1.9.3-rc", isNewerThan: "1.9.3-beta.5"), "alphanumeric prerelease identifiers compare in ASCII order")
+        expect(UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3-rc"), "a longer prerelease with an equal prefix is newer")
+        expect(UpdateChecker.compare("1.9.3-alpha", isNewerThan: "1.9.3-1"), "numeric prerelease identifiers rank below alphanumeric ones")
+        expect(UpdateChecker.compare("1.9.3-rc.2+b1", isNewerThan: "1.9.3-rc.1+b9"), "build metadata is ignored when ordering prereleases")
+        expect(!UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3"), "a final-release user is never offered a prerelease of the same core")
+        expect(!UpdateChecker.compare("1.9.3-rc.9", isNewerThan: "1.9.3.0"), "a prerelease never outranks its padded final release")
+        expect(!UpdateChecker.compare("1.9.3-rc.2", isNewerThan: "1.9.3-rc.10"), "prerelease numbers are not compared as text")
+        expect(!UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3-rc.1"), "an identical prerelease is not an update")
+        expect(!UpdateChecker.compare("1.9.3-rc.01", isNewerThan: "1.9.3-rc.1"), "leading zeros do not change a numeric prerelease identifier")
+        expect(!UpdateChecker.compare("1.9.3+build.7", isNewerThan: "1.9.3"), "build metadata alone is not an update")
+        expect(!UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3+build.7"), "a release without build metadata is not an update")
+        expect(!UpdateChecker.compare("1.9.2", isNewerThan: "1.9.3-rc.1"), "the numeric core still decides before prerelease identifiers")
+        expect(UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.2"), "a prerelease of a higher core is newer than an older release")
+        expect(!UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3"), "an identical release is not an update")
 
         // A display name is stored in line-oriented `Name = target` text, so it
         // must survive the round trip rather than deleting or duplicating rows.

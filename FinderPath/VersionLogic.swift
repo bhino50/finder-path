@@ -1,6 +1,8 @@
 import Foundation
 
-enum AppVersion {
+// Update checks and installs finish on URLSession's background delegate
+// queue, so this logic is pure and free of main-actor isolation.
+nonisolated enum AppVersion {
     static var current: String {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String
@@ -22,7 +24,7 @@ enum AppVersion {
     }
 }
 
-struct UpdateManifest: Equatable {
+nonisolated struct UpdateManifest: Equatable, Sendable {
     let latestVersion: String
     let downloadURL: URL?
     // Direct .zip or .dmg asset suitable for in-app install; nil falls back
@@ -31,78 +33,20 @@ struct UpdateManifest: Equatable {
     let releaseNotes: String?
 }
 
-enum UpdateCheckResult {
+nonisolated enum UpdateCheckResult: Sendable {
     case upToDate(latest: String)
     case updateAvailable(manifest: UpdateManifest)
     case failed(message: String)
 }
 
-enum UpdateChecker {
+nonisolated enum UpdateChecker {
     private static let maximumManifestSize: Int64 = 1_024 * 1_024
 
-    private final class ManifestSizeLimiter: NSObject, URLSessionDownloadDelegate {
-        private let maximumSize: Int64
-        private let lock = NSLock()
-        private var exceeded = false
-        private var rejectedRedirect = false
-
-        init(maximumSize: Int64) {
-            self.maximumSize = maximumSize
-        }
-
-        var didExceedLimit: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return exceeded
-        }
-
-        var didRejectRedirect: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return rejectedRedirect
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            task: URLSessionTask,
-            willPerformHTTPRedirection response: HTTPURLResponse,
-            newRequest request: URLRequest,
-            completionHandler: @escaping (URLRequest?) -> Void
-        ) {
-            guard let url = request.url, UpdateChecker.isHTTPSWebURL(url) else {
-                lock.lock()
-                rejectedRedirect = true
-                lock.unlock()
-                completionHandler(nil)
-                return
-            }
-            completionHandler(request)
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didWriteData bytesWritten: Int64,
-            totalBytesWritten: Int64,
-            totalBytesExpectedToWrite: Int64
-        ) {
-            guard totalBytesWritten > maximumSize || totalBytesExpectedToWrite > maximumSize else {
-                return
-            }
-            lock.lock()
-            exceeded = true
-            lock.unlock()
-            downloadTask.cancel()
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didFinishDownloadingTo location: URL
-        ) {}
-    }
-
-    static func check(manifestURL: String, completion: @escaping (UpdateCheckResult) -> Void) {
+    static func check(
+        manifestURL: String,
+        configuration: URLSessionConfiguration? = nil,
+        completion: @escaping @Sendable (UpdateCheckResult) -> Void
+    ) {
         let trimmed = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed), isHTTPSWebURL(url) else {
             completion(.failed(message: "The update manifest URL must be an HTTPS URL."))
@@ -122,79 +66,74 @@ enum UpdateChecker {
         // the request negotiates over TCP. The shared session's cached HTTP/3
         // mappings make it attempt QUIC, which stalls for the full timeout on
         // networks that silently drop UDP 443.
-        let sizeLimiter = ManifestSizeLimiter(maximumSize: maximumManifestSize)
-        let configuration = URLSessionConfiguration.ephemeral
+        let configuration = configuration ?? URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 30
-        let session = URLSession(
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FinderPathManifest-\(UUID().uuidString).json")
+        SizeLimitedDownload.start(
+            request: request,
             configuration: configuration,
-            delegate: sizeLimiter,
-            delegateQueue: nil
-        )
-        session.downloadTask(with: request) { location, response, error in
-            defer { session.finishTasksAndInvalidate() }
-            if sizeLimiter.didRejectRedirect {
-                completion(.failed(message: "The update manifest redirected to an unsafe location."))
-                return
-            }
-            if let error {
-                if sizeLimiter.didExceedLimit {
-                    completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
-                    return
-                }
-                completion(.failed(message: "Could not reach the update server: \(error.localizedDescription)"))
-                return
-            }
+            maximumSize: maximumManifestSize,
+            destination: destination
+        ) { outcome in
+            defer { try? FileManager.default.removeItem(at: destination) }
+            completion(checkResult(from: outcome))
+        }
+    }
 
-            guard let http = response as? HTTPURLResponse else {
-                completion(.failed(message: "The update server returned an invalid response."))
-                return
-            }
-            guard (200...299).contains(http.statusCode) else {
-                completion(.failed(message: "Update server returned HTTP \(http.statusCode)."))
-                return
-            }
-            guard let finalURL = http.url, isHTTPSWebURL(finalURL) else {
-                completion(.failed(message: "The update manifest redirected to a non-HTTPS location."))
-                return
-            }
-            guard http.expectedContentLength <= maximumManifestSize else {
-                completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
-                return
-            }
+    private static func checkResult(from outcome: SizeLimitedDownload.Outcome) -> UpdateCheckResult {
+        let sizeLimitMessage = "The update manifest exceeded the 1 MB safety limit."
+        if outcome.rejectedRedirect {
+            return .failed(message: "The update manifest redirected to an unsafe location.")
+        }
+        // Cancelling an oversized transfer also reports an error; the limit
+        // is the cause worth showing.
+        if outcome.exceededLimit {
+            return .failed(message: sizeLimitMessage)
+        }
+        if let error = outcome.error {
+            return .failed(message: "Could not reach the update server: \(error.localizedDescription)")
+        }
 
-            guard let location else {
-                completion(.failed(message: "Update server returned no data."))
-                return
-            }
+        guard let http = outcome.response as? HTTPURLResponse else {
+            return .failed(message: "The update server returned an invalid response.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            return .failed(message: "Update server returned HTTP \(http.statusCode).")
+        }
+        guard let finalURL = http.url, isHTTPSWebURL(finalURL) else {
+            return .failed(message: "The update manifest redirected to a non-HTTPS location.")
+        }
+        guard http.expectedContentLength <= maximumManifestSize else {
+            return .failed(message: sizeLimitMessage)
+        }
 
-            let responseSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                .map(Int64.init) ?? 0
-            guard responseSize > 0 else {
-                completion(.failed(message: "Update server returned no data."))
-                return
-            }
-            guard responseSize <= maximumManifestSize else {
-                completion(.failed(message: "The update manifest exceeded the 1 MB safety limit."))
-                return
-            }
-            guard let data = try? Data(contentsOf: location, options: .mappedIfSafe) else {
-                completion(.failed(message: "Could not read the update manifest."))
-                return
-            }
+        guard let location = outcome.fileURL else {
+            return .failed(message: "Update server returned no data.")
+        }
 
-            guard let manifest = parseManifest(data) else {
-                completion(.failed(message: "Could not parse the update manifest. Expected JSON with a version field."))
-                return
-            }
+        let responseSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map(Int64.init) ?? 0
+        guard responseSize > 0 else {
+            return .failed(message: "Update server returned no data.")
+        }
+        guard responseSize <= maximumManifestSize else {
+            return .failed(message: sizeLimitMessage)
+        }
+        guard let data = try? Data(contentsOf: location, options: .mappedIfSafe) else {
+            return .failed(message: "Could not read the update manifest.")
+        }
 
-            let current = AppVersion.shortVersionString
-            if compare(manifest.latestVersion, isNewerThan: current) {
-                completion(.updateAvailable(manifest: manifest))
-            } else {
-                completion(.upToDate(latest: manifest.latestVersion))
-            }
-        }.resume()
+        guard let manifest = parseManifest(data) else {
+            return .failed(message: "Could not parse the update manifest. Expected JSON with a version field.")
+        }
+
+        let current = AppVersion.shortVersionString
+        if compare(manifest.latestVersion, isNewerThan: current) {
+            return .updateAvailable(manifest: manifest)
+        }
+        return .upToDate(latest: manifest.latestVersion)
     }
 
     static func parseManifest(_ data: Data) -> UpdateManifest? {
@@ -261,21 +200,63 @@ enum UpdateChecker {
         )
     }
 
+    /// Release ordering follows SemVer 2.0.0 precedence: the dotted numeric
+    /// core decides first; with an equal core a release outranks each of its
+    /// prereleases, and build metadata ("+...") never affects ordering.
     static func compare(_ candidate: String, isNewerThan installed: String) -> Bool {
         guard let candidate = parsedVersion(candidate),
               let installed = parsedVersion(installed) else { return false }
-        let lhs = candidate.components
-        let rhs = installed.components
-        let length = max(lhs.count, rhs.count)
+        let coreOrder = compareCores(candidate.components, installed.components)
+        if coreOrder != .orderedSame { return coreOrder == .orderedDescending }
+        return comparePrereleases(candidate.prereleaseIdentifiers, installed.prereleaseIdentifiers)
+            == .orderedDescending
+    }
 
-        for index in 0..<length {
+    /// Compares normalized decimal strings without converting to Int, so an
+    /// oversized component keeps its numeric order.
+    private static func compareDecimal(_ lhs: Substring, _ rhs: Substring) -> ComparisonResult {
+        if lhs.count != rhs.count { return lhs.count > rhs.count ? .orderedDescending : .orderedAscending }
+        if lhs == rhs { return .orderedSame }
+        return lhs > rhs ? .orderedDescending : .orderedAscending
+    }
+
+    private static func compareCores(_ lhs: [String], _ rhs: [String]) -> ComparisonResult {
+        for index in 0..<max(lhs.count, rhs.count) {
             let l = index < lhs.count ? lhs[index] : "0"
             let r = index < rhs.count ? rhs[index] : "0"
-            if l.count != r.count { return l.count > r.count }
-            if l != r { return l > r }
+            let order = compareDecimal(Substring(l), Substring(r))
+            if order != .orderedSame { return order }
         }
+        return .orderedSame
+    }
 
-        return false
+    private static func comparePrereleases(_ lhs: [Substring], _ rhs: [Substring]) -> ComparisonResult {
+        switch (lhs.isEmpty, rhs.isEmpty) {
+        case (true, true): return .orderedSame
+        case (true, false): return .orderedDescending
+        case (false, true): return .orderedAscending
+        case (false, false): break
+        }
+        for (l, r) in zip(lhs, rhs) {
+            let order: ComparisonResult
+            switch (isNumericIdentifier(l), isNumericIdentifier(r)) {
+            case (true, true):
+                order = compareDecimal(l.drop { $0 == "0" }, r.drop { $0 == "0" })
+            case (true, false):
+                order = .orderedAscending
+            case (false, true):
+                order = .orderedDescending
+            case (false, false):
+                order = l == r ? .orderedSame : (l > r ? .orderedDescending : .orderedAscending)
+            }
+            if order != .orderedSame { return order }
+        }
+        if lhs.count == rhs.count { return .orderedSame }
+        return lhs.count > rhs.count ? .orderedDescending : .orderedAscending
+    }
+
+    private static func isNumericIdentifier(_ identifier: Substring) -> Bool {
+        !identifier.isEmpty && identifier.utf8.allSatisfy { (48...57).contains($0) }
     }
 
     static func versionsAreEquivalent(_ lhs: String, _ rhs: String) -> Bool {
@@ -284,8 +265,9 @@ enum UpdateChecker {
         }
 
         // Verification must preserve the full suffix, while release ordering
-        // compares only the dotted numeric core. Suffix numbers must never
-        // become extra core components (for example, 1.9-rc.99 vs 1.9.1).
+        // uses the suffix only to break a tie between equal numeric cores.
+        // Suffix numbers must never become extra core components (for
+        // example, 1.9-rc.99 vs 1.9.1).
         guard lhs.suffix == rhs.suffix else { return false }
 
         let left = lhs.components
@@ -317,6 +299,15 @@ enum UpdateChecker {
     private struct ParsedVersion {
         let components: [String]
         let suffix: String
+
+        /// Dot-separated identifiers between a leading "-" and the first "+";
+        /// empty for a release and for a suffix that is only build metadata.
+        var prereleaseIdentifiers: [Substring] {
+            guard suffix.first == "-" else { return [] }
+            return suffix.dropFirst()
+                .prefix { $0 != "+" }
+                .split(separator: ".", omittingEmptySubsequences: false)
+        }
     }
 
     /// Keep decimal components as normalized strings. Converting to Int used

@@ -44,6 +44,15 @@ nonisolated enum BoundedProcessRunner {
         case stopped(reason: String, output: CapturedOutput)
     }
 
+    /// What happens to processes a command leaves behind after exiting on its
+    /// own. Timeouts and monitor stops always terminate the whole session.
+    enum PostExitDescendants: Equatable, Sendable {
+        case terminate
+        /// Only for a tool whose job is to start a helper that must outlive
+        /// it (`hdiutil attach`); the caller owns that helper's teardown.
+        case preserve
+    }
+
     private static let pipeDrainGrace: TimeInterval = 0.25
     private static let postKillObservationLimit: TimeInterval = 1
     private static let ownershipObservationInterval: TimeInterval = 0.025
@@ -69,6 +78,7 @@ nonisolated enum BoundedProcessRunner {
         executable: String,
         arguments: [String] = [],
         limits: Limits,
+        postExitDescendants: PostExitDescendants = .terminate,
         stopReason: () -> String?
     ) -> MonitoredOutcome {
         var reason: String?
@@ -76,6 +86,7 @@ nonisolated enum BoundedProcessRunner {
             executable: executable,
             arguments: arguments,
             limits: limits,
+            postExitDescendants: postExitDescendants,
             processSnapshotProvider: processSnapshot,
             shouldStop: {
                 reason = stopReason()
@@ -131,6 +142,7 @@ nonisolated enum BoundedProcessRunner {
         executable: String,
         arguments: [String],
         limits: Limits,
+        postExitDescendants: PostExitDescendants = .terminate,
         processSnapshotProvider: () -> ProcessSnapshot,
         shouldStop: () -> Bool = { false }
     ) -> Outcome {
@@ -242,13 +254,15 @@ nonisolated enum BoundedProcessRunner {
             // Keep observation bounded: the runner must return even if the
             // kernel/reaper path unexpectedly fails to report the leader.
             _ = didExit.wait(timeout: .now() + postKillObservationLimit)
-        } else if observedOwnedProcesses.values.contains(where: {
-            isCurrent($0, ledBy: processIdentifier)
-        }) {
+        } else if postExitDescendants == .terminate,
+                  observedOwnedProcesses.values.contains(where: {
+                      isCurrent($0, ledBy: processIdentifier)
+                  }) {
             // A command can exit after daemonizing a background process that
             // still owns the output pipes. BoundedProcessRunner owns the whole
             // private session, not just its leader, so no descendant is allowed
-            // to outlive an otherwise successful invocation.
+            // to outlive an otherwise successful invocation unless the caller
+            // explicitly preserves it.
             terminateOwnedProcesses(
                 ledBy: processIdentifier,
                 expectedLeaderIdentity: leaderIdentity,

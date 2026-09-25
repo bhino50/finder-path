@@ -21,7 +21,9 @@ TARGET="$(uname -m)-apple-macos13.0"
   "$ROOT_DIR/FinderPath/Preferences.swift" \
   "$ROOT_DIR/FinderPath/RecentPaths.swift" \
   "$ROOT_DIR/FinderPath/RemoteServers.swift" \
+  "$ROOT_DIR/FinderPath/SizeLimitedDownload.swift" \
   "$ROOT_DIR/FinderPath/UpdateInstaller.swift" \
+  "$ROOT_DIR/FinderPath/UpdateLeftoverCleanup.swift" \
   "$ROOT_DIR/FinderPath/VersionLogic.swift" \
   "$ROOT_DIR/Tests/LogicTests.swift" \
   -framework AppKit \
@@ -42,6 +44,25 @@ PROCESS_RUNNER_TEST_BINARY="$BUILD_DIR/BoundedProcessRunnerTests"
   -o "$PROCESS_RUNNER_TEST_BINARY"
 
 "$PROCESS_RUNNER_TEST_BINARY"
+
+# Update downloads stream from a URLProtocol stub, so size limits, redirects
+# and response checks are exercised without network access.
+UPDATE_DOWNLOAD_TEST_BINARY="$BUILD_DIR/UpdateDownloadTests"
+"$SWIFTC" \
+  -parse-as-library \
+  -O \
+  -target "$TARGET" \
+  "$ROOT_DIR/FinderPath/BoundedProcessRunner.swift" \
+  "$ROOT_DIR/FinderPath/Bridges.swift" \
+  "$ROOT_DIR/FinderPath/RemoteServers.swift" \
+  "$ROOT_DIR/FinderPath/SizeLimitedDownload.swift" \
+  "$ROOT_DIR/FinderPath/UpdateInstaller.swift" \
+  "$ROOT_DIR/FinderPath/VersionLogic.swift" \
+  "$ROOT_DIR/Tests/UpdateDownloadTests.swift" \
+  -framework AppKit \
+  -o "$UPDATE_DOWNLOAD_TEST_BINARY"
+
+"$UPDATE_DOWNLOAD_TEST_BINARY"
 
 # Launcher discovery must leave the main actor responsive and reject obsolete
 # asynchronous menu results when command preferences change.

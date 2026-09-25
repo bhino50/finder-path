@@ -157,6 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for url in launchURLs.prefix(PendingURLQueue.capacity) {
             actionRouter.handle(url: url)
         }
+
+        // An in-app update keeps the previous bundle until this launch.
+        UpdateLeftoverCleanup.scheduleAfterLaunch()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

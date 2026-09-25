@@ -7,7 +7,11 @@ import Darwin
 // verification pinned to the FinderPath Developer ID team, plus a
 // Gatekeeper assessment, before it replaces anything on disk. The
 // download URL is never trusted on its own.
-enum UpdateInstaller {
+//
+// Only `install`'s completion touches the main actor. Download, extraction,
+// verification and replacement run on URLSession's background delegate
+// queue, so the installer is nonisolated.
+nonisolated enum UpdateInstaller {
     static let appBundleName = "FinderPath.app"
     static let expectedBundleID = "io.github.bhino50.FinderPath"
     static let expectedTeamID = "VJPMCBH6NX"
@@ -39,73 +43,19 @@ enum UpdateInstaller {
         }
     }
 
+    /// Runs `body` only while no update is installing, so other work in the
+    /// app folder cannot race a replacement or its rollback. Returns false,
+    /// without running `body`, when an installation holds the gate.
+    static func performExclusively(_ body: () -> Void) -> Bool {
+        guard installationGate.begin() else { return false }
+        defer { installationGate.end() }
+        body()
+        return true
+    }
+
     enum BrowserRecoveryPolicy: Equatable {
         case unavailable
         case offerManifestDownload
-    }
-
-    /// Cancels an oversized update while bytes are still arriving. The final
-    /// file-size check remains as a second line of defense for responses whose
-    /// expected length is unknown or inaccurate.
-    private final class DownloadSizeLimiter: NSObject, URLSessionDownloadDelegate {
-        private let maximumSize: Int64
-        private let lock = NSLock()
-        private var exceeded = false
-        private var rejectedRedirect = false
-
-        init(maximumSize: Int64) {
-            self.maximumSize = maximumSize
-        }
-
-        var didExceedLimit: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return exceeded
-        }
-
-        var didRejectRedirect: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return rejectedRedirect
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            task: URLSessionTask,
-            willPerformHTTPRedirection response: HTTPURLResponse,
-            newRequest request: URLRequest,
-            completionHandler: @escaping (URLRequest?) -> Void
-        ) {
-            guard let url = request.url, UpdateChecker.isHTTPSWebURL(url) else {
-                lock.lock()
-                rejectedRedirect = true
-                lock.unlock()
-                completionHandler(nil)
-                return
-            }
-            completionHandler(request)
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didWriteData bytesWritten: Int64,
-            totalBytesWritten: Int64,
-            totalBytesExpectedToWrite: Int64
-        ) {
-            let knownLengthIsTooLarge = totalBytesExpectedToWrite > maximumSize
-            guard totalBytesWritten > maximumSize || knownLengthIsTooLarge else { return }
-            lock.lock()
-            exceeded = true
-            lock.unlock()
-            downloadTask.cancel()
-        }
-
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didFinishDownloadingTo location: URL
-        ) {}
     }
 
     enum InstallError: LocalizedError {
@@ -186,77 +136,25 @@ enum UpdateInstaller {
             }
             return
         }
-        let finish: (Result<Void, InstallError>) -> Void = { result in
+        let finish: @Sendable (Result<Void, InstallError>) -> Void = { result in
             installationGate.end()
             Task { @MainActor in completion(result) }
         }
 
-        // Ephemeral session for the same reason as UpdateChecker.check: no
-        // persisted HTTP/3 mappings, so the download cannot stall on networks
-        // that silently drop UDP 443 (QUIC).
-        let sizeLimiter = DownloadSizeLimiter(maximumSize: maximumArchiveSize)
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = commandTimeout
-        configuration.timeoutIntervalForResource = 5 * 60
-        let session = URLSession(
-            configuration: configuration,
-            delegate: sizeLimiter,
-            delegateQueue: nil
-        )
-        session.downloadTask(with: archiveURL) { location, response, error in
-            defer { session.finishTasksAndInvalidate() }
-            if sizeLimiter.didRejectRedirect {
-                finish(.failure(.downloadRejected("The update redirected to an unsafe location.")))
-                return
-            }
-            if let error {
-                if sizeLimiter.didExceedLimit {
-                    finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
-                    return
-                }
-                finish(.failure(classifyDownloadError(error)))
-                return
-            }
-            guard let httpResponse = response as? HTTPURLResponse else {
-                finish(.failure(.downloadRejected("The update server returned an invalid response.")))
-                return
-            }
-            guard (200...299).contains(httpResponse.statusCode) else {
-                finish(.failure(.downloadRejected("Update server returned HTTP \(httpResponse.statusCode).")))
-                return
-            }
-            guard let finalURL = httpResponse.url, UpdateChecker.isHTTPSWebURL(finalURL) else {
-                finish(.failure(.downloadRejected("The update redirected to a non-HTTPS location.")))
-                return
-            }
-            if httpResponse.expectedContentLength > maximumArchiveSize {
-                finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
-                return
-            }
-            guard let location else {
-                finish(.failure(.downloadRejected("No file was received.")))
-                return
-            }
-
-            let archiveSize = (try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                .map(Int64.init) ?? 0
-            guard archiveSize > 0 else {
-                finish(.failure(.downloadRejected("The update package was empty.")))
-                return
-            }
-            guard archiveSize <= maximumArchiveSize else {
-                finish(.failure(.downloadRejected("The update package exceeded the 256 MB safety limit.")))
-                return
-            }
-
+        let workDir: URL
+        do {
+            workDir = try makeWorkDirectory()
+        } catch {
+            finish(.failure(.installFailed(error.localizedDescription)))
+            return
+        }
+        let archiveFile = workDir.appendingPathComponent("update" + pathExtension(of: archiveURL))
+        // Extraction, verification and replacement continue on the download
+        // session's background delegate queue, never on the main actor.
+        downloadArchive(from: archiveURL, to: archiveFile, maximumSize: maximumArchiveSize) { downloaded in
+            defer { try? FileManager.default.removeItem(at: workDir) }
             do {
-                let workDir = try makeWorkDirectory()
-                defer { try? FileManager.default.removeItem(at: workDir) }
-
-                let archiveFile = workDir.appendingPathComponent("update" + pathExtension(of: archiveURL))
-                try FileManager.default.moveItem(at: location, to: archiveFile)
-
-                let newApp = try extractApp(from: archiveFile, into: workDir)
+                let newApp = try extractApp(from: downloaded.get(), into: workDir)
                 try verify(appAt: newApp, expectedVersion: manifest.latestVersion)
                 try swapAndScheduleRelaunch(newApp: newApp, expectedVersion: manifest.latestVersion)
                 finish(.success(()))
@@ -265,7 +163,77 @@ enum UpdateInstaller {
             } catch {
                 finish(.failure(.installFailed(error.localizedDescription)))
             }
-        }.resume()
+        }
+    }
+
+    /// Downloads an update package to `destination`, cancelling the transfer
+    /// once it grows past `maximumSize`. No file remains after a failure.
+    static func downloadArchive(
+        from archiveURL: URL,
+        to destination: URL,
+        maximumSize: Int64,
+        configuration: URLSessionConfiguration? = nil,
+        completion: @escaping @Sendable (Result<URL, InstallError>) -> Void
+    ) {
+        // Ephemeral session for the same reason as UpdateChecker.check: no
+        // persisted HTTP/3 mappings, so the download cannot stall on networks
+        // that silently drop UDP 443 (QUIC).
+        let configuration = configuration ?? URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = commandTimeout
+        configuration.timeoutIntervalForResource = 5 * 60
+        SizeLimitedDownload.start(
+            request: URLRequest(url: archiveURL),
+            configuration: configuration,
+            maximumSize: maximumSize,
+            destination: destination
+        ) { outcome in
+            let result = validatedArchive(outcome, maximumSize: maximumSize)
+            if case .failure = result { try? FileManager.default.removeItem(at: destination) }
+            completion(result)
+        }
+    }
+
+    private static func validatedArchive(
+        _ outcome: SizeLimitedDownload.Outcome,
+        maximumSize: Int64
+    ) -> Result<URL, InstallError> {
+        let sizeLimitMessage = "The update package exceeded the \(maximumSize / (1_024 * 1_024)) MB safety limit."
+        if outcome.rejectedRedirect {
+            return .failure(.downloadRejected("The update redirected to an unsafe location."))
+        }
+        // Cancelling an oversized transfer also reports an error; the limit
+        // is the cause worth showing.
+        if outcome.exceededLimit {
+            return .failure(.downloadRejected(sizeLimitMessage))
+        }
+        if let error = outcome.error {
+            return .failure(classifyDownloadError(error))
+        }
+        guard let httpResponse = outcome.response as? HTTPURLResponse else {
+            return .failure(.downloadRejected("The update server returned an invalid response."))
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            return .failure(.downloadRejected("Update server returned HTTP \(httpResponse.statusCode)."))
+        }
+        guard let finalURL = httpResponse.url, UpdateChecker.isHTTPSWebURL(finalURL) else {
+            return .failure(.downloadRejected("The update redirected to a non-HTTPS location."))
+        }
+        if httpResponse.expectedContentLength > maximumSize {
+            return .failure(.downloadRejected(sizeLimitMessage))
+        }
+        guard let archive = outcome.fileURL else {
+            return .failure(.downloadRejected("No file was received."))
+        }
+
+        let archiveSize = (try? archive.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map(Int64.init) ?? 0
+        guard archiveSize > 0 else {
+            return .failure(.downloadRejected("The update package was empty."))
+        }
+        guard archiveSize <= maximumSize else {
+            return .failure(.downloadRejected(sizeLimitMessage))
+        }
+        return .success(archive)
     }
 
     /// A Debug/no-Xcode bundle must never replace itself with a release bundle.
@@ -318,7 +286,7 @@ enum UpdateInstaller {
         url.pathExtension.lowercased() == "dmg" ? ".dmg" : ".zip"
     }
 
-    private static func extractApp(from archive: URL, into workDir: URL) throws -> URL {
+    static func extractApp(from archive: URL, into workDir: URL) throws -> URL {
         let extractDir = workDir.appendingPathComponent("extracted")
         try FileManager.default.createDirectory(
             at: extractDir,
@@ -369,7 +337,10 @@ enum UpdateInstaller {
                 "-nobrowse", "-readonly", "-noautoopen",
                 "-mountpoint", mountPoint.path
             ],
-            timeout: 30
+            timeout: 30,
+            // A successful attach leaves a helper serving the mounted volume
+            // after hdiutil exits. The detach calls here own its teardown.
+            postExitDescendants: .preserve
         )
         guard attach.status == 0 else {
             throw InstallError.extractionFailed(attach.errorOutput)
@@ -511,6 +482,7 @@ enum UpdateInstaller {
     /// The transaction is testable with temporary fixture directories. Keep
     /// the previous bundle available for recovery because scheduling a launch
     /// is not proof that Launch Services or the new app started successfully.
+    /// UpdateLeftoverCleanup moves it to the Trash after the next launch.
     @discardableResult
     static func replaceApp(
         at target: URL,
@@ -617,7 +589,8 @@ enum UpdateInstaller {
         _ executable: String,
         _ arguments: [String],
         timeout: TimeInterval = commandTimeout,
-        expansionRoot: URL? = nil
+        expansionRoot: URL? = nil,
+        postExitDescendants: BoundedProcessRunner.PostExitDescendants = .terminate
     ) -> CommandResult {
         var nextExpansionCheck = Date()
         let monitored = BoundedProcessRunner.runMonitored(
@@ -628,6 +601,7 @@ enum UpdateInstaller {
                 maximumStandardOutputBytes: 0,
                 maximumStandardErrorBytes: maximumCommandErrorBytes
             ),
+            postExitDescendants: postExitDescendants,
             stopReason: {
                 guard let expansionRoot, Date() >= nextExpansionCheck else { return nil }
                 nextExpansionCheck = Date().addingTimeInterval(0.25)

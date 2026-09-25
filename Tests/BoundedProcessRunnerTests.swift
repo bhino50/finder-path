@@ -33,6 +33,18 @@ struct BoundedProcessRunnerTests {
             runLateSessionChildExitFixture(pidFilePath: CommandLine.arguments[2])
         }
         if CommandLine.arguments.count == 3,
+           CommandLine.arguments[1] == "--daemonizing-helper-fixture" {
+            runDaemonizingHelperFixture(pidFilePath: CommandLine.arguments[2])
+        }
+        if CommandLine.arguments.count == 3,
+           CommandLine.arguments[1] == "--daemonizing-helper-middle" {
+            _exit(spawnFixtureMode("--daemonizing-helper", argument: CommandLine.arguments[2]) > 1 ? 0 : 94)
+        }
+        if CommandLine.arguments.count == 3,
+           CommandLine.arguments[1] == "--daemonizing-helper" {
+            runDaemonizingHelper(pidFilePath: CommandLine.arguments[2])
+        }
+        if CommandLine.arguments.count == 3,
            CommandLine.arguments[1] == "--setsid-child-worker",
            let readinessDescriptor = Int32(CommandLine.arguments[2]) {
             runSetsidChildWorker(readinessDescriptor: readinessDescriptor)
@@ -605,6 +617,77 @@ struct BoundedProcessRunnerTests {
             expect(false, "the daemonizing fixture returns an exited outcome")
         }
 
+        // hdiutil attach exits after starting a helper that briefly shares its
+        // session, then calls setsid() and must keep serving the mounted volume.
+        // Only an explicit .preserve lets that helper outlive a successful exit.
+        for policy in [BoundedProcessRunner.PostExitDescendants.terminate, .preserve] {
+            let pidFileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("finderpath-helper-\(UUID().uuidString).pids")
+            var helperIdentity: FixtureProcessIdentity?
+            defer {
+                if let helperIdentity { terminateFixtureProcessIfCurrent(helperIdentity) }
+                try? FileManager.default.removeItem(at: pidFileURL)
+            }
+            let helperOutcome = BoundedProcessRunner.runMonitored(
+                executable: CommandLine.arguments[0],
+                arguments: ["--daemonizing-helper-fixture", pidFileURL.path],
+                limits: .init(
+                    timeout: 5,
+                    terminationGrace: 0.2,
+                    maximumStandardOutputBytes: 1_024,
+                    maximumStandardErrorBytes: 1_024
+                ),
+                postExitDescendants: policy,
+                stopReason: { nil }
+            )
+            helperIdentity = readFixtureRecord(from: pidFileURL)?.leader
+            guard case .completed(.exited(0, _)) = helperOutcome, let helper = helperIdentity else {
+                expect(false, "the daemonizing helper fixture exits normally after starting its helper")
+                continue
+            }
+            if policy == .terminate {
+                expect(
+                    fixtureProcessDisappeared(helper),
+                    "default post-exit cleanup still ends a helper that later left the session"
+                )
+            } else {
+                usleep(300_000)
+                expect(
+                    getsid(helper.pid) == helper.pid && fixtureProcessIdentity(for: helper.pid) == helper,
+                    "a preserved helper outlives its successful leader"
+                )
+            }
+        }
+
+        let preservedTimeout = BoundedProcessRunner.runMonitored(
+            executable: "/bin/sh",
+            arguments: ["-c", "/bin/sleep 30 & printf '%s %s\\n' \"$$\" \"$!\"; wait"],
+            limits: .init(
+                timeout: 0.5,
+                terminationGrace: 0.1,
+                maximumStandardOutputBytes: 1_024,
+                maximumStandardErrorBytes: 1_024
+            ),
+            postExitDescendants: .preserve,
+            stopReason: { nil }
+        )
+        if case .completed(.timedOut(let output)) = preservedTimeout {
+            let processIDs = String(decoding: output.standardOutput, as: UTF8.self)
+                .split(whereSeparator: \.isWhitespace)
+                .compactMap { pid_t($0) }
+            expect(processIDs.count == 2, "the preserved-timeout fixture reports leader and child pids")
+            if processIDs.count == 2 {
+                let expectedIdentity = fixtureProcessIdentity(for: processIDs[1])
+                let disappeared = processDisappeared(processIDs[1])
+                expect(disappeared, "preserving post-exit helpers never weakens timeout cleanup")
+                if !disappeared, let expectedIdentity {
+                    terminateProcessIfStillInSession(expectedIdentity, sessionLeader: processIDs[0])
+                }
+            }
+        } else {
+            expect(false, "a preserved command that hangs still times out")
+        }
+
         let missing = BoundedProcessRunner.run(
             executable: "/finderpath/tests/definitely-missing",
             limits: normalLimits
@@ -763,6 +846,50 @@ struct BoundedProcessRunnerTests {
         }
 
         _exit(0)
+    }
+
+    /// Mimics `hdiutil attach`: a short-lived middle process starts a helper
+    /// in this leader's session and exits. The leader returns zero once the
+    /// helper has left the session and recorded its identity.
+    private static func runDaemonizingHelperFixture(pidFilePath: String) -> Never {
+        let middlePID = spawnFixtureMode("--daemonizing-helper-middle", argument: pidFilePath)
+        guard middlePID > 1 else { _exit(92) }
+        var waitStatus: Int32 = 0
+        while waitpid(middlePID, &waitStatus, 0) == -1, errno == EINTR {}
+
+        let recordURL = URL(fileURLWithPath: pidFilePath)
+        var attempts = 0
+        while readFixtureRecord(from: recordURL) == nil, attempts < 300 {
+            attempts += 1
+            usleep(10_000)
+        }
+        _exit(readFixtureRecord(from: recordURL) == nil ? 93 : 0)
+    }
+
+    /// Stays observable in the runner's session long enough to be captured,
+    /// then detaches like the disk-image helper that serves a mounted volume.
+    /// It exits on its own if a failed test leaves it behind.
+    private static func runDaemonizingHelper(pidFilePath: String) -> Never {
+        let nullDevice = open("/dev/null", O_RDWR)
+        if nullDevice >= 0 {
+            dup2(nullDevice, STDOUT_FILENO)
+            dup2(nullDevice, STDERR_FILENO)
+        }
+        usleep(200_000)
+        guard setsid() == getpid() else { _exit(95) }
+        signal(SIGTERM, SIG_IGN)
+        guard writeFixtureRecord(pidFilePath: pidFilePath, childPID: nil) else { _exit(96) }
+        sleep(20)
+        _exit(0)
+    }
+
+    private static func spawnFixtureMode(_ mode: String, argument: String) -> pid_t {
+        let executable = CommandLine.arguments[0]
+        let argv = [strdup(executable), strdup(mode), strdup(argument), nil]
+        defer { argv.forEach { free($0) } }
+        var childPID: pid_t = -1
+        let result = posix_spawn(&childPID, executable, nil, nil, argv, environ)
+        return result == 0 ? childPID : -1
     }
 
     /// Once spawned, the worker remains this fixture's unreaped direct child.
