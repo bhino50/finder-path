@@ -78,6 +78,14 @@ struct FinderPathTerminalTests {
         var bright = pal
         bright.foreground = .ansi(12)
         expect(parser.parse(Array("\u{1B}[94m".utf8)) == [.setStyle(bright)], "SGR 94 sets bright foreground")
+        // SGR 8 conceals (xterm's "invisible"); SGR 28 and SGR 0 reveal again.
+        var concealedBright = bright
+        concealedBright.concealed = true
+        expect(concealedBright != bright, "concealment takes part in style equality")
+        expect(parser.parse(Array("\u{1B}[8m".utf8)) == [.setStyle(concealedBright)], "SGR 8 conceals")
+        expect(parser.parse(Array("\u{1B}[28m".utf8)) == [.setStyle(bright)], "SGR 28 reveals")
+        _ = parser.parse(Array("\u{1B}[8m".utf8))
+        expect(parser.parse(Array("\u{1B}[0m".utf8)) == [.setStyle(.plain)], "SGR 0 clears concealment")
 
         // MARK: - Parser: erase, insert, delete, scroll
 
@@ -199,6 +207,92 @@ struct FinderPathTerminalTests {
         expect(parser.parse(Array("\u{1B}[s".utf8)) == [.saveCursor], "CSI s saves cursor")
         expect(parser.parse(Array("\u{1B}[u".utf8)) == [.restoreCursor], "CSI u restores cursor")
 
+        // MARK: - Parser + screen: DECSC/DECRC save the whole cursor state
+        //
+        // xterm's DECSC (and CSI s) saves the SGR rendition, the character sets
+        // with the GL shift, and the pending-wrap flag along with the position.
+        // Saving only row and column let a status-line redraw leak its colors
+        // and line-drawing charset into whatever the program printed next.
+
+        var decscParser = TerminalParser()
+        var decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}7\u{1B}[31m\u{1B}8X".utf8)) { decscScreen.apply(action) }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "X" && decscScreen.cell(atRow: 0, column: 0).style == .plain,
+            "ESC 8 restores the default rendition saved by ESC 7"
+        )
+        for action in decscParser.parse(Array("\u{1B}[1;31m\u{1B}7\u{1B}[0m\u{1B}8Y\u{1B}[4mZ".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 1).character == "Y" && decscScreen.cell(atRow: 0, column: 1).style == redBold,
+            "ESC 8 restores bold red saved by ESC 7"
+        )
+        var redBoldUnderlined = redBold
+        redBoldUnderlined.underline = true
+        expect(
+            decscScreen.cell(atRow: 0, column: 2).style == redBoldUnderlined,
+            "SGR after ESC 8 builds on the restored rendition"
+        )
+
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}[32m\u{1B}[s\u{1B}[0m\u{1B}[3;4H\u{1B}[uA".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "A"
+                && decscScreen.cell(atRow: 0, column: 0).style.foreground == .ansi(2),
+            "CSI u restores the position and rendition saved by CSI s"
+        )
+
+        // xterm: DECRC with nothing saved homes the cursor and resets the
+        // rendition and character sets.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}[2;5H\u{1B}[31m\u{1B}(0\u{1B}8q".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "q" && decscScreen.cell(atRow: 0, column: 0).style == .plain,
+            "DECRC without a save homes the cursor with the default rendition and ASCII"
+        )
+
+        decscParser = TerminalParser()
+        expect(
+            decscParser.parse(Array("\u{1B}(0\u{1B}7\u{1B}(B\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("\u{2500}")],
+            "DECRC restores the G0 line-drawing designation saved by DECSC"
+        )
+        expect(
+            decscParser.parse(Array("\u{1B}(B\u{1B}7\u{1B}(0\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("q")],
+            "DECRC restores the ASCII designation saved by DECSC"
+        )
+        decscParser = TerminalParser()
+        expect(
+            decscParser.parse(Array("\u{1B})0\u{0E}\u{1B}7\u{0F}\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("\u{2500}")],
+            "DECRC restores the SO shift into G1"
+        )
+
+        // The pending wrap travels with the saved position, so the next glyph
+        // still wraps instead of overwriting the last column.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("abcd\u{1B}7\u{1B}[3;1Hzz\u{1B}8e".utf8)) { decscScreen.apply(action) }
+        expect(decscScreen.lineText(0) == "abcd", "DECRC keeps the saved pending wrap instead of overwriting the margin")
+        expect(decscScreen.lineText(1).hasPrefix("e"), "the glyph after DECRC wraps like it would have before DECSC")
+
+        // Saved state is per screen: a TUI's save on the alternate screen must
+        // not replace the rendition the shell saved on the primary one.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        let perScreenSave = "\u{1B}[31m\u{1B}7\u{1B}[0m\u{1B}[?1047h\u{1B}[32m\u{1B}7\u{1B}[?1047l\u{1B}[0m\u{1B}8P"
+        for action in decscParser.parse(Array(perScreenSave.utf8)) { decscScreen.apply(action) }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "P"
+                && decscScreen.cell(atRow: 0, column: 0).style.foreground == .ansi(1),
+            "the primary screen's DECSC rendition survives an alternate-screen save"
+        )
+
         // MARK: - Screen: printing, wrap, scrollback
 
         var screen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
@@ -208,6 +302,53 @@ struct FinderPathTerminalTests {
         screen.apply(.print("e"))
         expect(screen.lineText(1).hasPrefix("e"), "wrap moves print to next row")
         expect(screen.cursorRow == 1 && screen.cursorColumn == 1, "cursor advanced after wrap")
+
+        // MARK: - Parser + screen: REP repeats the preceding graphic character
+        //
+        // ncurses 6.6's xterm-256color entry advertises rep, so a 40-column rule
+        // arrives as "=" followed by CSI 39 b. Dropping REP drew a single '='.
+
+        var repParser = TerminalParser()
+        var repScreen = TerminalScreen(rows: 3, columns: 50, scrollbackLimit: 10)
+        for action in repParser.parse(Array("=\u{1B}[39b".utf8)) { repScreen.apply(action) }
+        expect(
+            repScreen.lineText(0) == String(repeating: "=", count: 40) + String(repeating: " ", count: 10),
+            "'=' then CSI 39 b draws forty '='"
+        )
+        expect(repScreen.cursorRow == 0 && repScreen.cursorColumn == 40, "REP advances the cursor like printing")
+        for action in repParser.parse(Array("\u{1B}[b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.cursorColumn == 41, "REP defaults to one repetition and can follow another REP")
+
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in repParser.parse(Array("\u{1B}[3bab\u{1B}[3b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "abbb", "REP with nothing printed yet does nothing")
+        expect(repScreen.lineText(1) == "b   ", "REP wraps at the margin like printing")
+
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 5, scrollbackLimit: 10)
+        for action in repParser.parse(Array("\u{754C}\u{1B}[2b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0).hasPrefix("\u{754C}\u{754C}"), "REP repeats a wide glyph two columns at a time")
+        expect(repScreen.lineText(1).hasPrefix("\u{754C}"), "a repeated wide glyph wraps before the final column")
+
+        repScreen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
+        repParser = TerminalParser()
+        for action in repParser.parse(Array("\u{1B}(0q\u{1B}[2b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "\u{2500}\u{2500}\u{2500}  ", "REP repeats a line-drawing glyph")
+
+        // xterm only repeats a character that occupies a column; a combining
+        // mark must not stack onto the previous cell.
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
+        for action in repParser.parse(Array("e\u{0301}\u{1B}[3b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "e\u{0301}    " && repScreen.cursorColumn == 1, "REP after a combining mark does nothing")
+
+        repParser = TerminalParser()
+        expect(
+            repParser.parse(Array("a\u{1B}[99999b".utf8)) == [.print("a"), .repeatCharacter("a", count: 9999)],
+            "a REP count keeps the parser's 9999 parameter clamp"
+        )
+        expect(repParser.parse(Array("\u{1B}c\u{1B}[b".utf8)) == [.hardReset], "RIS forgets the character REP would repeat")
 
         // MARK: - Screen: Unicode cell widths and split graphemes
 
@@ -375,6 +516,49 @@ struct FinderPathTerminalTests {
         screen.apply(.moveCursor(row: nil, column: 2))
         expect(screen.cursorRow == 4 && screen.cursorColumn == 1, "CHA keeps row")
 
+        // MARK: - Parser + screen: programmable tab stops (HTS, TBC, CHT, CBT)
+        //
+        // `tabs -4` clears every stop with CSI 3 g and sets its own with ESC H.
+        // Fixed 8-column stops ignored both, so output from programs that set
+        // their own stops landed in the wrong columns.
+
+        var tabParser = TerminalParser()
+        var tabScreen = TerminalScreen(rows: 2, columns: 20, scrollbackLimit: 10)
+        var tabsFour = "\r\u{1B}[3g"
+        for stop in stride(from: 4, to: 20, by: 4) { tabsFour += "\u{1B}[\(stop + 1)G\u{1B}H" }
+        for action in tabParser.parse(Array((tabsFour + "\r\ta\tb").utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cell(atRow: 0, column: 4).character == "a", "HT stops at a stop set with ESC H after CSI 3 g")
+        expect(tabScreen.cell(atRow: 0, column: 8).character == "b", "HT advances to the next programmed stop")
+        for action in tabParser.parse(Array("\u{1B}[3g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 19, "with every stop cleared HT goes to the right margin")
+        for action in tabParser.parse(Array("\u{1B}c\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 8, "RIS restores the default stops every eight columns")
+
+        tabParser = TerminalParser()
+        tabScreen = TerminalScreen(rows: 2, columns: 40, scrollbackLimit: 10)
+        for action in tabParser.parse(Array("\u{1B}[21G\u{1B}[Z".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "CBT from column 20 moves back to the stop at 16")
+        for action in tabParser.parse(Array("\u{1B}[5Z".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 0, "CBT moves back Ps stops and stops at the left margin")
+        for action in tabParser.parse(Array("\u{1B}[2I".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "CHT moves forward Ps stops")
+        for action in tabParser.parse(Array("\u{1B}[9999I".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 39, "CHT past the last stop clamps to the right margin")
+        for action in tabParser.parse(Array("\u{1B}[9G\u{1B}[g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "TBC 0 clears only the stop at the cursor")
+        for action in tabParser.parse(Array("\u{1B}[17G\u{1B}[0g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 24, "an explicit TBC 0 clears the stop at the cursor")
+
+        // Resizing keeps the stops a program set and gives new columns defaults.
+        tabParser = TerminalParser()
+        tabScreen = TerminalScreen(rows: 2, columns: 10, scrollbackLimit: 10)
+        for action in tabParser.parse(Array("\u{1B}[3g\u{1B}[4G\u{1B}H".utf8)) { tabScreen.apply(action) }
+        tabScreen.resize(rows: 2, columns: 30)
+        for action in tabParser.parse(Array("\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 3, "a programmed stop survives a resize")
+        for action in tabParser.parse(Array("\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "cleared stops stay cleared and new columns get default stops")
+
         // MARK: - Screen: erase
 
         screen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
@@ -418,6 +602,28 @@ struct FinderPathTerminalTests {
         screen.apply(.setStyle(green))
         screen.apply(.print("x"))
         expect(screen.cell(atRow: 0, column: 0).style.foreground == .ansi(2), "printed cell captures style")
+
+        // Concealed cells keep their text: the view hides the glyphs, while copy
+        // and accessibility read the characters like any other attribute.
+        var concealParser = TerminalParser()
+        var concealScreen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        for action in concealParser.parse(Array("a\u{1B}[8mpw\u{1B}[28mz\u{1B}[8m\u{1B}[K".utf8)) {
+            concealScreen.apply(action)
+        }
+        expect(
+            concealScreen.cell(atRow: 0, column: 1).style.concealed && concealScreen.cell(atRow: 0, column: 2).style.concealed,
+            "SGR 8 marks printed cells concealed"
+        )
+        expect(
+            !concealScreen.cell(atRow: 0, column: 0).style.concealed && !concealScreen.cell(atRow: 0, column: 3).style.concealed,
+            "cells printed outside SGR 8 stay visible"
+        )
+        expect(!concealScreen.cell(atRow: 0, column: 4).style.concealed, "erasing does not carry concealment into blanks")
+        expect(
+            TerminalRowText.string(from: (0..<6).map { concealScreen.cell(atRow: 0, column: $0) }, trimmingTrailingSpaces: true)
+                == "apwz",
+            "concealed text is still copied like text with any other attribute"
+        )
 
         // MARK: - Screen: scroll region
 

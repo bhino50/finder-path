@@ -64,6 +64,27 @@ struct TerminalParser {
 
     private var activeCharset: Charset { usingG1 ? g1Charset : g0Charset }
 
+    /// The parser's half of DECSC: the rendition and character-set state it
+    /// owns. The screen saves the cursor position and pending wrap itself.
+    private struct SavedRendition {
+        var style: CellStyle
+        var g0Charset: Charset
+        var g1Charset: Charset
+        var usingG1: Bool
+
+        /// What xterm's DECRC restores when nothing was saved.
+        static let initial = SavedRendition(style: .plain, g0Charset: .ascii, g1Charset: .ascii, usingG1: false)
+    }
+
+    /// DECSC state is per screen, like the screen's saved cursor: the primary
+    /// screen's is parked while the alternate screen is up.
+    private var savedRendition: SavedRendition?
+    private var parkedPrimaryRendition: SavedRendition?
+    private var usingAlternateScreen = false
+
+    /// The last graphic character printed, before charset mapping, for REP.
+    private var lastPrintedCharacter: Character?
+
     /// The character a printable byte stands for under the active charset.
     private func printable(_ byte: UInt8) -> Character {
         guard activeCharset == .decSpecialGraphics,
@@ -194,6 +215,7 @@ struct TerminalParser {
         case 0x00..<0x20, 0x7F:
             break // other C0 controls and DEL are ignored
         case 0x20..<0x7F:
+            lastPrintedCharacter = Character(UnicodeScalar(byte))
             actions.append(.print(printable(byte)))
         default:
             // Leading byte of a multi-byte UTF-8 sequence.
@@ -222,6 +244,7 @@ struct TerminalParser {
         utf8Expected = 0
         guard let decoded else { return }
         for character in decoded {
+            lastPrintedCharacter = character
             actions.append(.print(character))
         }
     }
@@ -256,9 +279,11 @@ struct TerminalParser {
         case UInt8(ascii: "E"):
             actions.append(.nextLine)
         case UInt8(ascii: "7"):
-            actions.append(.saveCursor)
+            saveCursor(into: &actions)
         case UInt8(ascii: "8"):
-            actions.append(.restoreCursor)
+            restoreCursor(into: &actions)
+        case UInt8(ascii: "H"):
+            actions.append(.setTabStop) // HTS
         case UInt8(ascii: "c"):
             // RIS hard reset is one atomic screen action so saved cursor,
             // alternate-buffer, title, and mode state cannot leak through.
@@ -269,6 +294,10 @@ struct TerminalParser {
             g0Charset = .ascii
             g1Charset = .ascii
             usingG1 = false
+            savedRendition = nil
+            parkedPrimaryRendition = nil
+            usingAlternateScreen = false
+            lastPrintedCharacter = nil
             actions.append(.hardReset)
         case UInt8(ascii: "="), UInt8(ascii: ">"):
             break // keypad modes, ignored
@@ -385,9 +414,21 @@ struct TerminalParser {
             // Bottom 0 is a sentinel the screen resolves to its last row.
             actions.append(.setScrollRegion(top: count(0), bottom: param(1, default: 0)))
         case "s":
-            actions.append(.saveCursor)
+            saveCursor(into: &actions)
         case "u":
-            actions.append(.restoreCursor)
+            restoreCursor(into: &actions)
+        case "b":
+            // REP repeats the last graphic character, mapped through the charset
+            // active now as xterm does. With nothing printed yet it does nothing.
+            guard let character = lastPrintedCharacter else { break }
+            let mapped = character.asciiValue.map { printable($0) } ?? character
+            actions.append(.repeatCharacter(mapped, count: count()))
+        case "I":
+            actions.append(.tabForward(count()))
+        case "Z":
+            actions.append(.tabBackward(count()))
+        case "g":
+            actions.append(.clearTabStops(param(0, default: 0)))
         case "n":
             actions.append(.reportDeviceStatus(param(0, default: 0)))
         case "m":
@@ -397,11 +438,49 @@ struct TerminalParser {
             let enabled = final == "h"
             for parameter in params {
                 guard let mode = Self.privateMode(parameter) else { continue }
+                if mode == .alternateScreen { switchSavedRendition(toAlternate: enabled) }
                 actions.append(.setMode(mode, enabled))
             }
         default:
             break // DA, window ops, and other queries are consumed
         }
+    }
+
+    // MARK: - Cursor save and restore
+
+    /// DECSC and CSI s: the screen saves the position and pending wrap, the
+    /// parser the rendition and character sets it owns.
+    private mutating func saveCursor(into actions: inout [TerminalAction]) {
+        savedRendition = SavedRendition(style: currentStyle, g0Charset: g0Charset, g1Charset: g1Charset, usingG1: usingG1)
+        actions.append(.saveCursor)
+    }
+
+    /// DECRC and CSI u. With nothing saved xterm resets the rendition and
+    /// charsets while the screen homes the cursor. The screen's brush mirrors
+    /// `currentStyle`, so a style is announced only when the restore changes it.
+    private mutating func restoreCursor(into actions: inout [TerminalAction]) {
+        let saved = savedRendition ?? .initial
+        g0Charset = saved.g0Charset
+        g1Charset = saved.g1Charset
+        usingG1 = saved.usingG1
+        actions.append(.restoreCursor)
+        guard saved.style != currentStyle else { return }
+        currentStyle = saved.style
+        actions.append(.setStyle(currentStyle))
+    }
+
+    /// Mirrors the screen: entering the alternate screen parks the primary
+    /// screen's DECSC state and starts with none of its own.
+    private mutating func switchSavedRendition(toAlternate alternate: Bool) {
+        guard alternate != usingAlternateScreen else { return }
+        if alternate {
+            parkedPrimaryRendition = savedRendition
+            savedRendition = nil
+        } else {
+            savedRendition = parkedPrimaryRendition
+            parkedPrimaryRendition = nil
+        }
+        usingAlternateScreen = alternate
     }
 
     private static func privateMode(_ parameter: Int?) -> TerminalMode? {
@@ -501,10 +580,12 @@ struct TerminalParser {
             case 3: currentStyle.italic = true
             case 4: currentStyle.underline = true
             case 7: currentStyle.inverse = true
+            case 8: currentStyle.concealed = true
             case 22: currentStyle.bold = false; currentStyle.faint = false
             case 23: currentStyle.italic = false
             case 24: currentStyle.underline = false
             case 27: currentStyle.inverse = false
+            case 28: currentStyle.concealed = false
             case 30...37: currentStyle.foreground = .ansi(UInt8(value - 30))
             case 39: currentStyle.foreground = .defaultForeground
             case 40...47: currentStyle.background = .ansi(UInt8(value - 40))

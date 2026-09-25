@@ -28,7 +28,7 @@ struct TerminalScreen {
         grid: [TerminalLine],
         cursorRow: Int,
         cursorColumn: Int,
-        savedCursor: (row: Int, column: Int)?
+        savedCursor: SavedCursor?
     )?
     private var scrollback: [TerminalLine] = []
     /// Logical front of `scrollback`. Advancing this index makes steady-state
@@ -43,7 +43,18 @@ struct TerminalScreen {
 
     /// Current SGR brush applied to prints and erases.
     private var brush = CellStyle.plain
-    private var savedCursor: (row: Int, column: Int)?
+
+    /// The screen's half of DECSC; the parser saves the rendition and
+    /// character sets that make up the rest.
+    private struct SavedCursor {
+        var row: Int
+        var column: Int
+        var pendingWrap: Bool
+    }
+    private var savedCursor: SavedCursor?
+
+    /// Shared by both screens, as in xterm.
+    private var tabStops: TerminalTabStops
 
     /// Printing in the last column parks the cursor there. Retain that fact
     /// even with autowrap disabled so combining marks extend the margin cell;
@@ -102,6 +113,7 @@ struct TerminalScreen {
         self.scrollbackLimit = max(scrollbackLimit, 0)
         self.regionBottom = self.rows - 1
         self.grid = Self.blankGrid(rows: self.rows, columns: self.columns)
+        self.tabStops = TerminalTabStops(columns: self.columns)
     }
 
     private static func blankGrid(rows: Int, columns: Int) -> [TerminalLine] {
@@ -147,6 +159,12 @@ struct TerminalScreen {
             hardReset()
         case .print(let character):
             printCharacter(character)
+        case .repeatCharacter(let character, let count):
+            // xterm repeats only a character that occupies a column, so REP
+            // after a combining mark cannot stack marks onto one cell. The
+            // parser's parameter clamp bounds the work.
+            guard Self.columnWidth(of: character) > 0 else { break }
+            for _ in 0..<max(count, 1) { printCharacter(character) }
         case .lineFeed:
             lineFeed()
         case .carriageReturn:
@@ -156,9 +174,22 @@ struct TerminalScreen {
             cursorColumn = max(cursorColumn - 1, 0)
             pendingWrap = false
         case .tab:
-            let nextStop = min(((cursorColumn / 8) + 1) * 8, columns - 1)
-            cursorColumn = nextStop
+            cursorColumn = tabStops.nextStop(after: cursorColumn, count: 1, lastColumn: columns - 1)
             pendingWrap = false
+        case .tabForward(let count):
+            cursorColumn = tabStops.nextStop(after: cursorColumn, count: count, lastColumn: columns - 1)
+            pendingWrap = false
+        case .tabBackward(let count):
+            cursorColumn = tabStops.previousStop(before: cursorColumn, count: count)
+            pendingWrap = false
+        case .setTabStop:
+            tabStops.set(at: cursorColumn)
+        case .clearTabStops(let mode):
+            switch mode {
+            case 0: tabStops.clear(at: cursorColumn)
+            case 3: tabStops.clearAll()
+            default: break // xterm ignores the VT510 line-tab modes
+            }
         case .bell:
             break
         case .moveCursor(let row, let column):
@@ -212,13 +243,15 @@ struct TerminalScreen {
                 scrollRegionDown()
             }
         case .saveCursor:
-            savedCursor = (cursorRow, cursorColumn)
+            savedCursor = SavedCursor(row: cursorRow, column: cursorColumn, pendingWrap: pendingWrap)
         case .restoreCursor:
-            if let saved = savedCursor {
-                cursorRow = clampRow(saved.row)
-                cursorColumn = clampColumn(saved.column)
-            }
-            pendingWrap = false
+            // xterm homes the cursor when nothing was saved.
+            let saved = savedCursor ?? SavedCursor(row: 0, column: 0, pendingWrap: false)
+            cursorRow = clampRow(saved.row)
+            cursorColumn = clampColumn(saved.column)
+            // A pending wrap only means something at the right margin, which a
+            // resize since the save may have moved.
+            pendingWrap = saved.pendingWrap && cursorColumn == columns - 1
         case .setMode(let mode, let enabled):
             setMode(mode, enabled)
         case .setTitle(let newTitle):
@@ -257,6 +290,7 @@ struct TerminalScreen {
         regionBottom = rows - 1
         brush = .plain
         savedCursor = nil
+        tabStops = TerminalTabStops(columns: columns)
         pendingWrap = false
     }
 
@@ -793,9 +827,10 @@ struct TerminalScreen {
                 min(max(saved.cursorRow - savedDroppedTop, 0), targetRows - 1),
                 min(saved.cursorColumn, targetColumns - 1),
                 saved.savedCursor.map { cursor in
-                    (
-                        min(max(cursor.row - savedDroppedTop, 0), targetRows - 1),
-                        min(cursor.column, targetColumns - 1)
+                    SavedCursor(
+                        row: min(max(cursor.row - savedDroppedTop, 0), targetRows - 1),
+                        column: min(cursor.column, targetColumns - 1),
+                        pendingWrap: cursor.pendingWrap
                     )
                 }
             )
@@ -826,8 +861,13 @@ struct TerminalScreen {
         cursorRow = clampRow(cursorRow - firstRetained)
         cursorColumn = clampColumn(cursorColumn)
         savedCursor = savedCursor.map { saved in
-            (clampRow(saved.row - firstRetained), clampColumn(saved.column))
+            SavedCursor(
+                row: clampRow(saved.row - firstRetained),
+                column: clampColumn(saved.column),
+                pendingWrap: saved.pendingWrap
+            )
         }
+        tabStops.extend(toColumns: targetColumns)
         pendingWrap = false
     }
 

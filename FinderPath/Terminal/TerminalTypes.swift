@@ -23,6 +23,9 @@ struct CellStyle: Equatable, Sendable {
     var italic = false
     var underline = false
     var inverse = false
+    /// SGR 8 (xterm "invisible"): the renderer hides the glyphs, but the cell
+    /// keeps its text so copy and accessibility behave as for any attribute.
+    var concealed = false
 
     static let plain = CellStyle()
 }
@@ -119,11 +122,21 @@ enum TerminalAction: Equatable, Sendable {
     /// ESC c (RIS): restore the emulator's complete initial state.
     case hardReset
     case print(Character)
+    /// REP: print the character `count` more times, exactly as printing would.
+    case repeatCharacter(Character, count: Int)
     case lineFeed
     case carriageReturn
     case backspace
     case tab
     case bell
+
+    /// HTS: set a tab stop at the cursor column.
+    case setTabStop
+    /// TBC: 0 clears the stop at the cursor column, 3 clears every stop.
+    case clearTabStops(Int)
+    /// CHT / CBT: move to the Nth next or previous tab stop.
+    case tabForward(Int)
+    case tabBackward(Int)
 
     /// 1-based absolute positioning; nil leaves that axis unchanged (CHA/VPA).
     case moveCursor(row: Int?, column: Int?)
@@ -163,6 +176,71 @@ enum TerminalAction: Equatable, Sendable {
 
     /// DSR: 5 = status, 6 = cursor position. Replies are the session's job.
     case reportDeviceStatus(Int)
+}
+
+/// Horizontal tab stops, one flag per column, as HTS/TBC program them and
+/// HT/CHT/CBT consume them.
+///
+/// Like xterm's, the set outlives a narrowing resize: columns it hides keep
+/// their stops, and only columns never seen before start with the default of
+/// one stop every eight columns.
+struct TerminalTabStops: Sendable {
+    private static let defaultInterval = 8
+
+    private var stops: [Bool]
+
+    init(columns: Int) {
+        stops = Self.defaultStops(for: 0..<max(columns, 0))
+    }
+
+    private static func defaultStops(for columns: Range<Int>) -> [Bool] {
+        columns.map { $0 % defaultInterval == 0 }
+    }
+
+    /// Makes room for `columns`, giving only never-seen columns default stops.
+    mutating func extend(toColumns columns: Int) {
+        guard columns > stops.count else { return }
+        stops += Self.defaultStops(for: stops.count..<columns)
+    }
+
+    func isStop(at column: Int) -> Bool {
+        stops.indices.contains(column) && stops[column]
+    }
+
+    mutating func set(at column: Int) {
+        guard stops.indices.contains(column) else { return }
+        stops[column] = true
+    }
+
+    mutating func clear(at column: Int) {
+        guard stops.indices.contains(column) else { return }
+        stops[column] = false
+    }
+
+    mutating func clearAll() {
+        stops = Array(repeating: false, count: stops.count)
+    }
+
+    /// The column `count` stops right of `column`. Running out of stops ends
+    /// at `lastColumn`, the right margin, as xterm's HT and CHT do.
+    func nextStop(after column: Int, count: Int, lastColumn: Int) -> Int {
+        var position = column
+        for _ in 0..<max(count, 1) {
+            guard position < lastColumn else { break }
+            position = ((position + 1)...lastColumn).first { isStop(at: $0) } ?? lastColumn
+        }
+        return position
+    }
+
+    /// The column `count` stops left of `column`, ending at the left margin.
+    func previousStop(before column: Int, count: Int) -> Int {
+        var position = column
+        for _ in 0..<max(count, 1) {
+            guard position > 0 else { break }
+            position = (0..<position).last { isStop(at: $0) } ?? 0
+        }
+        return position
+    }
 }
 
 /// One row of the terminal grid, plus whether its text continues onto the row

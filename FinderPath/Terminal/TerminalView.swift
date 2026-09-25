@@ -464,7 +464,10 @@ final class TerminalView: NSView {
                 next += 1
             }
             let run = NSAttributedString(string: text, attributes: textAttributes(for: style))
-            drawLine(run, atX: CGFloat(startColumn) * metrics.cellWidth, rowTop: rowTop, context: context)
+            // Concealed (SGR 8) runs keep their background but draw no glyphs.
+            if !style.concealed {
+                drawLine(run, atX: CGFloat(startColumn) * metrics.cellWidth, rowTop: rowTop, context: context)
+            }
             column = next
         }
     }
@@ -513,6 +516,7 @@ final class TerminalView: NSView {
         rect.fill()
 
         let cell = screen.cell(atRow: screen.cursorRow, column: screen.cursorColumn)
+        guard !cell.style.concealed else { return }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: metrics.font(for: cell.style),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String):
