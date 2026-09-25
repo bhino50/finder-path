@@ -57,6 +57,7 @@ UPDATE_DOWNLOAD_TEST_BINARY="$BUILD_DIR/UpdateDownloadTests"
   "$ROOT_DIR/FinderPath/Bridges.swift" \
   "$ROOT_DIR/FinderPath/RemoteServers.swift" \
   "$ROOT_DIR/FinderPath/SizeLimitedDownload.swift" \
+  "$ROOT_DIR/FinderPath/TerminalLaunchCommand.swift" \
   "$ROOT_DIR/FinderPath/UpdateInstaller.swift" \
   "$ROOT_DIR/FinderPath/VersionLogic.swift" \
   "$ROOT_DIR/Tests/UpdateDownloadTests.swift" \
