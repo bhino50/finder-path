@@ -891,6 +891,66 @@ struct FinderPathLogicTests {
         expect(cachedResult == freshStatus, "the newest forced result is the value committed to cache")
         expect(finalRequestCount == 2, "a fresh cache hit does not invoke the fetcher again")
 
+        // The Connect to Server window is created once and reused for the app's
+        // lifetime, and SwiftUI does not re-run onAppear when it is ordered back
+        // in. Every presentation must publish a new refresh key, while merely
+        // installing the hosting view (before the first show) must not count.
+        let presentationStates = await MainActor.run { () -> [(UInt64, Bool)] in
+            let presentation = RemoteConnectionPresentation()
+            var states = [(presentation.generation, presentation.hasBeenPresented)]
+            for _ in 0..<3 {
+                presentation.markPresented()
+                states.append((presentation.generation, presentation.hasBeenPresented))
+            }
+            return states
+        }
+        expect(presentationStates.first?.1 == false, "an installed but never shown window does not refresh")
+        expect(presentationStates.dropFirst().allSatisfy { $0.1 }, "every presentation refreshes Tailscale status")
+        expect(
+            Set(presentationStates.map { $0.0 }).count == presentationStates.count,
+            "each presentation publishes a distinct refresh key"
+        )
+
+        // A presentation refresh is a non-forced lookup: it must refetch once
+        // the cached status has aged out, and overlapping lookups must share one
+        // CLI run rather than racing.
+        let presentationFetcher = ControlledTailscaleFetcher()
+        let presentationCache = TailscaleStatusCache {
+            await presentationFetcher.fetch()
+        }
+        let firstPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<1_000 {
+            if await presentationFetcher.requestCount >= 1 { break }
+            await Task.yield()
+        }
+        let overlappingPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let overlappingLookupCount = await presentationFetcher.requestCount
+        expect(overlappingLookupCount == 1, "overlapping presentation refreshes share one in-flight fetch")
+        await presentationFetcher.complete(requestID: 0, with: freshStatus)
+        let firstPresentationResult = await firstPresentationLookup.value
+        let overlappingPresentationResult = await overlappingPresentationLookup.value
+        expect(
+            firstPresentationResult == freshStatus && overlappingPresentationResult == freshStatus,
+            "overlapping presentation refreshes receive the same status"
+        )
+        let expiredPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<1_000 {
+            if await presentationFetcher.requestCount >= 2 { break }
+            await Task.yield()
+        }
+        let expiredLookupCount = await presentationFetcher.requestCount
+        expect(expiredLookupCount == 2, "a presentation after the cache ages out fetches fresh status")
+        await presentationFetcher.complete(requestID: 1, with: staleStatus)
+        let expiredPresentationResult = await expiredPresentationLookup.value
+        expect(expiredPresentationResult == staleStatus, "the refetched status replaces the aged-out cache")
+
         // Prerelease builds of the same version must not be treated as equal:
         // UpdateInstaller.verify uses this to gate replacing the running app.
         expect(!UpdateChecker.versionsAreEquivalent("1.7-beta", "1.7-rc"), "different prereleases must not match")
@@ -944,6 +1004,38 @@ struct FinderPathLogicTests {
 
         expect(RemoteServers.sanitizedName("  spaced  ") == "spaced", "names are trimmed")
         expect(RemoteServers.sanitizedName("###") == "", "an all-marker name collapses to empty")
+
+        // Comment markers can hide behind whitespace. Stripping them only once
+        // saved "# # Dev" as "# Dev = host", which parse() skips as a comment,
+        // so the server vanished and the next rewrite deleted it.
+        let hiddenMarkerNames: [(raw: String, sanitized: String)] = [
+            ("# # Dev", "Dev"),
+            ("\t# #Dev", "Dev"),
+            ("#\u{3000}#Dev", "Dev"),
+            ("##", ""),
+            ("#", "")
+        ]
+        for (raw, sanitized) in hiddenMarkerNames {
+            expect(
+                RemoteServers.sanitizedName(raw) == sanitized,
+                "repeated leading comment markers are stripped from \(raw.debugDescription)"
+            )
+            let saved = [RemoteServer(name: raw, target: "dev.example.com")]
+            let expectedName = sanitized.isEmpty ? "dev.example.com" : sanitized
+            expect(
+                RemoteServers.parse(RemoteServers.serialize(saved))
+                    == [RemoteServer(name: expectedName, target: "dev.example.com")],
+                "a server named \(raw.debugDescription) survives the save/parse round trip"
+            )
+        }
+        for ordinaryName in ["Dev Server", "Prod #2", "C# Box", "dev-01"] {
+            expect(RemoteServers.sanitizedName(ordinaryName) == ordinaryName, "ordinary name \(ordinaryName.debugDescription) is unchanged")
+            let saved = [RemoteServer(name: ordinaryName, target: "dev.example.com")]
+            expect(
+                RemoteServers.parse(RemoteServers.serialize(saved)) == saved,
+                "ordinary name \(ordinaryName.debugDescription) survives the save/parse round trip"
+            )
+        }
 
         expect(ShellCommand.argument("it's here") == "'it'\\''s here'", "single-quote escaping should be shell-safe")
         expect(

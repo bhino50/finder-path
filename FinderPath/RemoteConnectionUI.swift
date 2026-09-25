@@ -3,6 +3,8 @@ import AppKit
 
 @MainActor
 final class RemoteConnectionWindowController: NSWindowController {
+    private let presentation: RemoteConnectionPresentation
+
     init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 580),
@@ -11,11 +13,15 @@ final class RemoteConnectionWindowController: NSWindowController {
             defer: false
         )
 
+        let presentation = RemoteConnectionPresentation()
         window.title = "Connect to Server"
         window.isReleasedWhenClosed = false
         window.center()
-        window.contentViewController = NSHostingController(rootView: RemoteConnectionView())
+        window.contentViewController = NSHostingController(
+            rootView: RemoteConnectionView(presentation: presentation)
+        )
 
+        self.presentation = presentation
         super.init(window: window)
     }
 
@@ -24,11 +30,16 @@ final class RemoteConnectionWindowController: NSWindowController {
     }
 
     func presentOnActiveScreen() {
+        // Bump before showing so the view refreshes Tailscale status on every
+        // open, not only the first one; the status cache absorbs quick reopens.
+        presentation.markPresented()
         WindowPresentation.present(self)
     }
 }
 
 struct RemoteConnectionView: View {
+    @ObservedObject var presentation: RemoteConnectionPresentation
+
     @AppStorage(FinderPathPreferences.remoteServersKey) private var remoteServersText = ""
     @AppStorage(FinderPathPreferences.remoteConnectionTerminalKey) private var remoteConnectionTerminal = "ghostty"
     // Persisted, not @State: this view is rebuilt on every launch, so a
@@ -95,7 +106,13 @@ struct RemoteConnectionView: View {
         }
         .padding(20)
         .frame(width: 460, height: 580)
-        .onAppear { Task { await refreshTailscale() } }
+        .task(id: presentation.generation) {
+            // The hosting view appears as soon as the controller installs it,
+            // before the window is shown; the first presentation does the
+            // initial load, so skip that install-time appearance.
+            guard presentation.hasBeenPresented else { return }
+            await refreshTailscale()
+        }
         .onChange(of: showAllDevices) { _ in
             if selectedTarget == nil { selection = nil }
         }

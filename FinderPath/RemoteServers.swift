@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 struct RemoteServer: Equatable {
@@ -55,15 +56,18 @@ enum RemoteServers {
     /// silently vanished — or, with a newline, came back as a second phantom
     /// entry pointing at a different host.
     static func sanitizedName(_ rawName: String) -> String {
-        let flattened = rawName
+        var name = rawName
             .split(whereSeparator: \.isNewline)
             .joined(separator: " ")
             .replacingOccurrences(of: "=", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // A leading '#' would make `parse` treat the whole line as a comment.
-        guard flattened.hasPrefix("#") else { return flattened }
-        return String(flattened.drop(while: { $0 == "#" }))
-            .trimmingCharacters(in: .whitespaces)
+        // Markers can hide behind whitespace ("# # Dev"), so keep stripping
+        // until neither leads. An empty result falls back to the target.
+        while name.hasPrefix("#") {
+            name = String(name.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return name
     }
 
     // Saved SSH targets are limited to hostname / user@host / ssh-config alias
@@ -147,6 +151,23 @@ enum RemoteConnectionSelection {
             return device.name.isEmpty ? device.address : device.name
         }
         return nil
+    }
+}
+
+/// Counts presentations of the Connect to Server window. Its controller is
+/// created once and reused for the app's lifetime, and SwiftUI does not re-run
+/// onAppear when that window is ordered back in, so reopening it days later
+/// kept showing the first launch's Tailscale state. The view keys its refresh
+/// on `generation` instead. Zero means the hosting view is installed but the
+/// window has not been shown yet.
+@MainActor
+final class RemoteConnectionPresentation: ObservableObject {
+    @Published private(set) var generation: UInt64 = 0
+
+    var hasBeenPresented: Bool { generation > 0 }
+
+    func markPresented() {
+        generation &+= 1
     }
 }
 
