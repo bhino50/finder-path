@@ -109,6 +109,17 @@ else
   APP_ARCHIVE_WORK_PATH="$APP_ARCHIVE_PATH"
 fi
 
+# Never destroy an earlier verified artifact while rebuilding this version.
+# This check precedes the cleanup trap: rejected collisions belong to the user,
+# so even an early exit must leave them intact.
+for artifact_path in "$DMG_PATH" "$APP_ARCHIVE_PATH"; do
+  if [[ -e "$artifact_path" || -L "$artifact_path" ]]; then
+    echo "Refusing to overwrite existing artifact: $artifact_path" >&2
+    echo "Choose a new version or move the existing artifact before packaging." >&2
+    exit 2
+  fi
+done
+
 if [[ -z "${DEVELOPER_DIR:-}" ]]; then
   for developer_dir in \
     /Applications/Xcode.app/Contents/Developer \
@@ -206,7 +217,7 @@ update_public_manifest() {
     "$VERSION" "$VERSION_JSON" "$DOWNLOAD_INDEX"
 }
 
-rm -rf "$DERIVED_DATA_PATH" "$DIST_DIR"
+rm -rf "$DERIVED_DATA_PATH"
 mkdir -p "$DIST_DIR"
 
 echo "Packaging $APP_NAME version $VERSION (from MARKETING_VERSION)"

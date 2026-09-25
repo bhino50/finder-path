@@ -7,7 +7,7 @@
 [![Latest release](https://img.shields.io/github/v/release/bhino50/finder-path?display_name=tag&sort=semver)](https://github.com/bhino50/finder-path/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/bhino50/finder-path/total?logo=github)](https://github.com/bhino50/finder-path/releases)
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple)
-![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift)
+![Swift](https://img.shields.io/badge/Swift-6.2%2B-orange?logo=swift)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
@@ -22,11 +22,11 @@ For Linux desktops, use the separate [finderpath-linux](https://github.com/bhino
 
 ## Features
 
-- **Menu bar path display** — always-visible path header at the top of the menu
+- **Menu bar path display** — path header at the top of the menu (on by default; can be hidden in Settings)
 - **Copy Path** — copies the full POSIX path to the clipboard
-- **Copy cd Command** — copies a shell-safe `cd "/path/to/folder"` command, ready to paste
+- **Copy cd Command** — copies a shell-safe `cd '/path/to/folder/'` command, ready to paste (single quotes by default; choose double quotes under Settings > Terminal)
 - **Recent Paths** — the last 10 folders FinderPath saw, each with the full action set: copy the path or `cd` command, open it in cmux, Ghostty, or Terminal, launch Codex, Claude, or Hermes there, start a built-in terminal, or reveal it in Finder. Only folders you actually had open in a Finder window are remembered, the list survives a restart, and **Clear Recent Paths** wipes it.
-- **Open in cmux / Ghostty** — your primary launchers, at the top of the menu; open the current Finder folder in cmux or a new Ghostty window
+- **Open in cmux / Ghostty** — your primary launchers, listed first among the open actions (just below Copy Path and Copy cd Command); open the current Finder folder in cmux or a new Ghostty window
 - **Open in Terminal** — opens Terminal.app in the current Finder folder
 - **Open with Codex / Claude / Hermes** — launches optional CLI agents in a new Terminal session at the current folder
 - **Mini terminals** — cmux-style terminal sessions built into the menu bar. A homegrown terminal emulator (no third-party dependencies) runs real shells, so you can use `git`, `ssh`, `vim`, `htop`, or CLI agents in FinderPath. Sessions keep running in the background while the app is open and restore their name and working directory after a restart. Left-click shows them in a **Terminals** menu section with **New Terminal Here**; right-click opens the movable, edge-resizable terminal window directly. Switch sessions with the tab strip, or unpin the window to return it to a menu-bar popover. Hold Option before opening the path menu to launch Codex, Claude, or Hermes inside FinderPath Terminal instead of an external terminal.
@@ -67,7 +67,7 @@ Prefer not to bypass Gatekeeper for a local build? Review the native Swift sourc
 
 ### Build from Source
 
-Requirements: macOS 13+, Xcode with Swift 5.9+ (or just the Command Line Tools for the no-Xcode script below)
+Requirements: macOS 13+ and Xcode 26 or later (Swift 6.2+). The no-Xcode script below needs only the Command Line Tools, also with Swift 6.2 or later.
 
 ```bash
 git clone https://github.com/bhino50/finder-path.git
@@ -105,15 +105,16 @@ See [bhino50/finderpath-linux](https://github.com/bhino50/finderpath-linux) for 
 
 ## Settings
 
-Open Settings from the menu (or press `,` while the menu is open) to configure:
+Open Settings from the menu (or press `⌘,` while the menu is open) to configure:
 
 | Section | Options |
 |---------|---------|
+| General | Launch at login; allow `finderpath://open-ghostty` and `finderpath://open-cmux` shortcut URLs |
 | Menu Items | Toggle visibility of each menu action |
 | Path Header | Header title, display style, truncation, width, font size |
 | Menu Bar Icon | SF Symbol choice, optional short title |
-| Terminal | `cd` quoting style (double or single quotes) |
-| Mini Terminals | Show/hide the session section, right-click behavior, font size, scrollback limit, shell override, and optional Option-as-Meta input |
+| Terminal | `cd` quoting style (single quotes by default, or double quotes) |
+| Terminals | Show/hide the session section, right-click behavior, hover quick-pick, font size, scrollback limit, shell override, and optional Option-as-Meta input |
 | Remote Connections | SSH terminal (Ghostty or macOS Terminal); servers and Tailscale devices are managed in the Connect to Server window |
 | Agent Launchers | Codex, Claude, and Hermes executable paths, hide-if-unavailable toggle |
 | Updates | Installed version, update manifest URL (GitHub Releases by default), manual Check Now |
@@ -125,13 +126,13 @@ Open Settings from the menu (or press `,` while the menu is open) to configure:
 FinderPath uses Apple Events only for these integrations, with macOS prompting when each one is first used:
 
 - **Finder** — reads the path of the frontmost Finder window via AppleScript
-- **Terminal** — opens Terminal sessions for Terminal and external agent launch actions
+- **Terminal** — runs Codex, Claude, and Hermes launches, and SSH connections when Settings > Remote Connections is set to macOS Terminal, through Terminal's AppleScript `do script`
 
-Ghostty is opened through Launch Services, and cmux is launched as a direct process. Those integrations do not use Apple Events from FinderPath.
+**Open in Terminal** and Ghostty are opened through Launch Services, cmux is launched as a direct process, and Option-held agent launches run in FinderPath's built-in terminal. None of these use Apple Events from FinderPath.
 
 To review or re-grant permissions: System Settings > Privacy & Security > Automation > FinderPath.
 
-If Finder access is denied, FinderPath shows the AppleScript error in the path field instead of crashing.
+If Finder access is denied, the path header reads **Finder access needed** and the menu adds **Allow Finder Access in System Settings…**, which opens the Automation pane. Other Finder failures, such as a stalled Finder, appear in the path header as `Finder AppleScript error: …`.
 
 ---
 
@@ -152,20 +153,24 @@ The parser also accepts a plain JSON manifest if you point the URL elsewhere:
 To ship a new version:
 
 1. Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the Xcode project. The package script reads `MARKETING_VERSION` from the project file.
-2. Run `./script/package_release.sh` with both `DEVELOPER_ID` and
-   `NOTARY_PROFILE`. Only that mode emits `dist/FinderPath-$VERSION.dmg` and
-   updates `download-site/version.json`, after the DMG passes notarization,
-   stapling, signature validation, and Gatekeeper. Other modes emit an
-   unmistakably named `NOT-FOR-PUBLIC-RELEASE` artifact and leave the public
-   manifest untouched.
-3. Tag the commit and publish a GitHub Release with the `.dmg` attached:
+2. Run `./script/package_release.sh` with `DEVELOPER_ID` and notarization
+   credentials (`NOTARY_PROFILE`, or `NOTARY_KEY` + `NOTARY_KEY_ID` as shown
+   below). Only a notarized run emits `dist/FinderPath-$VERSION.dmg` and
+   `dist/FinderPath-$VERSION-macOS13-notarized.zip` and updates
+   `download-site/version.json`, after both pass notarization, stapling,
+   signature validation, and Gatekeeper. Other modes emit an unmistakably
+   named `NOT-FOR-PUBLIC-RELEASE` artifact and leave the public manifest
+   untouched.
+3. Tag the commit and publish a GitHub Release with both artifacts attached:
 
    ```bash
-   gh release create v1.4 dist/FinderPath-1.4.dmg \
+   gh release create v1.4 \
+     dist/FinderPath-1.4.dmg dist/FinderPath-1.4-macOS13-notarized.zip \
      --title "FinderPath 1.4" --notes "Release notes for this version."
    ```
 
-   Existing installs hit `Check for Updates...` and get the new DMG.
+   Existing installs hit `Check for Updates...` and install the new version,
+   preferring the notarized ZIP.
 
 ---
 

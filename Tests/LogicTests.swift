@@ -39,6 +39,422 @@ struct FinderPathLogicTests {
         expect(!UpdateChecker.versionsAreEquivalent("", "0"), "empty versions must not match")
         expect(!UpdateChecker.versionsAreEquivalent("release", "0"), "nonnumeric versions must not match")
 
+        // Update trust-gate regression cases, added by the updater audit.
+        expect(!UpdateChecker.versionsAreEquivalent("18446744073709551616.9", "0.9"), "an overflowing version component cannot become zero during verification")
+        expect(UpdateChecker.compare("18446744073709551616.9", isNewerThan: "9.9"), "large decimal version components retain their numeric order")
+        expect(!UpdateChecker.versionsAreEquivalent("1..9", "1.9"), "empty numeric version components are rejected")
+        expect(!UpdateChecker.versionsAreEquivalent("1.9.", "1.9"), "a trailing version separator cannot disappear during verification")
+        expect(!UpdateChecker.versionsAreEquivalent("١.9", "0.9"), "non-ASCII digits cannot become zero during verification")
+        expect(!UpdateChecker.compare("1.9-rc.99", isNewerThan: "1.9.1"), "prerelease suffix numbers do not become core version components")
+        expect(UpdateChecker.versionsAreEquivalent("1.9-rc.2", "1.9.0-rc.2"), "core padding is independent of the full prerelease suffix")
+        expect(!UpdateChecker.versionsAreEquivalent("1.9-rc.2", "1.9-rc.3"), "the complete prerelease suffix remains part of version verification")
+        expect(UpdateChecker.parseManifest(Data(#"{"version":"1..9"}"#.utf8)) == nil, "a malformed manifest version is rejected")
+        expect(UpdateChecker.parseManifest(Data(#"{"tag_name":"v1..9"}"#.utf8)) == nil, "a malformed GitHub release version is rejected")
+        expect(!UpdateChecker.isHTTPSWebURL(URL(string: "https://user:password@example.com/update.zip")!), "update URLs cannot carry embedded credentials")
+        expect(!UpdateChecker.isHTTPSWebURL(URL(string: "http://example.com/update.zip")!), "update redirects cannot downgrade to HTTP")
+
+        // Exercise the production command helper with an inherited stderr
+        // pipe. The old helper waited for the entire three-second child even
+        // with a 0.1-second timeout; its replacement owns and stops that child.
+        let updaterTimeoutStart = Date()
+        let updaterTimeout = UpdateInstaller.run(
+            "/bin/sh",
+            ["-c", "/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 3' & wait"],
+            timeout: 0.1
+        )
+        expect(updaterTimeout.status != 0, "an updater timeout is always reported as failure")
+        expect(Date().timeIntervalSince(updaterTimeoutStart) < 2.5, "an inherited pipe cannot extend an updater timeout beyond bounded cleanup")
+        expect(updaterTimeout.errorOutput.contains("safety limit"), "an updater timeout retains its user-facing cause")
+        let updaterVerbose = UpdateInstaller.run(
+            "/bin/sh",
+            ["-c", "/bin/dd if=/dev/zero bs=1024 count=128 1>&2"],
+            timeout: 2
+        )
+        expect(updaterVerbose.status == 0, "a verbose update tool can complete while stderr drains")
+        expect(updaterVerbose.errorOutput.utf8.count < 65_700, "updater diagnostics stay within their retained byte limit")
+        expect(updaterVerbose.errorOutput.contains("Tool diagnostics were truncated."), "capped updater diagnostics report truncation")
+
+        do {
+            let updateFixtures = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FinderPathUpdateTransactionTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: updateFixtures, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: updateFixtures) }
+
+            func makeUpdateFixture(_ directory: URL, marker: String) throws {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try Data(marker.utf8).write(to: directory.appendingPathComponent("marker"))
+            }
+            func updateMarker(_ directory: URL) -> String? {
+                (try? Data(contentsOf: directory.appendingPathComponent("marker")))
+                    .map { String(decoding: $0, as: UTF8.self) }
+            }
+            func makeUpdateCase(_ name: String) throws -> URL {
+                let directory = updateFixtures.appendingPathComponent(name)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                return directory
+            }
+            let simulatedFailure = NSError(domain: "FinderPathUpdaterTests", code: 1)
+
+            // A partial copy/verification failure must precede every rename
+            // of the installed app and remove the temporary staging tree.
+            let preparationCase = try makeUpdateCase("preparation-failure")
+            let preparationTarget = preparationCase.appendingPathComponent("FinderPath.app")
+            let preparationSource = preparationCase.appendingPathComponent("source.app")
+            try makeUpdateFixture(preparationTarget, marker: "old")
+            try makeUpdateFixture(preparationSource, marker: "new")
+            var preparationScheduled = false
+            do {
+                try UpdateInstaller.stageAndReplaceApp(
+                    at: preparationTarget,
+                    with: preparationSource,
+                    prepareStagedApp: { source, staged in
+                        expect(updateMarker(preparationTarget) == "old", "the installed app remains complete while preparation runs")
+                        expect(staged.deletingLastPathComponent().deletingLastPathComponent().path == preparationCase.path, "staging happens on the destination volume")
+                        let attributes = try FileManager.default.attributesOfItem(atPath: staged.deletingLastPathComponent().path)
+                        expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700, "update staging is private to the installing user")
+                        try FileManager.default.copyItem(at: source, to: staged)
+                        throw simulatedFailure
+                    },
+                    scheduleRelaunch: { _ in preparationScheduled = true }
+                )
+                expect(false, "a failed staging step must reject the transaction")
+            } catch {
+                expect(updateMarker(preparationTarget) == "old", "a preparation failure preserves the original installed app")
+                expect(!preparationScheduled, "a preparation failure never schedules a relaunch")
+                let preparationEntries = try FileManager.default.contentsOfDirectory(atPath: preparationCase.path)
+                expect(preparationEntries.allSatisfy { !$0.hasPrefix(".FinderPathUpdate-") }, "a preparation failure removes its partial staging directory")
+            }
+
+            let successCase = try makeUpdateCase("success")
+            let successTarget = successCase.appendingPathComponent("FinderPath.app")
+            let successSource = successCase.appendingPathComponent("source.app")
+            try makeUpdateFixture(successTarget, marker: "old")
+            try makeUpdateFixture(successSource, marker: "new")
+            var successScheduled = false
+            let retired = try UpdateInstaller.stageAndReplaceApp(
+                at: successTarget,
+                with: successSource,
+                prepareStagedApp: { source, staged in
+                    expect(updateMarker(successTarget) == "old", "staging precedes replacement of the installed app")
+                    try FileManager.default.copyItem(at: source, to: staged)
+                },
+                scheduleRelaunch: { target in
+                    expect(target == successTarget && updateMarker(target) == "new", "relaunch scheduling sees the complete replacement at the intended path")
+                    successScheduled = true
+                }
+            )
+            expect(successScheduled && updateMarker(successTarget) == "new", "a successful transaction installs the staged app")
+            expect(updateMarker(retired) == "old", "the previous app is retained until real launch success can be established")
+            expect(updateMarker(successSource) == "new", "installing a staged copy preserves the verified source")
+
+            let helperFailureCase = try makeUpdateCase("helper-failure")
+            let helperFailureTarget = helperFailureCase.appendingPathComponent("FinderPath.app")
+            let helperFailureStaged = helperFailureCase.appendingPathComponent("staged.app")
+            try makeUpdateFixture(helperFailureTarget, marker: "old")
+            try makeUpdateFixture(helperFailureStaged, marker: "new")
+            do {
+                try UpdateInstaller.replaceApp(at: helperFailureTarget, with: helperFailureStaged) { target in
+                    expect(updateMarker(target) == "new", "the helper-failure fixture reaches the replacement phase")
+                    throw simulatedFailure
+                }
+                expect(false, "a relaunch scheduling failure must reject the transaction")
+            } catch {
+                expect(updateMarker(helperFailureTarget) == "old", "a helper launch failure restores the previous app")
+                let helperFailureEntries = try FileManager.default.contentsOfDirectory(atPath: helperFailureCase.path)
+                expect(helperFailureEntries == ["FinderPath.app"], "successful rollback removes the displaced replacement")
+            }
+
+            let renameFailureCase = try makeUpdateCase("rename-failure")
+            let renameFailureTarget = renameFailureCase.appendingPathComponent("FinderPath.app")
+            try makeUpdateFixture(renameFailureTarget, marker: "old")
+            var renameFailureScheduled = false
+            do {
+                try UpdateInstaller.replaceApp(at: renameFailureTarget, with: renameFailureCase.appendingPathComponent("missing.app")) { _ in
+                    renameFailureScheduled = true
+                }
+                expect(false, "a failed staged-app rename must reject the transaction")
+            } catch {
+                expect(updateMarker(renameFailureTarget) == "old", "a failed staged-app rename restores the previous app")
+                expect(!renameFailureScheduled, "a failed staged-app rename never schedules a relaunch")
+            }
+
+            let initialMoveFailureCase = try makeUpdateCase("initial-move-failure")
+            let initialMoveStaged = initialMoveFailureCase.appendingPathComponent("staged.app")
+            try makeUpdateFixture(initialMoveStaged, marker: "new")
+            do {
+                try UpdateInstaller.replaceApp(at: initialMoveFailureCase.appendingPathComponent("missing.app"), with: initialMoveStaged) { _ in
+                    expect(false, "a missing original app must never schedule a relaunch")
+                }
+                expect(false, "a failed move of the original app must reject the transaction")
+            } catch {
+                expect(updateMarker(initialMoveStaged) == "new", "an initial rename failure preserves the complete staged replacement")
+            }
+
+            let unavailableBackupCase = try makeUpdateCase("unavailable-backup")
+            let unavailableBackupTarget = unavailableBackupCase.appendingPathComponent("FinderPath.app")
+            let unavailableBackupStaged = unavailableBackupCase.appendingPathComponent("staged.app")
+            try makeUpdateFixture(unavailableBackupTarget, marker: "old")
+            try makeUpdateFixture(unavailableBackupStaged, marker: "new")
+            do {
+                try UpdateInstaller.replaceApp(at: unavailableBackupTarget, with: unavailableBackupStaged) { _ in
+                    for entry in try FileManager.default.contentsOfDirectory(at: unavailableBackupCase, includingPropertiesForKeys: nil)
+                    where entry.lastPathComponent.hasPrefix(".FinderPath.app.old-") {
+                        try FileManager.default.removeItem(at: entry)
+                    }
+                    throw simulatedFailure
+                }
+                expect(false, "an unavailable backup cannot be reported as a successful rollback")
+            } catch {
+                expect(updateMarker(unavailableBackupTarget) == "new", "failed rollback never deletes the only remaining complete app")
+                expect(error.localizedDescription.contains("replacement was retained"), "an unavailable backup reports the retained replacement")
+            }
+
+            // The real monitor observes an archive violation while its child
+            // is running. That child exits zero when terminated; policy still
+            // must win over the otherwise successful process status.
+            let policyRoot = try makeUpdateCase("policy-stop")
+            let policyLink = policyRoot.appendingPathComponent("escape")
+            let policyCommand = "trap 'exit 0' TERM; /bin/ln -s /etc "
+                + ShellCommand.argument(policyLink.path, quoteStyle: "single")
+                + "; while :; do /bin/sleep 1; done"
+            let policyResult = UpdateInstaller.run("/bin/sh", ["-c", policyCommand], timeout: 2, expansionRoot: policyRoot)
+            expect(policyResult.status != 0, "an archive policy failure cannot be converted into a successful exit")
+            expect(policyResult.errorOutput.contains(UpdateInstaller.escapedContainmentMessage), "an archive policy failure preserves its rejection reason")
+
+            let waiterStart = Date()
+            let waiter = UpdateInstaller.run(
+                "/bin/sh",
+                ["-c", UpdateInstaller.relaunchScript(of: successTarget, processIdentifier: ProcessInfo.processInfo.processIdentifier, maximumWaitAttempts: 1)],
+                timeout: 2
+            )
+            expect(waiter.status == 1, "the real relaunch waiter expires when the original process stays alive")
+            expect(Date().timeIntervalSince(waiterStart) < 2, "a cancelled app termination cannot leave a permanent relaunch helper")
+
+            // Retired bundles stay until a newer FinderPath launches from the
+            // same folder. That launch trashes only exact updater leftovers
+            // proven to be FinderPath copies no newer than itself.
+            func makeBundle(_ url: URL, identifier: String = UpdateInstaller.expectedBundleID, version: String) throws {
+                let contents = url.appendingPathComponent("Contents")
+                try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+                try PropertyListSerialization.data(
+                    fromPropertyList: ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version],
+                    format: .xml,
+                    options: 0
+                ).write(to: contents.appendingPathComponent("Info.plist"))
+            }
+            func retiredName(_ uuid: String = UUID().uuidString) -> String { ".FinderPath.app.old-\(uuid)" }
+
+            let cleanupCase = try makeUpdateCase("leftover-cleanup")
+            let cleanupApp = cleanupCase.appendingPathComponent("FinderPath.app")
+            try makeBundle(cleanupApp, version: "1.9.1")
+            for version in ["1.9.2", "1.9.3"] {
+                let source = updateFixtures.appendingPathComponent("source-\(version).app")
+                try makeBundle(source, version: version)
+                try UpdateInstaller.stageAndReplaceApp(
+                    at: cleanupApp,
+                    with: source,
+                    prepareStagedApp: { try FileManager.default.copyItem(at: $0, to: $1) },
+                    scheduleRelaunch: { _ in }
+                )
+            }
+            let retiredByUpdates = try FileManager.default.contentsOfDirectory(atPath: cleanupCase.path)
+                .filter { $0.hasPrefix(".FinderPath.app.old-") }
+            expect(retiredByUpdates.count == 2, "each in-app update keeps the previous bundle beside the app")
+
+            let lowercaseRetired = retiredName(UUID().uuidString.lowercased())
+            try makeBundle(cleanupCase.appendingPathComponent(lowercaseRetired), version: "1.9.1")
+            let keptNames = [
+                "newer": retiredName(), "foreign": retiredName(), "running": retiredName(),
+                "malformed": ".FinderPath.app.old-12345", "failed": ".FinderPath.app.failed-\(UUID().uuidString)",
+                "staging": ".FinderPathUpdate-\(UUID().uuidString)", "untrashable": retiredName(),
+                "linked": retiredName(), "linkedPlist": retiredName(),
+            ]
+            let keptURL = keptNames.mapValues { cleanupCase.appendingPathComponent($0) }
+            try makeBundle(keptURL["newer"]!, version: "2.0")
+            try makeBundle(keptURL["foreign"]!, identifier: "com.example.Other", version: "1.0")
+            for key in ["running", "malformed", "failed", "untrashable"] {
+                try makeBundle(keptURL[key]!, version: "1.0")
+            }
+            try FileManager.default.createDirectory(at: keptURL["staging"]!, withIntermediateDirectories: false)
+            let externalBundle = updateFixtures.appendingPathComponent("external.app")
+            try makeBundle(externalBundle, version: "1.0")
+            try FileManager.default.createSymbolicLink(at: keptURL["linked"]!, withDestinationURL: externalBundle)
+            try FileManager.default.createDirectory(at: keptURL["linkedPlist"]!.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(
+                at: keptURL["linkedPlist"]!.appendingPathComponent("Contents/Info.plist"),
+                withDestinationURL: externalBundle.appendingPathComponent("Contents/Info.plist")
+            )
+
+            let fixtureTrash = updateFixtures.appendingPathComponent("Trash")
+            try FileManager.default.createDirectory(at: fixtureTrash, withIntermediateDirectories: false)
+            func moveToFixtureTrash(_ item: URL) throws {
+                if item.lastPathComponent == keptNames["untrashable"] { throw simulatedFailure }
+                try FileManager.default.moveItem(at: item, to: fixtureTrash.appendingPathComponent(item.lastPathComponent))
+            }
+            func runCleanup(identifier: String? = UpdateInstaller.expectedBundleID, app: URL = cleanupApp) -> [String] {
+                UpdateLeftoverCleanup.run(
+                    runningApp: app,
+                    runningBundleIdentifier: identifier,
+                    runningVersion: "1.9.3",
+                    runningBundlePaths: [keptURL["running"]!.standardizedFileURL.path],
+                    trash: moveToFixtureTrash
+                )
+            }
+
+            expect(runCleanup(identifier: "io.github.bhino50.FinderPathDev").isEmpty, "a development build never cleans the folder it runs from")
+            expect(runCleanup(app: cleanupCase.appendingPathComponent("Other.app")).isEmpty, "only a host named FinderPath.app cleans its folder")
+            var trashedDuringInstall = ["not run"]
+            let gateWasFree = UpdateInstaller.performExclusively { trashedDuringInstall = runCleanup() }
+            expect(gateWasFree && trashedDuringInstall.isEmpty, "cleanup never races an update installation")
+
+            let trashed = runCleanup()
+            expect(Set(trashed) == Set(retiredByUpdates + [lowercaseRetired]), "retired FinderPath bundles no newer than the running app are trashed")
+            let trashedEntries = try FileManager.default.contentsOfDirectory(atPath: fixtureTrash.path)
+            expect(Set(trashedEntries) == Set(trashed), "cleanup trashes exactly the bundles it reports")
+            for (reason, url) in keptURL {
+                expect(
+                    (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+                        || FileManager.default.fileExists(atPath: url.path),
+                    "cleanup keeps the \(reason) leftover"
+                )
+            }
+            expect(FileManager.default.fileExists(atPath: externalBundle.path), "cleanup never follows a link out of the app folder")
+            expect(FileManager.default.fileExists(atPath: cleanupApp.appendingPathComponent("Contents/Info.plist").path), "cleanup never touches the running app")
+
+            let boundCase = try makeUpdateCase("leftover-cleanup-bound")
+            let boundApp = boundCase.appendingPathComponent("FinderPath.app")
+            try makeBundle(boundApp, version: "2.0")
+            for _ in 0..<10 {
+                try makeBundle(boundCase.appendingPathComponent(retiredName()), version: "1.0")
+            }
+            let boundedRun = UpdateLeftoverCleanup.run(
+                runningApp: boundApp,
+                runningBundleIdentifier: UpdateInstaller.expectedBundleID,
+                runningVersion: "2.0",
+                runningBundlePaths: [],
+                trash: { try FileManager.default.removeItem(at: $0) }
+            )
+            expect(boundedRun.count == 8, "one launch trashes a bounded number of retired bundles")
+        } catch {
+            expect(false, "updater fixture setup or verification failed: \(error.localizedDescription)")
+        }
+
+        do {
+            let archiveFixtures = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FinderPathArchiveEntryTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: archiveFixtures, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: archiveFixtures) }
+            let specialEntry = archiveFixtures.appendingPathComponent("fifo")
+            let fifoCreated = mkfifo(specialEntry.path, 0o600) == 0
+            expect(fifoCreated, "the archive special-file fixture creates its owned FIFO")
+            if fifoCreated {
+                expect(UpdateInstaller.expandedContentsViolation(at: archiveFixtures, maximumSize: 1_024, maximumEntries: 10, maximumDepth: 4) == UpdateInstaller.unsupportedEntryMessage, "an archive FIFO cannot enter bundle verification or copying")
+                try FileManager.default.removeItem(at: specialEntry)
+            }
+
+            let realApp = archiveFixtures.appendingPathComponent("FinderPath.app")
+            try FileManager.default.createDirectory(at: realApp, withIntermediateDirectories: true)
+            let foundApp = try UpdateInstaller.findApp(in: archiveFixtures)
+            expect(foundApp?.resolvingSymlinksInPath().path == realApp.resolvingSymlinksInPath().path, "archive selection accepts the real top-level app directory")
+            try FileManager.default.removeItem(at: realApp)
+
+            let nestedApp = archiveFixtures.appendingPathComponent("nested/FinderPath.app")
+            try FileManager.default.createDirectory(at: nestedApp, withIntermediateDirectories: true)
+            let nestedSelection = try UpdateInstaller.findApp(in: archiveFixtures)
+            expect(nestedSelection == nil, "archive selection does not descend into unrelated directories")
+            try FileManager.default.createSymbolicLink(atPath: realApp.path, withDestinationPath: "nested/FinderPath.app")
+            do {
+                _ = try UpdateInstaller.findApp(in: archiveFixtures)
+                expect(false, "a symlink cannot substitute for the archive's top-level app")
+            } catch {
+                expect(FileManager.default.fileExists(atPath: nestedApp.path), "rejecting a symlink leaves its destination untouched")
+            }
+            try FileManager.default.removeItem(at: realApp)
+            try Data("not an app".utf8).write(to: realApp)
+            do {
+                _ = try UpdateInstaller.findApp(in: archiveFixtures)
+                expect(false, "a regular file cannot substitute for the archive's app bundle")
+            } catch {
+                expect(true, "an app-named regular file is rejected during archive selection")
+            }
+        } catch {
+            expect(false, "archive fixture setup or verification failed: \(error.localizedDescription)")
+        }
+
+        // hdiutil attach exits while a helper it started keeps serving the
+        // mounted volume. The installer copies the app out afterwards, so the
+        // runner's post-exit cleanup must leave that helper alone.
+        do {
+            let imageFixtures = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FinderPathDiskImageTests-\(UUID().uuidString)")
+            let imageSource = imageFixtures.appendingPathComponent("source")
+            let image = imageFixtures.appendingPathComponent("update.dmg")
+            let work = imageFixtures.appendingPathComponent("work")
+            let mountPoints = [imageFixtures.appendingPathComponent("mount"), work.appendingPathComponent("mount")]
+            func runTool(_ arguments: [String]) -> Int32 {
+                let tool = Process()
+                tool.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                tool.arguments = arguments
+                tool.standardOutput = FileHandle.nullDevice
+                tool.standardError = FileHandle.nullDevice
+                guard (try? tool.run()) != nil else { return -1 }
+                tool.waitUntilExit()
+                return tool.terminationStatus
+            }
+            defer {
+                for mountPoint in mountPoints
+                where FileManager.default.fileExists(atPath: mountPoint.appendingPathComponent("FinderPath.app").path) {
+                    _ = runTool(["detach", mountPoint.path, "-force"])
+                }
+                try? FileManager.default.removeItem(at: imageFixtures)
+            }
+            let sourceContents = imageSource.appendingPathComponent("FinderPath.app/Contents")
+            try FileManager.default.createDirectory(at: sourceContents, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: sourceContents.appendingPathComponent("Info.plist"))
+
+            if runTool(["create", "-quiet", "-fs", "HFS+", "-format", "UDZO", "-srcfolder", imageSource.path, image.path]) != 0 {
+                print("Skipping disk-image update tests: hdiutil create is unavailable here.")
+            } else {
+                let attach = UpdateInstaller.run(
+                    "/usr/bin/hdiutil",
+                    ["attach", image.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mountPoints[0].path],
+                    timeout: 30,
+                    postExitDescendants: .preserve
+                )
+                if attach.status == 0 {
+                    expect(
+                        FileManager.default.fileExists(atPath: mountPoints[0].appendingPathComponent("FinderPath.app/Contents/Info.plist").path),
+                        "a preserved attach helper keeps the volume mounted after hdiutil exits"
+                    )
+                    let detach = UpdateInstaller.run("/usr/bin/hdiutil", ["detach", mountPoints[0].path, "-force"], timeout: 15)
+                    expect(detach.status == 0, "the preserved attach helper is torn down by detach")
+                } else {
+                    print("Skipping disk-image attach check: \(attach.errorOutput)")
+                }
+                do {
+                    let extracted = try UpdateInstaller.extractApp(from: image, into: work)
+                    expect(
+                        FileManager.default.fileExists(atPath: extracted.appendingPathComponent("Contents/Info.plist").path),
+                        "a disk-image update is copied out of its mounted volume"
+                    )
+                    expect(
+                        !FileManager.default.fileExists(atPath: mountPoints[1].appendingPathComponent("FinderPath.app").path),
+                        "disk-image extraction detaches its temporary volume"
+                    )
+                } catch {
+                    // Only a host that also refuses a plain attach may skip.
+                    if runTool(["attach", image.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mountPoints[0].path]) != 0 {
+                        print("Skipping disk-image update tests: hdiutil attach is not permitted here.")
+                    } else {
+                        expect(false, "disk-image extraction failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        } catch {
+            expect(false, "disk-image fixture setup failed: \(error.localizedDescription)")
+        }
+
         // Browser recovery is a typed trust decision. Only an operational
         // download failure may expose the manifest's external URL; packages
         // that were rejected or never verified must remain fail-closed.
@@ -221,6 +637,47 @@ struct FinderPathLogicTests {
             RemoteServer(name: "Local", target: "localhost")
         ]
         expect(RemoteServers.parse(RemoteServers.serialize(servers)) == servers, "server persistence should round-trip")
+
+        // The visible row, including a refreshed hostname, owns the SSH target.
+        // Hiding or removing a row must make Connect unavailable.
+        let selectedDevice = TailscaleDevice(
+            name: "old-host", address: "100.64.0.9", os: "macOS", online: true
+        )
+        let renamedDevice = TailscaleDevice(
+            name: "new-host", address: selectedDevice.address, os: "macOS", online: true
+        )
+        let deviceSelection = "ts:\(selectedDevice.id)"
+        expect(
+            RemoteConnectionSelection.target(for: deviceSelection, servers: [], visibleDevices: [selectedDevice]) == "old-host",
+            "selecting a visible device resolves its current hostname"
+        )
+        expect(
+            RemoteConnectionSelection.target(for: deviceSelection, servers: [], visibleDevices: [renamedDevice]) == "new-host",
+            "a refresh that renames the selected device updates the connection target"
+        )
+        expect(
+            RemoteConnectionSelection.target(for: deviceSelection, servers: [], visibleDevices: [selectedDevice].filter(\.isLinux)) == nil,
+            "filtering out the selected device disables its connection"
+        )
+        expect(
+            RemoteConnectionSelection.target(for: deviceSelection, servers: [], visibleDevices: []) == nil,
+            "removing the selected device disables its connection"
+        )
+        let unnamedDevice = TailscaleDevice(name: "", address: selectedDevice.address, os: "linux", online: false)
+        expect(
+            RemoteConnectionSelection.target(for: deviceSelection, servers: [], visibleDevices: [unnamedDevice]) == selectedDevice.address,
+            "a device without a name uses the displayed address"
+        )
+        expect(
+            RemoteConnectionSelection.target(for: "srv:0", servers: servers, visibleDevices: []) == servers[0].target,
+            "a saved server resolves to the current row target"
+        )
+        for invalidSelection in [nil, "srv:-1", "srv:\(servers.count)", "srv:invalid", "ts:missing", "unknown:0"] as [String?] {
+            expect(
+                RemoteConnectionSelection.target(for: invalidSelection, servers: servers, visibleDevices: [selectedDevice]) == nil,
+                "missing or invalid selections do not connect"
+            )
+        }
 
         // The Tailscale device list must show every device by default. Filtering
         // it to Linux hosts hid every online Windows and macOS server on a real
@@ -434,6 +891,66 @@ struct FinderPathLogicTests {
         expect(cachedResult == freshStatus, "the newest forced result is the value committed to cache")
         expect(finalRequestCount == 2, "a fresh cache hit does not invoke the fetcher again")
 
+        // The Connect to Server window is created once and reused for the app's
+        // lifetime, and SwiftUI does not re-run onAppear when it is ordered back
+        // in. Every presentation must publish a new refresh key, while merely
+        // installing the hosting view (before the first show) must not count.
+        let presentationStates = await MainActor.run { () -> [(UInt64, Bool)] in
+            let presentation = RemoteConnectionPresentation()
+            var states = [(presentation.generation, presentation.hasBeenPresented)]
+            for _ in 0..<3 {
+                presentation.markPresented()
+                states.append((presentation.generation, presentation.hasBeenPresented))
+            }
+            return states
+        }
+        expect(presentationStates.first?.1 == false, "an installed but never shown window does not refresh")
+        expect(presentationStates.dropFirst().allSatisfy { $0.1 }, "every presentation refreshes Tailscale status")
+        expect(
+            Set(presentationStates.map { $0.0 }).count == presentationStates.count,
+            "each presentation publishes a distinct refresh key"
+        )
+
+        // A presentation refresh is a non-forced lookup: it must refetch once
+        // the cached status has aged out, and overlapping lookups must share one
+        // CLI run rather than racing.
+        let presentationFetcher = ControlledTailscaleFetcher()
+        let presentationCache = TailscaleStatusCache {
+            await presentationFetcher.fetch()
+        }
+        let firstPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<1_000 {
+            if await presentationFetcher.requestCount >= 1 { break }
+            await Task.yield()
+        }
+        let overlappingPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let overlappingLookupCount = await presentationFetcher.requestCount
+        expect(overlappingLookupCount == 1, "overlapping presentation refreshes share one in-flight fetch")
+        await presentationFetcher.complete(requestID: 0, with: freshStatus)
+        let firstPresentationResult = await firstPresentationLookup.value
+        let overlappingPresentationResult = await overlappingPresentationLookup.value
+        expect(
+            firstPresentationResult == freshStatus && overlappingPresentationResult == freshStatus,
+            "overlapping presentation refreshes receive the same status"
+        )
+        let expiredPresentationLookup = Task {
+            await presentationCache.status(forceRefresh: false, maxAge: 0)
+        }
+        for _ in 0..<1_000 {
+            if await presentationFetcher.requestCount >= 2 { break }
+            await Task.yield()
+        }
+        let expiredLookupCount = await presentationFetcher.requestCount
+        expect(expiredLookupCount == 2, "a presentation after the cache ages out fetches fresh status")
+        await presentationFetcher.complete(requestID: 1, with: staleStatus)
+        let expiredPresentationResult = await expiredPresentationLookup.value
+        expect(expiredPresentationResult == staleStatus, "the refetched status replaces the aged-out cache")
+
         // Prerelease builds of the same version must not be treated as equal:
         // UpdateInstaller.verify uses this to gate replacing the running app.
         expect(!UpdateChecker.versionsAreEquivalent("1.7-beta", "1.7-rc"), "different prereleases must not match")
@@ -444,8 +961,28 @@ struct FinderPathLogicTests {
             !UpdateChecker.versionsAreEquivalent("1.7-dev", "1.7-de"),
             "a v inside a prerelease suffix must not be stripped during verification"
         )
-        // Ordering deliberately keeps ignoring suffixes.
-        expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "ordering still ignores prerelease suffixes")
+        // Ordering follows SemVer precedence: the numeric core decides first,
+        // prerelease identifiers only break a tie, build metadata never counts.
+        expect(UpdateChecker.compare("1.8-beta", isNewerThan: "1.7"), "a higher-core prerelease is still offered")
+        expect(UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3-rc.1"), "a prerelease user is offered the matching final release")
+        expect(UpdateChecker.compare("v1.9.3.0", isNewerThan: "1.9.3-RC.1"), "a padded final release outranks its prerelease")
+        expect(UpdateChecker.compare("1.9.3+build.7", isNewerThan: "1.9.3-rc.1"), "build metadata does not make a release a prerelease")
+        expect(UpdateChecker.compare("1.9.3-rc.2", isNewerThan: "1.9.3-rc.1"), "later prereleases of one core are ordered")
+        expect(UpdateChecker.compare("1.9.3-rc.10", isNewerThan: "1.9.3-rc.2"), "numeric prerelease identifiers compare numerically")
+        expect(UpdateChecker.compare("1.9.3-rc", isNewerThan: "1.9.3-beta.5"), "alphanumeric prerelease identifiers compare in ASCII order")
+        expect(UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3-rc"), "a longer prerelease with an equal prefix is newer")
+        expect(UpdateChecker.compare("1.9.3-alpha", isNewerThan: "1.9.3-1"), "numeric prerelease identifiers rank below alphanumeric ones")
+        expect(UpdateChecker.compare("1.9.3-rc.2+b1", isNewerThan: "1.9.3-rc.1+b9"), "build metadata is ignored when ordering prereleases")
+        expect(!UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3"), "a final-release user is never offered a prerelease of the same core")
+        expect(!UpdateChecker.compare("1.9.3-rc.9", isNewerThan: "1.9.3.0"), "a prerelease never outranks its padded final release")
+        expect(!UpdateChecker.compare("1.9.3-rc.2", isNewerThan: "1.9.3-rc.10"), "prerelease numbers are not compared as text")
+        expect(!UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.3-rc.1"), "an identical prerelease is not an update")
+        expect(!UpdateChecker.compare("1.9.3-rc.01", isNewerThan: "1.9.3-rc.1"), "leading zeros do not change a numeric prerelease identifier")
+        expect(!UpdateChecker.compare("1.9.3+build.7", isNewerThan: "1.9.3"), "build metadata alone is not an update")
+        expect(!UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3+build.7"), "a release without build metadata is not an update")
+        expect(!UpdateChecker.compare("1.9.2", isNewerThan: "1.9.3-rc.1"), "the numeric core still decides before prerelease identifiers")
+        expect(UpdateChecker.compare("1.9.3-rc.1", isNewerThan: "1.9.2"), "a prerelease of a higher core is newer than an older release")
+        expect(!UpdateChecker.compare("1.9.3", isNewerThan: "1.9.3"), "an identical release is not an update")
 
         // A display name is stored in line-oriented `Name = target` text, so it
         // must survive the round trip rather than deleting or duplicating rows.
@@ -468,7 +1005,47 @@ struct FinderPathLogicTests {
         expect(RemoteServers.sanitizedName("  spaced  ") == "spaced", "names are trimmed")
         expect(RemoteServers.sanitizedName("###") == "", "an all-marker name collapses to empty")
 
+        // Comment markers can hide behind whitespace. Stripping them only once
+        // saved "# # Dev" as "# Dev = host", which parse() skips as a comment,
+        // so the server vanished and the next rewrite deleted it.
+        let hiddenMarkerNames: [(raw: String, sanitized: String)] = [
+            ("# # Dev", "Dev"),
+            ("\t# #Dev", "Dev"),
+            ("#\u{3000}#Dev", "Dev"),
+            ("##", ""),
+            ("#", "")
+        ]
+        for (raw, sanitized) in hiddenMarkerNames {
+            expect(
+                RemoteServers.sanitizedName(raw) == sanitized,
+                "repeated leading comment markers are stripped from \(raw.debugDescription)"
+            )
+            let saved = [RemoteServer(name: raw, target: "dev.example.com")]
+            let expectedName = sanitized.isEmpty ? "dev.example.com" : sanitized
+            expect(
+                RemoteServers.parse(RemoteServers.serialize(saved))
+                    == [RemoteServer(name: expectedName, target: "dev.example.com")],
+                "a server named \(raw.debugDescription) survives the save/parse round trip"
+            )
+        }
+        for ordinaryName in ["Dev Server", "Prod #2", "C# Box", "dev-01"] {
+            expect(RemoteServers.sanitizedName(ordinaryName) == ordinaryName, "ordinary name \(ordinaryName.debugDescription) is unchanged")
+            let saved = [RemoteServer(name: ordinaryName, target: "dev.example.com")]
+            expect(
+                RemoteServers.parse(RemoteServers.serialize(saved)) == saved,
+                "ordinary name \(ordinaryName.debugDescription) survives the save/parse round trip"
+            )
+        }
+
         expect(ShellCommand.argument("it's here") == "'it'\\''s here'", "single-quote escaping should be shell-safe")
+        expect(
+            ShellCommand.argument("/tmp/folder!history", quoteStyle: "double") == "'/tmp/folder!history'",
+            "double-quote preference must not expose interactive shell history expansion"
+        )
+        expect(
+            ShellCommand.argument("/tmp/it's!here", quoteStyle: "double") == "'/tmp/it'\\''s!here'",
+            "history-safe fallback must also preserve apostrophes"
+        )
         expect(
             ShellCommand.argument("$HOME/`pwd`/\"folder\"", quoteStyle: "double")
                 == "\"\\$HOME/\\`pwd\\`/\\\"folder\\\"\"",
@@ -484,6 +1061,66 @@ struct FinderPathLogicTests {
         expect(
             TerminalBridge.escapedAppleScriptString("/tmp/a\nb") == "/tmp/a\\nb",
             "a newline in a folder path should escape rather than collapse to a space"
+        )
+
+        // Agent launches are typed into the user's login shell, which may be
+        // fish or tcsh. Every one of them reads `\x` outside quotes as x.
+        expect(ShellCommand.portableArgument("") == "''", "an empty portable argument stays one word")
+        expect(
+            ShellCommand.portableArgument("/tmp/plain dir") == "'/tmp/plain dir'",
+            "ordinary characters stay inside single quotes"
+        )
+        expect(
+            ShellCommand.portableArgument("it's a\\b!") == "'it'\\''s a'\\\\'b'\\!",
+            "quote, backslash, and bang are escaped outside the quotes"
+        )
+        expect(
+            ShellCommand.portableArgument("'\u{301}") == "\\''\u{301}'",
+            "a combining mark cannot hide a quote inside a quoted run"
+        )
+        expect(
+            ShellCommand.portableArgument(TerminalBridge.agentLaunchScript) == "'\(TerminalBridge.agentLaunchScript)'",
+            "the fixed launch program stays a single quoted word"
+        )
+        // Outside the quoted arguments only plain words may remain: `if`/`fi`,
+        // `&&`, and `${...}` are what fish and tcsh reject.
+        let agentCommand = TerminalBridge.agentLaunchCommand(
+            displayName: "Claude", executable: "/Users/u/.local/bin/claude", directoryPath: "/Users/u/it's a\\dir!"
+        )
+        var unquotedAgentText = ""
+        var insideQuotes = false
+        var afterBackslash = false
+        for scalar in agentCommand.unicodeScalars {
+            if afterBackslash {
+                afterBackslash = false
+            } else if insideQuotes {
+                insideQuotes = scalar != "'"
+            } else if scalar == "\\" {
+                afterBackslash = true
+            } else if scalar == "'" {
+                insideQuotes = true
+            } else {
+                unquotedAgentText.unicodeScalars.append(scalar)
+            }
+        }
+        expect(
+            unquotedAgentText == "exec /bin/sh -c     " && !insideQuotes && !afterBackslash,
+            "the agent launch line is plain words around balanced quoted arguments"
+        )
+        let missingAgentMessage = TerminalBridge.agentMissingMessage(
+            displayName: "Claude", executable: "/opt/homebrew/bin/claude"
+        )
+        expect(
+            missingAgentMessage.contains("/opt/homebrew/bin/claude") && missingAgentMessage.contains("Settings"),
+            "the missing-agent message names the checked path and where to change it"
+        )
+        expect(
+            !missingAgentMessage.contains("PATH"),
+            "the missing-agent message never asks for a file path to be added to PATH"
+        )
+        expect(
+            AgentLauncher.commonSearchDirectories.allSatisfy(AgentLauncher.searchLocationsSummary.contains),
+            "the Settings footnote lists every folder a bare command name is looked up in"
         )
 
         // The Ghostty SSH path opens a throwaway script as a document so the

@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -77,6 +78,14 @@ struct FinderPathTerminalTests {
         var bright = pal
         bright.foreground = .ansi(12)
         expect(parser.parse(Array("\u{1B}[94m".utf8)) == [.setStyle(bright)], "SGR 94 sets bright foreground")
+        // SGR 8 conceals (xterm's "invisible"); SGR 28 and SGR 0 reveal again.
+        var concealedBright = bright
+        concealedBright.concealed = true
+        expect(concealedBright != bright, "concealment takes part in style equality")
+        expect(parser.parse(Array("\u{1B}[8m".utf8)) == [.setStyle(concealedBright)], "SGR 8 conceals")
+        expect(parser.parse(Array("\u{1B}[28m".utf8)) == [.setStyle(bright)], "SGR 28 reveals")
+        _ = parser.parse(Array("\u{1B}[8m".utf8))
+        expect(parser.parse(Array("\u{1B}[0m".utf8)) == [.setStyle(.plain)], "SGR 0 clears concealment")
 
         // MARK: - Parser: erase, insert, delete, scroll
 
@@ -198,6 +207,92 @@ struct FinderPathTerminalTests {
         expect(parser.parse(Array("\u{1B}[s".utf8)) == [.saveCursor], "CSI s saves cursor")
         expect(parser.parse(Array("\u{1B}[u".utf8)) == [.restoreCursor], "CSI u restores cursor")
 
+        // MARK: - Parser + screen: DECSC/DECRC save the whole cursor state
+        //
+        // xterm's DECSC (and CSI s) saves the SGR rendition, the character sets
+        // with the GL shift, and the pending-wrap flag along with the position.
+        // Saving only row and column let a status-line redraw leak its colors
+        // and line-drawing charset into whatever the program printed next.
+
+        var decscParser = TerminalParser()
+        var decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}7\u{1B}[31m\u{1B}8X".utf8)) { decscScreen.apply(action) }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "X" && decscScreen.cell(atRow: 0, column: 0).style == .plain,
+            "ESC 8 restores the default rendition saved by ESC 7"
+        )
+        for action in decscParser.parse(Array("\u{1B}[1;31m\u{1B}7\u{1B}[0m\u{1B}8Y\u{1B}[4mZ".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 1).character == "Y" && decscScreen.cell(atRow: 0, column: 1).style == redBold,
+            "ESC 8 restores bold red saved by ESC 7"
+        )
+        var redBoldUnderlined = redBold
+        redBoldUnderlined.underline = true
+        expect(
+            decscScreen.cell(atRow: 0, column: 2).style == redBoldUnderlined,
+            "SGR after ESC 8 builds on the restored rendition"
+        )
+
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}[32m\u{1B}[s\u{1B}[0m\u{1B}[3;4H\u{1B}[uA".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "A"
+                && decscScreen.cell(atRow: 0, column: 0).style.foreground == .ansi(2),
+            "CSI u restores the position and rendition saved by CSI s"
+        )
+
+        // xterm: DECRC with nothing saved homes the cursor and resets the
+        // rendition and character sets.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("\u{1B}[2;5H\u{1B}[31m\u{1B}(0\u{1B}8q".utf8)) {
+            decscScreen.apply(action)
+        }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "q" && decscScreen.cell(atRow: 0, column: 0).style == .plain,
+            "DECRC without a save homes the cursor with the default rendition and ASCII"
+        )
+
+        decscParser = TerminalParser()
+        expect(
+            decscParser.parse(Array("\u{1B}(0\u{1B}7\u{1B}(B\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("\u{2500}")],
+            "DECRC restores the G0 line-drawing designation saved by DECSC"
+        )
+        expect(
+            decscParser.parse(Array("\u{1B}(B\u{1B}7\u{1B}(0\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("q")],
+            "DECRC restores the ASCII designation saved by DECSC"
+        )
+        decscParser = TerminalParser()
+        expect(
+            decscParser.parse(Array("\u{1B})0\u{0E}\u{1B}7\u{0F}\u{1B}8q".utf8)) == [.saveCursor, .restoreCursor, .print("\u{2500}")],
+            "DECRC restores the SO shift into G1"
+        )
+
+        // The pending wrap travels with the saved position, so the next glyph
+        // still wraps instead of overwriting the last column.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in decscParser.parse(Array("abcd\u{1B}7\u{1B}[3;1Hzz\u{1B}8e".utf8)) { decscScreen.apply(action) }
+        expect(decscScreen.lineText(0) == "abcd", "DECRC keeps the saved pending wrap instead of overwriting the margin")
+        expect(decscScreen.lineText(1).hasPrefix("e"), "the glyph after DECRC wraps like it would have before DECSC")
+
+        // Saved state is per screen: a TUI's save on the alternate screen must
+        // not replace the rendition the shell saved on the primary one.
+        decscParser = TerminalParser()
+        decscScreen = TerminalScreen(rows: 3, columns: 10, scrollbackLimit: 10)
+        let perScreenSave = "\u{1B}[31m\u{1B}7\u{1B}[0m\u{1B}[?1047h\u{1B}[32m\u{1B}7\u{1B}[?1047l\u{1B}[0m\u{1B}8P"
+        for action in decscParser.parse(Array(perScreenSave.utf8)) { decscScreen.apply(action) }
+        expect(
+            decscScreen.cell(atRow: 0, column: 0).character == "P"
+                && decscScreen.cell(atRow: 0, column: 0).style.foreground == .ansi(1),
+            "the primary screen's DECSC rendition survives an alternate-screen save"
+        )
+
         // MARK: - Screen: printing, wrap, scrollback
 
         var screen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
@@ -207,6 +302,69 @@ struct FinderPathTerminalTests {
         screen.apply(.print("e"))
         expect(screen.lineText(1).hasPrefix("e"), "wrap moves print to next row")
         expect(screen.cursorRow == 1 && screen.cursorColumn == 1, "cursor advanced after wrap")
+
+        // MARK: - Parser + screen: REP repeats the preceding graphic character
+        //
+        // ncurses 6.6's xterm-256color entry advertises rep, so a 40-column rule
+        // arrives as "=" followed by CSI 39 b. Dropping REP drew a single '='.
+
+        var repParser = TerminalParser()
+        var repScreen = TerminalScreen(rows: 3, columns: 50, scrollbackLimit: 10)
+        for action in repParser.parse(Array("=\u{1B}[39b".utf8)) { repScreen.apply(action) }
+        expect(
+            repScreen.lineText(0) == String(repeating: "=", count: 40) + String(repeating: " ", count: 10),
+            "'=' then CSI 39 b draws forty '='"
+        )
+        expect(repScreen.cursorRow == 0 && repScreen.cursorColumn == 40, "REP advances the cursor like printing")
+        for action in repParser.parse(Array("\u{1B}[b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.cursorColumn == 41, "REP defaults to one repetition and can follow another REP")
+
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in repParser.parse(Array("\u{1B}[3bab\u{1B}[3b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "abbb", "REP with nothing printed yet does nothing")
+        expect(repScreen.lineText(1) == "b   ", "REP wraps at the margin like printing")
+
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 5, scrollbackLimit: 10)
+        for action in repParser.parse(Array("\u{754C}\u{1B}[2b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0).hasPrefix("\u{754C}\u{754C}"), "REP repeats a wide glyph two columns at a time")
+        expect(repScreen.lineText(1).hasPrefix("\u{754C}"), "a repeated wide glyph wraps before the final column")
+
+        repScreen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
+        repParser = TerminalParser()
+        for action in repParser.parse(Array("\u{1B}(0q\u{1B}[2b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "\u{2500}\u{2500}\u{2500}  ", "REP repeats a line-drawing glyph")
+
+        // xterm only repeats a character that occupies a column; a combining
+        // mark must not stack onto the previous cell.
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
+        for action in repParser.parse(Array("e\u{0301}\u{1B}[3b".utf8)) { repScreen.apply(action) }
+        expect(repScreen.lineText(0) == "e\u{0301}    " && repScreen.cursorColumn == 1, "REP after a combining mark does nothing")
+
+        repParser = TerminalParser()
+        expect(
+            repParser.parse(Array("a\u{1B}[99999b".utf8)) == [.print("a"), .repeatCharacter("a", count: 9999)],
+            "a REP count keeps the parser's 9999 parameter clamp"
+        )
+        expect(repParser.parse(Array("\u{1B}c\u{1B}[b".utf8)) == [.hardReset], "RIS forgets the character REP would repeat")
+
+        // A huge REP count is bounded by the line width, so a few bytes of
+        // hostile output cannot force thousands of prints on the main thread.
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in repParser.parse(Array("a\u{1B}[9999b".utf8)) { repScreen.apply(action) }
+        expect(
+            repScreen.lineText(0) == "aaaa" && repScreen.lineText(1) == "a   " && repScreen.lineText(2) == "    ",
+            "REP repeats at most one line width"
+        )
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 24, columns: 80, scrollbackLimit: 1_000)
+        let hostileREP = Array(String(repeating: "a\u{1B}[9999b", count: 9_000).utf8)
+        let repStart = Date()
+        for action in repParser.parse(hostileREP) { repScreen.apply(action) }
+        expect(Date().timeIntervalSince(repStart) < 1.0, "hostile REP output stays cheap to apply")
 
         // MARK: - Screen: Unicode cell widths and split graphemes
 
@@ -374,6 +532,49 @@ struct FinderPathTerminalTests {
         screen.apply(.moveCursor(row: nil, column: 2))
         expect(screen.cursorRow == 4 && screen.cursorColumn == 1, "CHA keeps row")
 
+        // MARK: - Parser + screen: programmable tab stops (HTS, TBC, CHT, CBT)
+        //
+        // `tabs -4` clears every stop with CSI 3 g and sets its own with ESC H.
+        // Fixed 8-column stops ignored both, so output from programs that set
+        // their own stops landed in the wrong columns.
+
+        var tabParser = TerminalParser()
+        var tabScreen = TerminalScreen(rows: 2, columns: 20, scrollbackLimit: 10)
+        var tabsFour = "\r\u{1B}[3g"
+        for stop in stride(from: 4, to: 20, by: 4) { tabsFour += "\u{1B}[\(stop + 1)G\u{1B}H" }
+        for action in tabParser.parse(Array((tabsFour + "\r\ta\tb").utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cell(atRow: 0, column: 4).character == "a", "HT stops at a stop set with ESC H after CSI 3 g")
+        expect(tabScreen.cell(atRow: 0, column: 8).character == "b", "HT advances to the next programmed stop")
+        for action in tabParser.parse(Array("\u{1B}[3g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 19, "with every stop cleared HT goes to the right margin")
+        for action in tabParser.parse(Array("\u{1B}c\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 8, "RIS restores the default stops every eight columns")
+
+        tabParser = TerminalParser()
+        tabScreen = TerminalScreen(rows: 2, columns: 40, scrollbackLimit: 10)
+        for action in tabParser.parse(Array("\u{1B}[21G\u{1B}[Z".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "CBT from column 20 moves back to the stop at 16")
+        for action in tabParser.parse(Array("\u{1B}[5Z".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 0, "CBT moves back Ps stops and stops at the left margin")
+        for action in tabParser.parse(Array("\u{1B}[2I".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "CHT moves forward Ps stops")
+        for action in tabParser.parse(Array("\u{1B}[9999I".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 39, "CHT past the last stop clamps to the right margin")
+        for action in tabParser.parse(Array("\u{1B}[9G\u{1B}[g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "TBC 0 clears only the stop at the cursor")
+        for action in tabParser.parse(Array("\u{1B}[17G\u{1B}[0g\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 24, "an explicit TBC 0 clears the stop at the cursor")
+
+        // Resizing keeps the stops a program set and gives new columns defaults.
+        tabParser = TerminalParser()
+        tabScreen = TerminalScreen(rows: 2, columns: 10, scrollbackLimit: 10)
+        for action in tabParser.parse(Array("\u{1B}[3g\u{1B}[4G\u{1B}H".utf8)) { tabScreen.apply(action) }
+        tabScreen.resize(rows: 2, columns: 30)
+        for action in tabParser.parse(Array("\r\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 3, "a programmed stop survives a resize")
+        for action in tabParser.parse(Array("\t".utf8)) { tabScreen.apply(action) }
+        expect(tabScreen.cursorColumn == 16, "cleared stops stay cleared and new columns get default stops")
+
         // MARK: - Screen: erase
 
         screen = TerminalScreen(rows: 2, columns: 5, scrollbackLimit: 10)
@@ -417,6 +618,28 @@ struct FinderPathTerminalTests {
         screen.apply(.setStyle(green))
         screen.apply(.print("x"))
         expect(screen.cell(atRow: 0, column: 0).style.foreground == .ansi(2), "printed cell captures style")
+
+        // Concealed cells keep their text: the view hides the glyphs, while copy
+        // and accessibility read the characters like any other attribute.
+        var concealParser = TerminalParser()
+        var concealScreen = TerminalScreen(rows: 2, columns: 6, scrollbackLimit: 10)
+        for action in concealParser.parse(Array("a\u{1B}[8mpw\u{1B}[28mz\u{1B}[8m\u{1B}[K".utf8)) {
+            concealScreen.apply(action)
+        }
+        expect(
+            concealScreen.cell(atRow: 0, column: 1).style.concealed && concealScreen.cell(atRow: 0, column: 2).style.concealed,
+            "SGR 8 marks printed cells concealed"
+        )
+        expect(
+            !concealScreen.cell(atRow: 0, column: 0).style.concealed && !concealScreen.cell(atRow: 0, column: 3).style.concealed,
+            "cells printed outside SGR 8 stay visible"
+        )
+        expect(!concealScreen.cell(atRow: 0, column: 4).style.concealed, "erasing does not carry concealment into blanks")
+        expect(
+            TerminalRowText.string(from: (0..<6).map { concealScreen.cell(atRow: 0, column: $0) }, trimmingTrailingSpaces: true)
+                == "apwz",
+            "concealed text is still copied like text with any other attribute"
+        )
 
         // MARK: - Screen: scroll region
 
@@ -628,6 +851,264 @@ struct FinderPathTerminalTests {
             !TerminalInputEncoder.encodePaste("a\u{1B}[31mb", bracketed: false).contains(0x1B),
             "unbracketed paste strips ESC bytes from content"
         )
+        // Pasted line breaks must arrive as Return (CR), as xterm and
+        // Terminal.app send them. LF is Ctrl-J, which nano/pico binds to
+        // justify, and CRLF would otherwise become two line breaks.
+        expect(
+            TerminalInputEncoder.encodePaste("one\ntwo\n", bracketed: false) == Array("one\rtwo\r".utf8),
+            "unbracketed paste sends LF line breaks as CR"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("one\r\ntwo\r\n", bracketed: false) == Array("one\rtwo\r".utf8),
+            "unbracketed paste collapses CRLF to a single CR"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("one\rtwo", bracketed: false) == Array("one\rtwo".utf8),
+            "unbracketed paste keeps a lone CR unchanged"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("a\r\n\nb\r\r\nc", bracketed: false) == Array("a\r\rb\r\rc".utf8),
+            "mixed line endings each become exactly one CR"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("one\r\ntwo\nthree", bracketed: true)
+                == Array("\u{1B}[200~".utf8) + Array("one\rtwo\rthree".utf8) + Array("\u{1B}[201~".utf8),
+            "bracketed paste normalizes line breaks inside the markers"
+        )
+        expect(
+            TerminalInputEncoder.encodePaste("a\u{1B}\nb", bracketed: false) == Array("a\rb".utf8),
+            "line-break normalization keeps ESC stripping"
+        )
+
+        // MARK: - Input encoder: key routing around the input method
+
+        typealias KeyPress = TerminalInputEncoder.KeyPress
+        func route(_ key: KeyPress, meta: Bool = false, composing: Bool = false) -> TerminalInputEncoder.KeyRoute {
+            TerminalInputEncoder.route(key, optionAsMeta: meta, isComposing: composing)
+        }
+        let plainA = KeyPress(characters: "a", charactersIgnoringModifiers: "a")
+        let returnKey = KeyPress(specialKey: .enter, characters: "\r", charactersIgnoringModifiers: "\r")
+        let backspaceKey = KeyPress(specialKey: .backspace, characters: "\u{7F}", charactersIgnoringModifiers: "\u{7F}")
+        let escapeKey = KeyPress(specialKey: .escape, characters: "\u{1B}", charactersIgnoringModifiers: "\u{1B}")
+        let leftArrow = KeyPress(specialKey: .left, characters: "\u{F702}", charactersIgnoringModifiers: "\u{F702}")
+        let shiftTab = KeyPress(specialKey: .tab, characters: "\u{19}", charactersIgnoringModifiers: "\t", shift: true)
+        let controlC = KeyPress(characters: "\u{03}", charactersIgnoringModifiers: "c", control: true)
+        let commandV = KeyPress(characters: "v", charactersIgnoringModifiers: "v", command: true)
+        // US layout Option-e is a dead key: AppKit reports no characters yet.
+        let deadOptionE = KeyPress(characters: "", charactersIgnoringModifiers: "e", option: true)
+        let functionF13 = KeyPress(characters: "\u{F710}", charactersIgnoringModifiers: "\u{F710}")
+
+        expect(route(plainA) == .inputMethod, "plain text goes through the input method so it can compose")
+        let heldA = KeyPress(characters: "a", charactersIgnoringModifiers: "a", isRepeat: true)
+        expect(route(heldA) == .text("a", meta: false), "a held key keeps repeating instead of opening the accent picker")
+        expect(route(heldA, composing: true) == .inputMethod, "a held key still reaches an open composition")
+        expect(route(deadOptionE) == .inputMethod, "a dead key reaches the input method instead of being dropped")
+        expect(route(returnKey) == .special(.enter, []), "Return keeps its direct encoding when nothing is composing")
+        expect(route(backspaceKey) == .special(.backspace, []), "Backspace keeps its direct encoding")
+        expect(route(escapeKey) == .special(.escape, []), "Escape keeps its direct encoding")
+        expect(route(leftArrow) == .special(.left, []), "arrows keep their direct encoding")
+        expect(route(shiftTab) == .special(.tab, [.shift]), "Shift-Tab keeps its modifier")
+        expect(route(controlC) == .bytes([0x03]), "Control combinations stay direct C0 bytes")
+        // AppKit binds ^/ to insertRightToLeftSlash:, which the input method
+        // consumes without calling back; Control keys must never reach it.
+        let controlSlash = KeyPress(characters: "/", charactersIgnoringModifiers: "/", control: true)
+        expect(route(controlSlash) == .text("/", meta: false), "a Control key without a C0 byte stays direct")
+        expect(route(controlSlash, composing: true) == .inputMethod, "an open composition still receives Control keys")
+        expect(route(deadOptionE, meta: true) == .text("e", meta: true), "Option-as-Meta still sends ESC-prefixed text")
+        expect(
+            route(KeyPress(specialKey: .left, characters: "\u{F702}", charactersIgnoringModifiers: "\u{F702}", option: true))
+                == .special(.left, []),
+            "Option is not a terminal modifier unless Option-as-Meta is enabled"
+        )
+        expect(route(commandV) == .commandShortcut, "Command shortcuts stay with the view and menus")
+        expect(route(functionF13) == .unhandled, "private-use function keys are never typed as text")
+        for key in [plainA, returnKey, backspaceKey, escapeKey, leftArrow, shiftTab, controlC, commandV, deadOptionE] {
+            expect(
+                route(key, composing: true) == .inputMethod,
+                "every key reaches the input method while a composition is in progress"
+            )
+        }
+        // When the input method hands a key back (doCommand), the key must
+        // produce exactly what it would have without an input method.
+        func handedBack(_ key: KeyPress) -> TerminalInputEncoder.KeyRoute {
+            TerminalInputEncoder.directRoute(key, optionAsMeta: false)
+        }
+        expect(handedBack(returnKey) == .special(.enter, []), "a handed-back Return is encoded as Return")
+        expect(handedBack(leftArrow) == .special(.left, []), "a handed-back arrow is encoded as that arrow")
+        expect(handedBack(controlC) == .bytes([0x03]), "a handed-back Control key is encoded as its C0 byte")
+        expect(handedBack(plainA) == .text("a", meta: false), "a handed-back character is typed directly")
+        expect(handedBack(deadOptionE) == .unhandled, "a handed-back dead key has no text to type")
+        expect(
+            TerminalInputEncoder.specialKey(forKeyCode: 36) == .enter
+                && TerminalInputEncoder.specialKey(forKeyCode: 76) == .enter,
+            "Return and keypad Enter are both the Enter key"
+        )
+        expect(TerminalInputEncoder.specialKey(forKeyCode: 14) == nil, "character keys have no special encoding")
+
+        // MARK: - Input encoder: marked (composing) text state
+
+        var marked = TerminalMarkedText()
+        expect(!marked.isActive, "no composition initially")
+        expect(marked.markedRange.location == NSNotFound, "an empty composition reports no marked range")
+        marked.mark("\u{00B4}", selectedRange: NSRange(location: 1, length: 0))
+        expect(marked.isActive && marked.text == "\u{00B4}", "a dead key accent becomes marked text")
+        expect(marked.markedRange == NSRange(location: 0, length: 1), "the marked range covers the accent")
+        expect(marked.selectedRange == NSRange(location: 1, length: 0), "the caret follows the accent")
+        marked.mark("\u{1F600}x", selectedRange: NSRange(location: 9, length: 4))
+        expect(marked.markedRange == NSRange(location: 0, length: 3), "marked ranges count UTF-16 units")
+        expect(marked.selectedRange == NSRange(location: 3, length: 0), "an out-of-range selection is clamped")
+        expect(marked.unmark() == "\u{1F600}x" && !marked.isActive, "unmarking accepts the marked text once")
+        expect(marked.unmark().isEmpty, "unmarking with nothing marked sends nothing")
+        marked.mark("\u{304B}", selectedRange: NSRange(location: 1, length: 0))
+        marked.mark("", selectedRange: NSRange(location: 0, length: 0))
+        expect(!marked.isActive, "an empty marked string cancels the composition")
+        marked.mark("\u{304B}", selectedRange: NSRange(location: 1, length: 0))
+        marked.discard()
+        expect(!marked.isActive && marked.unmark().isEmpty, "discarding drops the composition without text")
+
+        // MARK: - Terminal view: input method client sends exact bytes
+
+        do {
+            // A stand-in shell that reports each byte it receives as <xx>, so
+            // the assertions see exactly what the view sent through the PTY.
+            let hexShell = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("finderpath-hex-shell-\(UUID().uuidString)")
+            let hexShellScript = """
+            #!/bin/sh
+            stty raw -echo
+            printf READY
+            while :; do
+              chunk=$(dd bs=256 count=1 2>/dev/null | od -An -tx1 -v)
+              [ -n "$chunk" ] || exit 0
+              printf '<%s>' $chunk
+            done
+
+            """
+            try hexShellScript.write(to: hexShell, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hexShell.path)
+            defer { try? FileManager.default.removeItem(at: hexShell) }
+
+            let inputSession = TerminalSession(
+                name: "Input",
+                workingDirectory: NSTemporaryDirectory(),
+                shellPath: hexShell.path,
+                scrollbackLimit: 10
+            )
+            let inputView = TerminalView(frame: NSRect(x: 0, y: 0, width: 480, height: 160))
+            inputView.session = inputSession
+            inputSession.start()
+
+            func receivedBytes() -> String {
+                let screen = inputSession.screen
+                return (0..<screen.rows).map { screen.lineText($0) }.joined()
+                    .replacingOccurrences(of: " ", with: "")
+            }
+            // The whole transcript must match, so nothing extra (such as an
+            // uncommitted composition) can reach the shell unnoticed.
+            var transcript = "READY"
+            func expectReceived(_ bytes: String, _ message: String) {
+                transcript += bytes
+                for _ in 0..<500 where receivedBytes() != transcript {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+                }
+                expect(receivedBytes() == transcript, "\(message) (shell received \(receivedBytes()))")
+            }
+            func keyEvent(
+                _ characters: String,
+                _ charactersIgnoringModifiers: String,
+                keyCode: UInt16,
+                _ modifierFlags: NSEvent.ModifierFlags = []
+            ) -> NSEvent {
+                NSEvent.keyEvent(
+                    with: .keyDown,
+                    location: .zero,
+                    modifierFlags: modifierFlags,
+                    timestamp: 0,
+                    windowNumber: 0,
+                    context: nil,
+                    characters: characters,
+                    charactersIgnoringModifiers: charactersIgnoringModifiers,
+                    isARepeat: false,
+                    keyCode: keyCode
+                )!
+            }
+            let noReplacement = NSRange(location: NSNotFound, length: 0)
+
+            expectReceived("", "the byte-reporting shell starts")
+            inputView.keyDown(with: keyEvent("a", "a", keyCode: 0))
+            expectReceived("<61>", "plain typing reaches the shell through the input method")
+            inputView.keyDown(with: keyEvent("\r", "\r", keyCode: 36))
+            expectReceived("<0d>", "Return keeps its direct encoding")
+            inputView.keyDown(with: keyEvent("\u{03}", "c", keyCode: 8, .control))
+            expectReceived("<03>", "Control-C keeps its direct encoding")
+            inputView.keyDown(with: keyEvent("/", "/", keyCode: 44, .control))
+            expectReceived("<2f>", "Control-/ is not swallowed by the ^/ key binding")
+
+            inputView.setMarkedText("\u{00B4}", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
+            expect(inputView.hasMarkedText(), "a dead-key accent is held as marked text")
+            expect(inputView.markedRange() == NSRange(location: 0, length: 1), "the marked range covers the accent")
+            inputView.insertText("\u{00E9}", replacementRange: noReplacement)
+            expect(!inputView.hasMarkedText(), "committing ends the composition")
+            expectReceived("<c3><a9>", "the composed character is sent once, without the marked accent")
+
+            inputView.setMarkedText(
+                NSAttributedString(string: "\u{304B}"),
+                selectedRange: NSRange(location: 1, length: 0),
+                replacementRange: noReplacement
+            )
+            inputView.unmarkText()
+            expect(!inputView.hasMarkedText(), "unmarking ends the composition")
+            expectReceived("<e3><81><8b>", "unmarking accepts the marked text as typed")
+
+            inputView.setMarkedText("q", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
+            inputView.keyDown(with: keyEvent("\r", "\r", keyCode: 36))
+            expectReceived("<0d>", "a key the input method hands back keeps its terminal encoding")
+            inputView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: noReplacement)
+            expect(!inputView.hasMarkedText(), "an empty marked string cancels without sending")
+
+            // ^O is bound to two selectors; each doCommand(by:) call must not
+            // resend the same key.
+            inputView.setMarkedText("q", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
+            inputView.keyDown(with: keyEvent("\u{0F}", "o", keyCode: 31, .control))
+            expectReceived("<0f>", "an array key binding sends the handed-back key once")
+            inputView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: noReplacement)
+
+            inputView.setMarkedText("x", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
+            inputView.session = nil
+            expect(!inputView.hasMarkedText(), "detaching the session discards the composition")
+            inputView.session = inputSession
+            inputView.insertText("z", replacementRange: noReplacement)
+            expectReceived("<7a>", "a discarded composition is never sent")
+
+            expect(inputView.validAttributesForMarkedText().isEmpty, "marked text takes no attributes")
+            expect(inputView.characterIndex(for: .zero) == NSNotFound, "screen points map to no document index")
+
+            // Candidate windows anchor to the cursor cell in screen space.
+            _ = NSApplication.shared
+            let inputWindow = NSWindow(
+                contentRect: NSRect(x: 100, y: 200, width: 480, height: 160),
+                styleMask: .borderless,
+                backing: .buffered,
+                defer: true
+            )
+            inputWindow.contentView = inputView
+            let cursorScreen = inputSession.screen
+            let expectedCursorRect = NSRect(
+                x: 100 + CGFloat(cursorScreen.cursorColumn) * inputView.metrics.cellWidth,
+                y: 200 + 160 - CGFloat(cursorScreen.cursorRow + 1) * inputView.metrics.cellHeight,
+                width: inputView.metrics.cellWidth,
+                height: inputView.metrics.cellHeight
+            )
+            expect(
+                inputView.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
+                    == expectedCursorRect,
+                "the input method's first rect is the cursor cell in screen coordinates"
+            )
+            inputWindow.contentView = nil
+            inputSession.terminate()
+        } catch {
+            failures.append("input-method view fixture failed: \(error)")
+        }
 
         // MARK: - Parser: colon-delimited SGR (ITU-T)
 
@@ -897,6 +1378,126 @@ struct FinderPathTerminalTests {
             } catch {
                 failures.append("controlling-terminal test launch threw: \(error)")
             }
+        }
+
+        // MARK: - PTY descriptor isolation
+
+        do {
+            // A shell must inherit only its terminal. An inheritable app
+            // descriptor, such as the write end of a Foundation Pipe that a
+            // concurrent Finder path query is reading, would otherwise stay
+            // open for the shell's whole life and that reader would never see
+            // EOF. pipe() descriptors are inheritable by default; moving them
+            // far above anything the child opens keeps the listing unambiguous.
+            var pipeDescriptors: [Int32] = [-1, -1]
+            let pipeCreated = pipe(&pipeDescriptors) == 0
+            expect(pipeCreated, "descriptor isolation fixture creates a pipe")
+            let leakedRead = pipeCreated ? fcntl(pipeDescriptors[0], F_DUPFD, 200) : -1
+            var leakedWrite = pipeCreated ? fcntl(pipeDescriptors[1], F_DUPFD, 200) : -1
+            if pipeCreated {
+                close(pipeDescriptors[0])
+                close(pipeDescriptors[1])
+            }
+            defer {
+                if leakedRead >= 0 { close(leakedRead) }
+                if leakedWrite >= 0 { close(leakedWrite) }
+            }
+            expect(
+                leakedRead >= 200 && leakedWrite >= 200
+                    && fcntl(leakedWrite, F_GETFD) & FD_CLOEXEC == 0,
+                "descriptor isolation fixture holds an inheritable pipe"
+            )
+
+            func runInPTY(_ command: [String], input: String? = nil, until marker: String) -> String {
+                let pty = PTYProcess(
+                    executable: command[0],
+                    arguments: Array(command.dropFirst()),
+                    workingDirectory: "/tmp",
+                    environment: [:],
+                    rows: 24,
+                    columns: 80
+                )
+                let lock = NSLock()
+                var collected: [UInt8] = []
+                let done = DispatchSemaphore(value: 0)
+                pty.onOutput = { bytes in
+                    lock.lock(); collected.append(contentsOf: bytes); lock.unlock()
+                }
+                pty.onExit = { _ in done.signal() }
+                do {
+                    try pty.launch()
+                } catch {
+                    failures.append("descriptor isolation launch of \(command[0]) threw: \(error)")
+                    return ""
+                }
+                if let input { pty.write(Array(input.utf8)) }
+                if done.wait(timeout: .now() + 5) != .success { pty.terminate() }
+                var text = ""
+                for _ in 0..<100 {
+                    lock.lock(); text = String(decoding: collected, as: UTF8.self); lock.unlock()
+                    if text.contains(marker) { break }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                return text
+            }
+
+            // /dev/fd lists the caller's own descriptors: 0-2 plus the one
+            // the shell's glob opens to read the directory. (ls is avoided
+            // because fts holds a second descriptor for the working folder.)
+            let listing = runInPTY(["/bin/sh", "-c", "echo /dev/fd/*"], until: "/dev/fd/2")
+            let childDescriptors = Set(
+                listing.components(separatedBy: .whitespacesAndNewlines).compactMap { token in
+                    token.hasPrefix("/dev/fd/") ? Int32(token.dropFirst("/dev/fd/".count)) : nil
+                }
+            )
+            expect(
+                childDescriptors.isSuperset(of: [0, 1, 2]),
+                "spawned child keeps its terminal stdin, stdout, and stderr (saw \(childDescriptors.sorted()))"
+            )
+            expect(
+                !childDescriptors.contains(leakedRead) && !childDescriptors.contains(leakedWrite),
+                "spawned child does not inherit an unrelated app pipe (saw \(childDescriptors.sorted()))"
+            )
+            expect(
+                childDescriptors.subtracting([0, 1, 2]).count <= 1,
+                "spawned child holds no descriptors beyond its terminal (saw \(childDescriptors.sorted()))"
+            )
+
+            let ttyName = runInPTY(["/bin/sh", "-c", "tty"], until: "/dev/ttys")
+            expect(ttyName.contains("/dev/ttys"), "isolated child still owns its controlling terminal")
+            let echoed = runInPTY(
+                ["/bin/sh", "-c", "read line; echo \"got:$line\""],
+                input: "hello\r",
+                until: "got:hello"
+            )
+            expect(echoed.contains("got:hello"), "isolated child still reads terminal input")
+
+            // The user-visible failure: while any shell is open, the pipe
+            // reader must still see EOF once the app closes its write end.
+            let longLived = PTYProcess(
+                executable: "/bin/cat",
+                arguments: [],
+                workingDirectory: "/tmp",
+                environment: [:],
+                rows: 24,
+                columns: 80
+            )
+            let longLivedExited = DispatchSemaphore(value: 0)
+            longLived.onOutput = { _ in }
+            longLived.onExit = { _ in longLivedExited.signal() }
+            do {
+                try longLived.launch()
+                close(leakedWrite)
+                leakedWrite = -1
+                var readable = pollfd(fd: leakedRead, events: Int16(POLLIN), revents: 0)
+                var byte: UInt8 = 0
+                let sawEOF = poll(&readable, 1, 2000) == 1 && read(leakedRead, &byte, 1) == 0
+                expect(sawEOF, "a pipe reader sees EOF while a terminal shell is running")
+            } catch {
+                failures.append("descriptor isolation long-lived launch threw: \(error)")
+            }
+            longLived.terminate()
+            _ = longLivedExited.wait(timeout: .now() + 5)
         }
 
         // MARK: - PTY write/drain deadlock regression
@@ -2109,6 +2710,179 @@ struct FinderPathTerminalTests {
                 && statusScreen.cell(atRow: 0, column: 3).character == "o",
             "a wide status glyph advances two columns, so following text is not off by one"
         )
+
+        // MARK: - Parser: colon color groups cannot consume neighbouring attributes
+
+        var colorScopeParser = TerminalParser()
+        var retainedColorStyle = CellStyle.plain
+        retainedColorStyle.foreground = .ansi(1)
+        retainedColorStyle.bold = true
+        _ = colorScopeParser.parse(Array("\u{1B}[31;1m".utf8))
+        retainedColorStyle.underline = true
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[38:5;4m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an incomplete colon indexed color cannot steal the following underline attribute"
+        )
+        retainedColorStyle.italic = true
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[48:2:1:2;3m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an incomplete colon RGB color cannot steal the following italic attribute"
+        )
+        retainedColorStyle.foreground = .palette(9)
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[38:5:9:0m".utf8)) == [.setStyle(retainedColorStyle)],
+            "an extra colon color component cannot execute as a top-level style reset"
+        )
+        retainedColorStyle.background = .rgb(3, 4, 5)
+        expect(
+            colorScopeParser.parse(Array("\u{1B}[48:2:3:4:5;22m".utf8)) == [.setStyle({
+                var expected = retainedColorStyle
+                expected.bold = false
+                return expected
+            }())],
+            "a complete colon RGB group leaves later semicolon attributes independent"
+        )
+
+        // MARK: - Screen: streamed width-changing graphemes at the right margin
+
+        for glyph in ["❤️", "☹️", "↔️", "#️⃣", "1️⃣"] {
+            let text = "abc" + glyph + "X"
+            var completeGlyphScreen = TerminalScreen(rows: 2, columns: 4)
+            for character in text { completeGlyphScreen.apply(.print(character)) }
+            var streamedGlyphScreen = TerminalScreen(rows: 2, columns: 4)
+            var streamedGlyphParser = TerminalParser()
+            for byte in text.utf8 {
+                for action in streamedGlyphParser.parse([byte]) { streamedGlyphScreen.apply(action) }
+            }
+            expect(
+                (0..<2).allSatisfy { row in
+                    (0..<4).allSatisfy { column in
+                        streamedGlyphScreen.cell(atRow: row, column: column)
+                            == completeGlyphScreen.cell(atRow: row, column: column)
+                    }
+                },
+                "streamed \(glyph) keeps the same cells and wrap padding as one complete grapheme"
+            )
+            expect(
+                streamedGlyphScreen.cursorRow == completeGlyphScreen.cursorRow
+                    && streamedGlyphScreen.cursorColumn == completeGlyphScreen.cursorColumn,
+                "streamed \(glyph) leaves the cursor after the complete two-column grapheme"
+            )
+        }
+
+        var styledMargin = TerminalScreen(rows: 2, columns: 4)
+        var styledMarginParser = TerminalParser()
+        for action in styledMarginParser.parse(Array("abc\u{1B}[31m❤\u{1B}[34m\u{FE0F}X".utf8)) {
+            styledMargin.apply(action)
+        }
+        expect(
+            styledMargin.cell(atRow: 1, column: 0).character == "❤️"
+                && styledMargin.cell(atRow: 1, column: 0).style.foreground == .ansi(1),
+            "moving a widened grapheme to the next row retains the base character's style"
+        )
+        expect(
+            styledMargin.cell(atRow: 1, column: 2).character == "X"
+                && styledMargin.cell(atRow: 1, column: 2).style.foreground == .ansi(4),
+            "moving a widened grapheme does not change the active brush for following text"
+        )
+
+        for columns in [1, 4] {
+            var clippedGlyphScreen = TerminalScreen(rows: 2, columns: columns)
+            clippedGlyphScreen.apply(.setMode(.autowrap, false))
+            clippedGlyphScreen.apply(.moveCursor(row: 1, column: columns))
+            var clippedGlyphParser = TerminalParser()
+            for action in clippedGlyphParser.parse(Array("❤️".utf8)) { clippedGlyphScreen.apply(action) }
+            expect(
+                clippedGlyphScreen.cell(atRow: 0, column: columns - 1).character == "❤️",
+                "a clipped \(columns)-column terminal retains a grapheme's presentation selector"
+            )
+            expect(clippedGlyphScreen.cursorRow == 0, "disabled autowrap does not move a widened grapheme")
+        }
+
+        var toggledWrapScreen = TerminalScreen(rows: 2, columns: 4)
+        for character in "abcd" { toggledWrapScreen.apply(.print(character)) }
+        toggledWrapScreen.apply(.setMode(.autowrap, false))
+        toggledWrapScreen.apply(.print("X"))
+        toggledWrapScreen.apply(.setMode(.autowrap, true))
+        toggledWrapScreen.apply(.print("Y"))
+        expect(toggledWrapScreen.lineText(0) == "abcY", "reenabling autowrap does not wrap a prior clipped print")
+        toggledWrapScreen.apply(.print("Z"))
+        expect(toggledWrapScreen.lineText(1).hasPrefix("Z"), "new output wraps normally after autowrap is reenabled")
+
+        // MARK: - Screen: saved cursor follows rows retained by resize
+
+        var savedBeforeResize = TerminalScreen(rows: 6, columns: 8)
+        for row in 1...6 {
+            savedBeforeResize.apply(.moveCursor(row: row, column: 1))
+            for character in "ROW\(row)" { savedBeforeResize.apply(.print(character)) }
+        }
+        savedBeforeResize.apply(.moveCursor(row: 4, column: 2))
+        savedBeforeResize.apply(.saveCursor)
+        savedBeforeResize.apply(.moveCursor(row: 6, column: 5))
+        var parkedSavedBeforeResize = savedBeforeResize
+        savedBeforeResize.resize(rows: 3, columns: 8)
+        savedBeforeResize.apply(.restoreCursor)
+        parkedSavedBeforeResize.apply(.setMode(.alternateScreen, true))
+        parkedSavedBeforeResize.resize(rows: 3, columns: 8)
+        parkedSavedBeforeResize.apply(.setMode(.alternateScreen, false))
+        parkedSavedBeforeResize.apply(.restoreCursor)
+        expect(
+            savedBeforeResize.cursorRow == 0 && savedBeforeResize.cursorColumn == 1,
+            "restoring after a shrinking resize returns to the saved text's retained row"
+        )
+        expect(
+            savedBeforeResize.cursorRow == parkedSavedBeforeResize.cursorRow
+                && savedBeforeResize.cursorColumn == parkedSavedBeforeResize.cursorColumn,
+            "primary and parked-primary resize preserve saved cursor positions identically"
+        )
+
+        // MARK: - Selection: highlight and copy cover complete wide glyphs
+
+        var selectedWideScreen = TerminalScreen(rows: 1, columns: 6)
+        for character in "A界B" { selectedWideScreen.apply(.print(character)) }
+        let selectedWideCells = (0..<6).map { selectedWideScreen.cell(atRow: 0, column: $0) }
+        let startsOnContinuation = TerminalRowText.selectedColumns(in: selectedWideCells, from: 2, through: 3)
+        expect(
+            startsOnContinuation.map {
+                TerminalRowText.string(from: selectedWideCells[$0], trimmingTrailingSpaces: true)
+            } == "界B",
+            "copy starting on a wide glyph's right half includes that whole glyph"
+        )
+        expect(
+            startsOnContinuation?.contains(1) == true && startsOnContinuation?.contains(2) == true
+                && startsOnContinuation?.contains(0) == false,
+            "selection highlights both cells of its first wide glyph without selecting the preceding letter"
+        )
+        let endsOnBase = TerminalRowText.selectedColumns(in: selectedWideCells, from: 0, through: 1)
+        expect(
+            endsOnBase?.contains(2) == true && endsOnBase?.contains(3) == false,
+            "selection ending on a wide glyph's left half highlights its continuation too"
+        )
+        let onlyContinuation = TerminalRowText.selectedColumns(in: selectedWideCells, from: 2, through: 2)
+        expect(
+            onlyContinuation.map {
+                TerminalRowText.string(from: selectedWideCells[$0], trimmingTrailingSpaces: true)
+            } == "界",
+            "a selection containing only a continuation cell copies its visible glyph"
+        )
+        expect(
+            TerminalRowText.selectedColumns(in: selectedWideCells, from: 6, through: 8) == nil,
+            "a selection completely beyond a resized row stays empty"
+        )
+
+        // MARK: - Session: confirming the fallback name pins it over a shell title
+
+        let renamedFallbackSession = TerminalSession(name: "Terminal 1", workingDirectory: NSTemporaryDirectory())
+        renamedFallbackSession.handleOutput(Array("\u{1B}]2;running command\u{07}".utf8))
+        expect(renamedFallbackSession.displayName == "running command", "the shell initially supplies the tab title")
+        expect(renamedFallbackSession.rename(to: "Terminal 1"), "confirming the fallback name changes an unpinned session")
+        expect(
+            renamedFallbackSession.hasCustomName && renamedFallbackSession.displayName == "Terminal 1",
+            "an explicit fallback-name rename overrides the shell title"
+        )
+        renamedFallbackSession.handleOutput(Array("\u{1B}]2;another command\u{07}".utf8))
+        expect(renamedFallbackSession.displayName == "Terminal 1", "later shell titles cannot replace the explicit name")
+        expect(!renamedFallbackSession.rename(to: "Terminal 1"), "confirming an already pinned name is a metadata no-op")
 
         // MARK: - Result
 

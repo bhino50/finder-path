@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 struct RemoteServer: Equatable {
@@ -55,15 +56,18 @@ enum RemoteServers {
     /// silently vanished — or, with a newline, came back as a second phantom
     /// entry pointing at a different host.
     static func sanitizedName(_ rawName: String) -> String {
-        let flattened = rawName
+        var name = rawName
             .split(whereSeparator: \.isNewline)
             .joined(separator: " ")
             .replacingOccurrences(of: "=", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // A leading '#' would make `parse` treat the whole line as a comment.
-        guard flattened.hasPrefix("#") else { return flattened }
-        return String(flattened.drop(while: { $0 == "#" }))
-            .trimmingCharacters(in: .whitespaces)
+        // Markers can hide behind whitespace ("# # Dev"), so keep stripping
+        // until neither leads. An empty result falls back to the target.
+        while name.hasPrefix("#") {
+            name = String(name.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return name
     }
 
     // Saved SSH targets are limited to hostname / user@host / ssh-config alias
@@ -125,6 +129,46 @@ nonisolated struct TailscaleDevice: Identifiable, Hashable, Sendable {
 
     var id: String { address.isEmpty ? name : address }
     var isLinux: Bool { os.lowercased() == "linux" }
+}
+
+/// Resolve the selection against the rows currently displayed. Keeping a second
+/// cached target can connect to an old hostname after a Tailscale refresh, or to
+/// a device that the user has hidden with the platform filter.
+enum RemoteConnectionSelection {
+    static func target(
+        for selection: String?,
+        servers: [RemoteServer],
+        visibleDevices: [TailscaleDevice]
+    ) -> String? {
+        guard let selection else { return nil }
+        if selection.hasPrefix("srv:"),
+           let index = Int(selection.dropFirst(4)),
+           servers.indices.contains(index) {
+            return servers[index].target
+        }
+        if selection.hasPrefix("ts:"),
+           let device = visibleDevices.first(where: { $0.id == String(selection.dropFirst(3)) }) {
+            return device.name.isEmpty ? device.address : device.name
+        }
+        return nil
+    }
+}
+
+/// Counts presentations of the Connect to Server window. Its controller is
+/// created once and reused for the app's lifetime, and SwiftUI does not re-run
+/// onAppear when that window is ordered back in, so reopening it days later
+/// kept showing the first launch's Tailscale state. The view keys its refresh
+/// on `generation` instead. Zero means the hosting view is installed but the
+/// window has not been shown yet.
+@MainActor
+final class RemoteConnectionPresentation: ObservableObject {
+    @Published private(set) var generation: UInt64 = 0
+
+    var hasBeenPresented: Bool { generation > 0 }
+
+    func markPresented() {
+        generation &+= 1
+    }
 }
 
 nonisolated enum TailscaleFailure: Equatable, Sendable {
@@ -486,6 +530,10 @@ nonisolated enum ShellCommand {
     static func argument(_ value: String, quoteStyle: String = "single") -> String {
         switch quoteStyle {
         case "double":
+            // Interactive zsh/bash expand history inside double quotes. A
+            // backslash is not portable here, so preserve the literal filename
+            // with the existing single-quote encoder when it contains a bang.
+            if value.contains("!") { return argument(value) }
             let escaped = value
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
@@ -496,5 +544,34 @@ nonisolated enum ShellCommand {
         default:
             return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
         }
+    }
+
+    /// Quotes text typed into whatever login shell the user runs, so sh,
+    /// bash, zsh, fish, and tcsh all read back the same value. Ordinary
+    /// characters go inside single quotes. The three that one of those shells
+    /// still treats specially there (`'`, fish's `\`, and tcsh's history `!`)
+    /// are backslash-escaped outside the quotes, where all of them read `\x`
+    /// as a literal x. Scalars, not Characters, are scanned so a combining
+    /// mark cannot hide a quote. tcsh still rejects a newline inside quotes.
+    static func portableArgument(_ value: String) -> String {
+        guard !value.isEmpty else { return "''" }
+        var quoted = ""
+        var run = String.UnicodeScalarView()
+        func closeRun() {
+            guard !run.isEmpty else { return }
+            quoted += "'\(String(run))'"
+            run = String.UnicodeScalarView()
+        }
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "'", "\\", "!":
+                closeRun()
+                quoted += "\\\(scalar)"
+            default:
+                run.append(scalar)
+            }
+        }
+        closeRun()
+        return quoted
     }
 }

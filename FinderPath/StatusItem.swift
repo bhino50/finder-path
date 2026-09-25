@@ -22,6 +22,8 @@ final class StatusItemController: NSObject {
     private var menuOptionHeld = false
     private var harnessMenuItemBindings: [HarnessMenuItemBinding] = []
     private var hoverDwellTimer: Timer?
+    private var launcherAvailability = LauncherAvailabilityState()
+    private var launcherAvailabilityTask: Task<Void, Never>?
 
     // Hovering the status item quick-picks an open terminal session without a
     // click. Lazy so the picker only exists once a hover actually qualifies.
@@ -88,6 +90,7 @@ final class StatusItemController: NSObject {
         }
 
         updateStatusItemAppearance()
+        refreshLauncherAvailability()
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
@@ -95,6 +98,8 @@ final class StatusItemController: NSObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.updateStatusItemAppearance()
+                self?.refreshLauncherAvailability()
+                self?.rebuildTrackedMenuIfNeeded()
             }
         }
     }
@@ -168,6 +173,7 @@ final class StatusItemController: NSObject {
         // A beachballed Finder can no longer freeze the click.
         menuOptionHeld = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.option)
         isMenuTracking = true
+        refreshLauncherAvailability()
         state.refresh { [weak self] in
             self?.rebuildTrackedMenuIfNeeded()
         }
@@ -212,10 +218,31 @@ final class StatusItemController: NSObject {
         rebuildMenu(menu, optionHeld: menuOptionHeld)
     }
 
-    /// The agents the menu may offer, in display order. Availability stats every
-    /// directory on PATH, so it is resolved here once per rebuild and handed to
-    /// every row that needs it — doing it per row would mean hundreds of
-    /// filesystem calls each time the menu is built, twice per click.
+    private func launcherRequests() -> [String: AgentAvailabilityRequest] {
+        [
+            "Codex": AgentAvailabilityRequest(executable: FinderPathPreferences.codexExecutable),
+            "Claude": AgentAvailabilityRequest(executable: FinderPathPreferences.claudeExecutable),
+            "Hermes": AgentAvailabilityRequest(executable: FinderPathPreferences.hermesExecutable),
+            "cmux": AgentAvailabilityRequest(
+                executable: "cmux", fallbackPaths: [TerminalBridge.cmuxBundleExecutablePath]
+            )
+        ]
+    }
+
+    private func refreshLauncherAvailability() {
+        let requests = launcherRequests()
+        let generation = launcherAvailability.begin(requests)
+        launcherAvailabilityTask?.cancel()
+        launcherAvailabilityTask = Task { @MainActor [weak self] in
+            let results = await AgentLauncher.checkAvailability(for: requests)
+            guard !Task.isCancelled, let self,
+                  self.launcherAvailability.complete(results, generation: generation) else { return }
+            self.rebuildTrackedMenuIfNeeded()
+        }
+    }
+
+    /// Menu construction reads completed probes only; checking a configured
+    /// executable on an unresponsive network mount must not block menu tracking.
     private func agentOptions() -> [RecentPathAgentOption] {
         [
             ("Codex", FinderPathPreferences.codexExecutable, FinderPathPreferences.showOpenWithCodexItem),
@@ -225,7 +252,9 @@ final class StatusItemController: NSObject {
             RecentPathAgentOption(
                 name: name,
                 executable: executable,
-                availability: AgentLauncher.availability(for: executable),
+                availability: launcherAvailability.availability(
+                    for: name, request: AgentAvailabilityRequest(executable: executable)
+                ),
                 isEnabled: isEnabled
             )
         }
@@ -238,8 +267,11 @@ final class StatusItemController: NSObject {
 
         let isPermissionDenied = FinderBridge.isPermissionDenied(state.currentPath)
         let agents = agentOptions()
+        let cmuxRequest = AgentAvailabilityRequest(
+            executable: "cmux", fallbackPaths: [TerminalBridge.cmuxBundleExecutablePath]
+        )
         let launcherAvailability = RecentPathLauncherAvailability(
-            isCmuxInstalled: TerminalBridge.isCmuxInstalled,
+            isCmuxInstalled: self.launcherAvailability.availability(for: "cmux", request: cmuxRequest).isInstalled,
             isGhosttyInstalled: TerminalBridge.isGhosttyInstalled
         )
 
@@ -540,6 +572,7 @@ final class StatusItemController: NSObject {
     }
 
     @objc private func refreshMenuItem() {
+        refreshLauncherAvailability()
         state.refresh { [weak self] in
             self?.rebuildTrackedMenuIfNeeded()
         }
@@ -627,16 +660,18 @@ final class StatusItemController: NSObject {
     /// path rows pass their own.
     private func openHarnessTerminal(executable: String, name: String, directory: String? = nil) {
         guard let button = statusItem.button else { return }
-        guard let resolvedPath = AgentLauncher.availability(for: executable).resolvedPath else {
-            FinderPathAlertPresenter.presentLaunchFailure(
-                "\(name) CLI was not found. Check its command or path in FinderPath Settings.",
-                displayName: name
-            )
-            return
-        }
         let requestedDirectory = directory ?? (state.hasCopyablePath ? state.currentPath : NSHomeDirectory())
-        state.withResolvedActionTarget(requestedDirectory) { [weak self, weak button] workingDirectory in
-            guard let self, let button else { return }
+        Task { @MainActor [weak self, weak button] in
+            let availability = await AgentLauncher.checkAvailability(for: executable)
+            guard !Task.isCancelled, let self, let button else { return }
+            guard let resolvedPath = availability.resolvedPath else {
+                FinderPathAlertPresenter.presentLaunchFailure(
+                    "\(name) CLI could not be found. Check its command or path and reconnect any volume it uses.",
+                    displayName: name
+                )
+                return
+            }
+            guard let workingDirectory = await self.state.validatedActionTarget(requestedDirectory) else { return }
             let session = TerminalSessionStore.shared.newSession(
                 name: name,
                 workingDirectory: workingDirectory,

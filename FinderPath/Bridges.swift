@@ -239,7 +239,7 @@ nonisolated enum FinderBridge {
     }
 }
 
-struct AgentAvailability: Equatable, Sendable {
+nonisolated struct AgentAvailability: Equatable, Sendable {
     let executable: String
     let resolvedPath: String?
 
@@ -252,7 +252,106 @@ struct AgentAvailability: Equatable, Sendable {
     }
 }
 
+nonisolated struct AgentAvailabilityRequest: Hashable, Sendable {
+    let executable: String
+    var defaultExecutable: String? = nil
+    var fallbackPaths: [String] = []
+}
+
+/// Shares bounded background probes across menu rebuilds and launch actions.
+/// A cache miss never runs filesystem work on the caller's actor, and repeated
+/// requests for a stalled executable share one worker instead of piling up.
+actor AgentAvailabilityCache {
+    typealias Resolver = @Sendable (AgentAvailabilityRequest) -> AgentAvailability
+
+    private struct CachedResult {
+        let availability: AgentAvailability
+        let fetchedAt: Date
+    }
+
+    private let resolver: Resolver
+    private let maximumAge: TimeInterval
+    private let capacity: Int
+    private var cached: [AgentAvailabilityRequest: CachedResult] = [:]
+    private var inFlight: [AgentAvailabilityRequest: Task<AgentAvailability, Never>] = [:]
+
+    init(maximumAge: TimeInterval = 8, capacity: Int = 32, resolver: @escaping Resolver) {
+        self.maximumAge = maximumAge
+        self.capacity = max(1, capacity)
+        self.resolver = resolver
+    }
+
+    func availability(for request: AgentAvailabilityRequest) async -> AgentAvailability {
+        if let task = inFlight[request] { return await task.value }
+        if let result = cached[request], Date().timeIntervalSince(result.fetchedAt) < maximumAge {
+            return result.availability
+        }
+        // Each production worker has a process timeout. Also cap distinct
+        // pending requests so rapid preference changes cannot exhaust workers.
+        guard inFlight.count < capacity else {
+            return .unknown(executable: request.executable)
+        }
+        let resolver = self.resolver
+        let task = Task.detached(priority: .userInitiated) { resolver(request) }
+        inFlight[request] = task
+        let result = await task.value
+        inFlight[request] = nil
+        if cached.count >= capacity,
+           let oldest = cached.min(by: { $0.value.fetchedAt < $1.value.fetchedAt })?.key {
+            cached[oldest] = nil
+        }
+        cached[request] = CachedResult(availability: result, fetchedAt: Date())
+        return result
+    }
+}
+
+/// Menu results belong to the exact request set that produced them. A slower
+/// lookup from an earlier click or executable edit cannot replace newer rows.
+nonisolated struct LauncherAvailabilityState {
+    private(set) var generation: UInt64 = 0
+    private var requests: [String: AgentAvailabilityRequest] = [:]
+    private var results: [String: AgentAvailability] = [:]
+
+    mutating func begin(_ requests: [String: AgentAvailabilityRequest]) -> UInt64 {
+        generation &+= 1
+        results = results.filter { self.requests[$0.key] == requests[$0.key] }
+        self.requests = requests
+        return generation
+    }
+
+    @discardableResult
+    mutating func complete(_ results: [String: AgentAvailability], generation: UInt64) -> Bool {
+        guard generation == self.generation else { return false }
+        self.results = results
+        return true
+    }
+
+    func availability(for key: String, request: AgentAvailabilityRequest) -> AgentAvailability {
+        guard requests[key] == request, let result = results[key] else {
+            return .unknown(executable: request.executable)
+        }
+        return result
+    }
+}
+
 nonisolated enum AgentLauncher {
+    private static let availabilityCache = AgentAvailabilityCache { resolveAvailability($0) }
+    private static let probeLimits = BoundedProcessRunner.Limits(
+        timeout: 2,
+        terminationGrace: 0.2,
+        maximumStandardOutputBytes: 64 * 1_024,
+        maximumStandardErrorBytes: 1_024
+    )
+    private static let executableProbeSource = """
+    for candidate do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\\0' "$candidate"
+            exit 0
+        fi
+    done
+    exit 1
+    """
+
     struct MenuPresentation: Equatable {
         let title: String
         let usesBuiltInTerminal: Bool
@@ -281,49 +380,101 @@ nonisolated enum AgentLauncher {
     }
 
     static func availability(for executable: String, defaultExecutable: String? = nil) -> AgentAvailability {
-        let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
-        let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
-        guard !commandName.isEmpty else {
-            return AgentAvailability(executable: executable, resolvedPath: nil)
-        }
-
-        let expandedCommand = NSString(string: commandName).expandingTildeInPath
-        if expandedCommand.contains("/") {
-            let path = URL(fileURLWithPath: expandedCommand).standardizedFileURL.path
-            return AgentAvailability(
-                executable: commandName,
-                resolvedPath: isExecutableRegularFile(atPath: path) ? path : nil
-            )
-        }
-
-        let resolvedPath = executableSearchDirectories()
-            .lazy
-            .map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(commandName).path }
-            .first { isExecutableRegularFile(atPath: $0) }
-
+        let (commandName, candidates) = executableCandidates(for: executable, defaultExecutable: defaultExecutable)
         return AgentAvailability(
             executable: commandName,
-            resolvedPath: resolvedPath
+            resolvedPath: candidates.first { isExecutableRegularFile(atPath: $0) }
         )
     }
 
-    // Retain an async API for UI call sites. Resolution is now a fast filesystem
-    // lookup rather than a login-shell subprocess, so opening the menu cannot be
-    // delayed by shell startup files or a stuck command probe.
-    static func checkAvailability(for executable: String, defaultExecutable: String? = nil) async -> AgentAvailability {
-        availability(for: executable, defaultExecutable: defaultExecutable)
+    private static func executableCandidates(
+        for executable: String,
+        defaultExecutable: String?
+    ) -> (String, [String]) {
+        let trimmedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commandName = trimmedExecutable.isEmpty ? (defaultExecutable ?? "") : trimmedExecutable
+        guard !commandName.isEmpty else { return (executable, []) }
+
+        let expandedCommand = NSString(string: commandName).expandingTildeInPath
+        if expandedCommand.contains("/") {
+            let path = URL(fileURLWithPath: expandedCommand, isDirectory: false).standardizedFileURL.path
+            return (commandName, [path])
+        }
+
+        let candidates = executableSearchDirectories().map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+                .appendingPathComponent(commandName, isDirectory: false).path
+        }
+        return (commandName, candidates)
+    }
+
+    /// The fixed shell program receives paths only as argv. A disconnected
+    /// mount can block test(1), so the checks live in a time-limited subprocess,
+    /// not in the menu process. NUL termination preserves newlines in filenames.
+    private static func resolveAvailability(_ request: AgentAvailabilityRequest) -> AgentAvailability {
+        let (commandName, candidates) = executableCandidates(
+            for: request.executable, defaultExecutable: request.defaultExecutable
+        )
+        let paths = candidates + request.fallbackPaths
+        guard !paths.isEmpty else { return .unknown(executable: commandName) }
+        let outcome = BoundedProcessRunner.run(
+            executable: "/bin/sh",
+            arguments: ["-c", executableProbeSource, "FinderPath executable check"] + paths,
+            limits: probeLimits
+        )
+        guard case .exited(let status, let output) = outcome,
+              status == 0, !output.standardOutputWasTruncated,
+              output.standardOutput.last == 0,
+              let path = String(data: output.standardOutput.dropLast(), encoding: .utf8),
+              paths.contains(path) else {
+            return .unknown(executable: commandName)
+        }
+        return AgentAvailability(executable: commandName, resolvedPath: path)
+    }
+
+    static func checkAvailability(
+        for executable: String,
+        defaultExecutable: String? = nil,
+        fallbackPaths: [String] = []
+    ) async -> AgentAvailability {
+        await availabilityCache.availability(for: AgentAvailabilityRequest(
+            executable: executable, defaultExecutable: defaultExecutable, fallbackPaths: fallbackPaths
+        ))
+    }
+
+    static func checkAvailability(
+        for requests: [String: AgentAvailabilityRequest]
+    ) async -> [String: AgentAvailability] {
+        await withTaskGroup(of: (String, AgentAvailability).self) { group in
+            for (key, request) in requests {
+                group.addTask { (key, await availabilityCache.availability(for: request)) }
+            }
+            var results: [String: AgentAvailability] = [:]
+            for await (key, availability) in group { results[key] = availability }
+            return results
+        }
+    }
+
+    /// Folders searched for a bare command name, ahead of FinderPath's own
+    /// PATH. No shell startup file is read, and an app opened from the Dock or
+    /// at login inherits only /usr/bin:/bin:/usr/sbin:/sbin, so a CLI that
+    /// nvm, Volta, bun, or pnpm installs needs its full path in Settings.
+    static let commonSearchDirectories = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "~/.local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin"
+    ]
+
+    static var searchLocationsSummary: String {
+        commonSearchDirectories.joined(separator: ", ")
     }
 
     private static func executableSearchDirectories() -> [String] {
-        let commonDirectories = [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "\(NSHomeDirectory())/.local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin"
-        ]
+        let commonDirectories = commonSearchDirectories.map { NSString(string: $0).expandingTildeInPath }
         let inheritedDirectories = ProcessInfo.processInfo.environment["PATH"]?
             .split(separator: ":")
             .map(String.init) ?? []
@@ -345,8 +496,8 @@ enum TerminalBridge {
         cmuxExecutablePath() != nil
     }
 
-    // cmux is a Ghostty-based workspace manager. Its CLI may live on the user's
-    // shell PATH or only inside the app bundle, so check both.
+    // cmux is a Ghostty-based workspace manager. Its CLI may be in one of the
+    // launcher search folders or only inside the app bundle, so check both.
     static func cmuxExecutablePath() -> String? {
         if let resolved = AgentLauncher.availability(for: "cmux", defaultExecutable: "cmux").resolvedPath {
             return resolved
@@ -405,23 +556,25 @@ enum TerminalBridge {
 
     static func openCmux(at path: String, completion: @escaping (String?) -> Void) {
         let directoryPath = URL(fileURLWithPath: path, isDirectory: true).path
-
-        guard let cmuxPath = cmuxExecutablePath() else {
-            completion("cmux CLI was not found. Install cmux or add it to your shell PATH.")
-            return
-        }
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: cmuxPath)
-        task.arguments = [directoryPath]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-
-        do {
-            try task.run()
-            completion(nil)
-        } catch {
-            completion("Could not open cmux: \(error.localizedDescription)")
+        Task.detached {
+            let availability = await AgentLauncher.checkAvailability(
+                for: "cmux", fallbackPaths: [cmuxBundleExecutablePath]
+            )
+            guard let cmuxPath = availability.resolvedPath else {
+                completion("cmux CLI could not be found. Install cmux or reconnect the volume that contains it.")
+                return
+            }
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: cmuxPath)
+            task.arguments = [directoryPath]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            do {
+                try task.run()
+                completion(nil)
+            } catch {
+                completion("Could not open cmux: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -573,39 +726,6 @@ enum TerminalBridge {
     /// same approach FinderBridge.fetchCurrentPath already uses, for the same
     /// reason. The completion may run off the main actor, matching the
     /// contract openGhostty/openSSHInGhostty already have.
-    /// Builds the AppleScript that runs `command` in Terminal.app.
-    ///
-    /// Terminal launched cold by an Apple event still opens its startup window
-    /// before servicing `do script`, so an unconditional `do script` produced
-    /// two windows per launch: the idle startup window plus the command
-    /// window. The running state is read outside the tell block — the first
-    /// event inside it would launch Terminal and hide whether the startup
-    /// window is fresh — and a cold launch reuses window 1, falling back to a
-    /// new window when Terminal is configured to start without one. The
-    /// timeout is generous because a cold launch (or the TCC consent prompt)
-    /// can exceed a few seconds, and a premature -1712 surfaced as a spurious
-    /// launch-failure alert while the window went on to open anyway.
-    static func terminalLaunchScriptSource(command: String) -> String {
-        """
-        set launchCommand to "\(escapedAppleScriptString(command))"
-        set terminalWasRunning to application id "com.apple.Terminal" is running
-        with timeout of 30 seconds
-            tell application id "com.apple.Terminal"
-                if terminalWasRunning then
-                    do script launchCommand
-                else
-                    try
-                        do script launchCommand in window 1
-                    on error
-                        do script launchCommand
-                    end try
-                end if
-                activate
-            end tell
-        end timeout
-        """
-    }
-
     private static func runTerminalScript(
         command: String,
         completion: @escaping (String?) -> Void
@@ -646,30 +766,14 @@ enum TerminalBridge {
         at path: String,
         completion: @escaping (String?) -> Void
     ) {
-        let directoryPath = URL(fileURLWithPath: path, isDirectory: true).path
-        let executableArgument = ShellCommand.argument(executable)
-        let missingMessage = "\(displayName) CLI was not found. Install it or add \(executable) to your shell PATH."
-        let command = """
-        clear; cd \(ShellCommand.argument(directoryPath)) && if command -v -- \(executableArgument) >/dev/null 2>&1; then exec \(executableArgument); else echo \(ShellCommand.argument(missingMessage)); exec ${SHELL:-/bin/zsh} -l; fi
-        """
+        let command = agentLaunchCommand(
+            displayName: displayName,
+            executable: executable,
+            directoryPath: URL(fileURLWithPath: path, isDirectory: true).path
+        )
 
         // Terminal can open a folder through NSWorkspace, but running a CLI
         // command in a new tab/window requires Terminal's AppleScript interface.
         runTerminalScript(command: command, completion: completion)
-    }
-
-    /// AppleScript string literals cannot span raw newlines, but they do
-    /// understand `\n` and `\r` escapes. Replacing the characters with spaces
-    /// (as this used to) silently rewrote the command: a folder whose name
-    /// contains a newline — legal on APFS — turned `cd '/tmp/a<LF>b'` into
-    /// `cd '/tmp/a b'`, so the launch landed in the wrong directory or failed.
-    /// Emitting the escape preserves the byte. Backslash is escaped first so
-    /// the escapes added below are not themselves doubled.
-    static func escapedAppleScriptString(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .replacingOccurrences(of: "\n", with: "\\n")
     }
 }
