@@ -143,6 +143,9 @@ final class TerminalView: NSView {
     /// The event interpretKeyEvents is processing, so a key the input method
     /// hands back through doCommand(by:) keeps its terminal encoding.
     private var interpretingKeyEvent: NSEvent?
+    /// Array key bindings (^O, Option-Up) call doCommand(by:) once per
+    /// selector; the handed-back key is still sent only once.
+    private var interpretedKeyWasHandedBack = false
 
     private var screenDirty = false
     private var redrawTimer: DispatchSourceTimer?
@@ -666,6 +669,8 @@ final class TerminalView: NSView {
             NSSound.beep()
             return
         }
+        guard !interpretedKeyWasHandedBack else { return }
+        interpretedKeyWasHandedBack = true
         let route = TerminalInputEncoder.directRoute(
             Self.keyPress(for: event),
             optionAsMeta: FinderPathPreferences.terminalOptionAsMeta
@@ -681,8 +686,13 @@ final class TerminalView: NSView {
         switch route {
         case .inputMethod:
             let outerEvent = interpretingKeyEvent
+            let outerHandedBack = interpretedKeyWasHandedBack
             interpretingKeyEvent = event
-            defer { interpretingKeyEvent = outerEvent }
+            interpretedKeyWasHandedBack = false
+            defer {
+                interpretingKeyEvent = outerEvent
+                interpretedKeyWasHandedBack = outerHandedBack
+            }
             interpretKeyEvents([event])
         case .commandShortcut:
             performCommandShortcut(event)

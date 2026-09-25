@@ -192,12 +192,14 @@ enum TerminalInputEncoder {
     /// which report no characters yet) go to the input method; everything
     /// with a terminal encoding keeps it. Auto-repeats of plain text stay
     /// direct so a held key keeps repeating, as terminals expect, instead of
-    /// opening the press-and-hold accent picker.
+    /// opening the press-and-hold accent picker. Control keys stay direct
+    /// too: AppKit binds some of them (^/ to insertRightToLeftSlash:) to
+    /// actions the input method consumes without calling back.
     static func route(_ key: KeyPress, optionAsMeta: Bool, isComposing: Bool) -> KeyRoute {
         if isComposing { return .inputMethod }
         let direct = directRoute(key, optionAsMeta: optionAsMeta)
         switch direct {
-        case .text(_, meta: false) where !key.isRepeat:
+        case .text(_, meta: false) where !key.isRepeat && !key.control:
             return .inputMethod
         case .unhandled where (key.characters ?? "").isEmpty:
             return .inputMethod

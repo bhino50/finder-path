@@ -350,6 +350,22 @@ struct FinderPathTerminalTests {
         )
         expect(repParser.parse(Array("\u{1B}c\u{1B}[b".utf8)) == [.hardReset], "RIS forgets the character REP would repeat")
 
+        // A huge REP count is bounded by the line width, so a few bytes of
+        // hostile output cannot force thousands of prints on the main thread.
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        for action in repParser.parse(Array("a\u{1B}[9999b".utf8)) { repScreen.apply(action) }
+        expect(
+            repScreen.lineText(0) == "aaaa" && repScreen.lineText(1) == "a   " && repScreen.lineText(2) == "    ",
+            "REP repeats at most one line width"
+        )
+        repParser = TerminalParser()
+        repScreen = TerminalScreen(rows: 24, columns: 80, scrollbackLimit: 1_000)
+        let hostileREP = Array(String(repeating: "a\u{1B}[9999b", count: 9_000).utf8)
+        let repStart = Date()
+        for action in repParser.parse(hostileREP) { repScreen.apply(action) }
+        expect(Date().timeIntervalSince(repStart) < 1.0, "hostile REP output stays cheap to apply")
+
         // MARK: - Screen: Unicode cell widths and split graphemes
 
         expect(TerminalScreen.columnWidth(of: "A") == 1, "ASCII occupies one terminal column")
@@ -893,6 +909,11 @@ struct FinderPathTerminalTests {
         expect(route(leftArrow) == .special(.left, []), "arrows keep their direct encoding")
         expect(route(shiftTab) == .special(.tab, [.shift]), "Shift-Tab keeps its modifier")
         expect(route(controlC) == .bytes([0x03]), "Control combinations stay direct C0 bytes")
+        // AppKit binds ^/ to insertRightToLeftSlash:, which the input method
+        // consumes without calling back; Control keys must never reach it.
+        let controlSlash = KeyPress(characters: "/", charactersIgnoringModifiers: "/", control: true)
+        expect(route(controlSlash) == .text("/", meta: false), "a Control key without a C0 byte stays direct")
+        expect(route(controlSlash, composing: true) == .inputMethod, "an open composition still receives Control keys")
         expect(route(deadOptionE, meta: true) == .text("e", meta: true), "Option-as-Meta still sends ESC-prefixed text")
         expect(
             route(KeyPress(specialKey: .left, characters: "\u{F702}", charactersIgnoringModifiers: "\u{F702}", option: true))
@@ -1020,6 +1041,8 @@ struct FinderPathTerminalTests {
             expectReceived("<0d>", "Return keeps its direct encoding")
             inputView.keyDown(with: keyEvent("\u{03}", "c", keyCode: 8, .control))
             expectReceived("<03>", "Control-C keeps its direct encoding")
+            inputView.keyDown(with: keyEvent("/", "/", keyCode: 44, .control))
+            expectReceived("<2f>", "Control-/ is not swallowed by the ^/ key binding")
 
             inputView.setMarkedText("\u{00B4}", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
             expect(inputView.hasMarkedText(), "a dead-key accent is held as marked text")
@@ -1042,6 +1065,13 @@ struct FinderPathTerminalTests {
             expectReceived("<0d>", "a key the input method hands back keeps its terminal encoding")
             inputView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: noReplacement)
             expect(!inputView.hasMarkedText(), "an empty marked string cancels without sending")
+
+            // ^O is bound to two selectors; each doCommand(by:) call must not
+            // resend the same key.
+            inputView.setMarkedText("q", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
+            inputView.keyDown(with: keyEvent("\u{0F}", "o", keyCode: 31, .control))
+            expectReceived("<0f>", "an array key binding sends the handed-back key once")
+            inputView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: noReplacement)
 
             inputView.setMarkedText("x", selectedRange: NSRange(location: 1, length: 0), replacementRange: noReplacement)
             inputView.session = nil

@@ -161,10 +161,12 @@ struct TerminalScreen {
             printCharacter(character)
         case .repeatCharacter(let character, let count):
             // xterm repeats only a character that occupies a column, so REP
-            // after a combining mark cannot stack marks onto one cell. The
-            // parser's parameter clamp bounds the work.
+            // after a combining mark cannot stack marks onto one cell. Like
+            // IL and SU, the count is bounded by geometry: real emitters
+            // (ncurses rep) repeat runs within one line, and a few bytes of
+            // hostile output must not force thousands of prints.
             guard Self.columnWidth(of: character) > 0 else { break }
-            for _ in 0..<max(count, 1) { printCharacter(character) }
+            for _ in 0..<min(max(count, 1), columns) { printCharacter(character) }
         case .lineFeed:
             lineFeed()
         case .carriageReturn:
