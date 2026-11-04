@@ -57,6 +57,15 @@ final class TerminalSession: Identifiable {
         return String(base.prefix(maxLength - 1)).trimmingCharacters(in: .whitespaces) + "\u{2026}"
     }
 
+    /// Applies explicit naming intent independently of persistence. The store
+    /// saves and notifies only when this changes the session's metadata.
+    func rename(to newName: String) -> Bool {
+        guard name != newName || !hasCustomName else { return false }
+        name = newName
+        hasCustomName = true
+        return true
+    }
+
     private let shellPath: String
     private let scrollbackLimit: Int
     /// Optional command run once after the shell starts, e.g. a CLI agent like

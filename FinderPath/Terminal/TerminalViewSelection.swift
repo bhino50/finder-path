@@ -24,7 +24,7 @@ extension TerminalView {
     /// Whether a cell participates in the current selection. Line-major:
     /// interior lines are fully covered, the first and last lines are bounded
     /// by their respective columns.
-    func isSelected(contentLine: Int, column: Int) -> Bool {
+    func isSelected(contentLine: Int, column: Int, rowCells: [TerminalCell]) -> Bool {
         guard hasActiveSelection, let anchor = selectionAnchor, let head = selectionHead,
               let session else { return false }
         let start = min(anchor, head)
@@ -34,12 +34,13 @@ extension TerminalView {
         let line = session.screen.absoluteLine(forContentLine: contentLine)
 
         guard line >= start.line, line <= end.line else { return false }
-        if start.line == end.line {
-            return column >= start.column && column <= end.column
-        }
-        if line == start.line { return column >= start.column }
-        if line == end.line { return column <= end.column }
-        return true
+        let firstColumn = line == start.line ? start.column : 0
+        let lastColumn = line == end.line ? end.column : rowCells.count - 1
+        return TerminalRowText.selectedColumns(
+            in: rowCells,
+            from: firstColumn,
+            through: lastColumn
+        )?.contains(column) == true
     }
 
     func clearSelection() {
@@ -96,15 +97,18 @@ extension TerminalView {
             let continues = screen.isLineWrapped(contentLine: line)
             let firstColumn = absoluteLine == start.line ? start.column : 0
             let lastColumn = absoluteLine == end.line ? end.column : cells.count - 1
-            guard firstColumn <= lastColumn, firstColumn < cells.count else {
+            guard let selectedColumns = TerminalRowText.selectedColumns(
+                in: cells,
+                from: firstColumn,
+                through: lastColumn
+            ) else {
                 rows.append(TerminalTextJoiner.Row(text: "", continuesToNextRow: continues))
                 continue
             }
-            let upperBound = min(lastColumn, cells.count - 1)
             // Trailing blanks are row padding, not content -- but a wrapped row
             // runs to the edge, so trimming it would eat real characters.
             let text = TerminalRowText.string(
-                from: cells[firstColumn...upperBound],
+                from: cells[selectedColumns],
                 trimmingTrailingSpaces: !continues
             )
             rows.append(TerminalTextJoiner.Row(text: text, continuesToNextRow: continues))

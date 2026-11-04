@@ -18,8 +18,8 @@ nonisolated enum BoundedProcessRunner {
             maximumStandardOutputBytes: Int,
             maximumStandardErrorBytes: Int
         ) {
-            self.timeout = max(timeout, 0)
-            self.terminationGrace = max(terminationGrace, 0)
+            self.timeout = timeout.isFinite ? max(timeout, 0) : 0
+            self.terminationGrace = terminationGrace.isFinite ? max(terminationGrace, 0) : 0
             self.maximumStandardOutputBytes = max(maximumStandardOutputBytes, 0)
             self.maximumStandardErrorBytes = max(maximumStandardErrorBytes, 0)
         }
@@ -39,6 +39,20 @@ nonisolated enum BoundedProcessRunner {
         case launchFailed(message: String)
     }
 
+    enum MonitoredOutcome: Equatable, Sendable {
+        case completed(Outcome)
+        case stopped(reason: String, output: CapturedOutput)
+    }
+
+    /// What happens to processes a command leaves behind after exiting on its
+    /// own. Timeouts and monitor stops always terminate the whole session.
+    enum PostExitDescendants: Equatable, Sendable {
+        case terminate
+        /// Only for a tool whose job is to start a helper that must outlive
+        /// it (`hdiutil attach`); the caller owns that helper's teardown.
+        case preserve
+    }
+
     private static let pipeDrainGrace: TimeInterval = 0.25
     private static let postKillObservationLimit: TimeInterval = 1
     private static let ownershipObservationInterval: TimeInterval = 0.025
@@ -54,6 +68,35 @@ nonisolated enum BoundedProcessRunner {
             limits: limits,
             processSnapshotProvider: processSnapshot
         )
+    }
+
+    /// A caller may stop work when a resource or policy check fails. The
+    /// monitor runs synchronously on the calling thread and must return
+    /// promptly. Its reason remains distinct from an ordinary timeout even
+    /// when the child handles termination by exiting with status zero.
+    static func runMonitored(
+        executable: String,
+        arguments: [String] = [],
+        limits: Limits,
+        postExitDescendants: PostExitDescendants = .terminate,
+        stopReason: () -> String?
+    ) -> MonitoredOutcome {
+        var reason: String?
+        let outcome = run(
+            executable: executable,
+            arguments: arguments,
+            limits: limits,
+            postExitDescendants: postExitDescendants,
+            processSnapshotProvider: processSnapshot,
+            shouldStop: {
+                reason = stopReason()
+                return reason != nil
+            }
+        )
+        if let reason, case .timedOut(let output) = outcome {
+            return .stopped(reason: reason, output: output)
+        }
+        return .completed(outcome)
     }
 
     /// Deterministic seam for the process-table failure path. Keeping the
@@ -99,8 +142,14 @@ nonisolated enum BoundedProcessRunner {
         executable: String,
         arguments: [String],
         limits: Limits,
-        processSnapshotProvider: () -> ProcessSnapshot
+        postExitDescendants: PostExitDescendants = .terminate,
+        processSnapshotProvider: () -> ProcessSnapshot,
+        shouldStop: () -> Bool = { false }
     ) -> Outcome {
+        guard !executable.utf8.contains(0),
+              !arguments.contains(where: { $0.utf8.contains(0) }) else {
+            return .launchFailed(message: "Process paths and arguments cannot contain a NUL byte.")
+        }
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             return .executableNotFound(path: executable)
         }
@@ -165,9 +214,10 @@ nonisolated enum BoundedProcessRunner {
         // preserving its stable identity here lets normal-exit cleanup remain
         // safe after that parent relationship disappears.
         var observedOwnedProcesses: [pid_t: CapturedProcess] = [:]
-        let timeoutDeadline = Date().addingTimeInterval(limits.timeout)
+        let timeoutDeadline = DispatchTime.now() + limits.timeout
         var exitResult: DispatchTimeoutResult = .timedOut
         repeat {
+            if shouldStop() { break }
             if leaderIdentity != nil,
                isOriginalSessionLeader(processIdentifier, expectedIdentity: leaderIdentity) {
                 captureOwnedProcesses(
@@ -177,11 +227,10 @@ nonisolated enum BoundedProcessRunner {
                     into: &observedOwnedProcesses
                 )
             }
-            let remaining = max(timeoutDeadline.timeIntervalSinceNow, 0)
             exitResult = didExit.wait(
-                timeout: .now() + min(ownershipObservationInterval, remaining)
+                timeout: min(timeoutDeadline, .now() + ownershipObservationInterval)
             )
-        } while exitResult == .timedOut && Date() < timeoutDeadline
+        } while exitResult == .timedOut && DispatchTime.now() < timeoutDeadline
 
         let timedOut = exitResult == .timedOut
         let initialSnapshot = processSnapshotProvider()
@@ -205,13 +254,15 @@ nonisolated enum BoundedProcessRunner {
             // Keep observation bounded: the runner must return even if the
             // kernel/reaper path unexpectedly fails to report the leader.
             _ = didExit.wait(timeout: .now() + postKillObservationLimit)
-        } else if observedOwnedProcesses.values.contains(where: {
-            isCurrent($0, ledBy: processIdentifier)
-        }) {
+        } else if postExitDescendants == .terminate,
+                  observedOwnedProcesses.values.contains(where: {
+                      isCurrent($0, ledBy: processIdentifier)
+                  }) {
             // A command can exit after daemonizing a background process that
             // still owns the output pipes. BoundedProcessRunner owns the whole
             // private session, not just its leader, so no descendant is allowed
-            // to outlive an otherwise successful invocation.
+            // to outlive an otherwise successful invocation unless the caller
+            // explicitly preserves it.
             terminateOwnedProcesses(
                 ledBy: processIdentifier,
                 expectedLeaderIdentity: leaderIdentity,
@@ -293,6 +344,14 @@ nonisolated enum BoundedProcessRunner {
                 ))
             }
         }
+        setupResult = posix_spawn_file_actions_addopen(
+            &fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0
+        )
+        guard setupResult == 0 else {
+            return .failure(SpawnFailure(
+                message: "Could not isolate process standard input: \(errnoMessage(setupResult))"
+            ))
+        }
 
         var attributes: posix_spawnattr_t?
         setupResult = posix_spawnattr_init(&attributes)
@@ -302,7 +361,12 @@ nonisolated enum BoundedProcessRunner {
             ))
         }
         defer { posix_spawnattr_destroy(&attributes) }
-        setupResult = posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID))
+        // Commands receive only their explicitly configured standard streams.
+        // Inheriting a socket, PTY, or writable app file would extend its
+        // lifetime and give a child access unrelated to its requested work.
+        setupResult = posix_spawnattr_setflags(
+            &attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        )
         guard setupResult == 0 else {
             return .failure(SpawnFailure(
                 message: "Could not isolate the process session: \(errnoMessage(setupResult))"
@@ -388,9 +452,9 @@ nonisolated enum BoundedProcessRunner {
         }
 
         signalCapturedProcesses(captured.values, ledBy: sessionLeader, signal: SIGTERM)
-        let deadline = Date().addingTimeInterval(max(grace, 0))
+        let deadline = DispatchTime.now() + max(grace, 0)
 
-        while Date() < deadline {
+        while DispatchTime.now() < deadline {
             let leaderRemainsCurrent = expectedLeaderIdentity != nil
                 && isOriginalSessionLeader(
                     sessionLeader,

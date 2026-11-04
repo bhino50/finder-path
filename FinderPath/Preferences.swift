@@ -278,6 +278,10 @@ enum FinderPathPreferences {
     }
 
     static func displayPath(for path: String) -> String {
+        // An empty value is the in-flight Finder query, not a relative path.
+        // Resolving it as a file URL in compact mode displays this process's
+        // working directory instead of the menu's fetching placeholder.
+        guard !path.isEmpty else { return path }
         guard !path.hasPrefix("Finder AppleScript error:") else { return path }
 
         switch pathDisplayStyle {
@@ -304,7 +308,9 @@ enum FinderPathPreferences {
     }
 
     private static func compactPath(_ path: String) -> String {
-        let url = URL(fileURLWithPath: path).standardizedFileURL
+        // The header always shows a folder. The hint keeps Foundation from
+        // calling lstat on it during every menu build.
+        let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         let components = url.pathComponents.filter { $0 != "/" }
 
         // Only elide when something is actually being elided. With `>= 2` an

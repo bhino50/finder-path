@@ -36,7 +36,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>FinderPath needs permission to read the current Finder path and to open Terminal, Ghostty, cmux, CLI agents, or SSH connections you launch.</string>
+	<string>FinderPath needs permission to read the current Finder path and to run CLI agents or SSH connections you launch in Terminal.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

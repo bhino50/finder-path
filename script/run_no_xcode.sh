@@ -26,6 +26,21 @@ APP_EXECUTABLE="$APP/Contents/MacOS/$APP_NAME"
 DEPLOYMENT_TARGET="13.0"
 MODE="${1:-run}"
 
+usage() {
+  echo "usage: $0 [run|build|verify]"
+}
+
+# Reject unknown modes before touching a running build or looking up tools.
+if (( $# > 1 )); then
+  usage >&2
+  exit 2
+fi
+case "$MODE" in
+  run|build|verify) ;;
+  --help|-h) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
 matching_executable_pids() {
   local expected_executable="$1"
   local line trimmed pid executable
