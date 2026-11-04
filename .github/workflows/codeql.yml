@@ -29,11 +29,20 @@ jobs:
             runner: ubuntu-latest
           - language: swift
             build_mode: manual
-            runner: macos-latest
+            # Avoid the capacity-constrained arm64 pool without dropping Swift analysis.
+            runner: macos-26-intel
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Report macOS toolchain
+        if: matrix.language == 'swift'
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4

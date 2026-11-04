@@ -17,12 +17,21 @@ concurrency:
 jobs:
   macos:
     name: Build FinderPath macOS
-    runs-on: macos-latest
+    # The arm64 pool can exhaust its queue before assigning a runner. Keep
+    # hosted checks on Intel; the Release step still builds both architectures.
+    runs-on: macos-26-intel
     timeout-minutes: 45
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Report macOS toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
 
       - name: Validate project files
         run: |

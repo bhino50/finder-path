@@ -28,6 +28,7 @@ Seven additional defects were fixed:
 - Packaging preservation fixtures: **2 scenarios passed**.
 - Build-entrypoint fixtures: **8 scenarios passed**.
 - Xcode Release build: passed; executable contains **arm64 and x86_64**.
+- Xcode Debug and the repaired `build_and_run.sh build` entrypoint: passed.
 - Command-Line-Tools build: passed; development bundle identity verified.
 - Shell fixtures executed under sh, bash, zsh, dash, and tcsh. Fish was not
   installed on the test host.
@@ -39,6 +40,15 @@ Seven additional defects were fixed:
 
 Xcode emitted its App Intents metadata-extraction warning because this app
 does not depend on AppIntents. No Swift compiler warnings were observed.
+
+## Hosted runner recovery
+
+The initial GitHub macOS build and Swift analysis never received runners and
+were canceled after 15 minutes. Both job annotations identified hosted macOS
+arm64 capacity constraints. The workflows now use the supported
+`macos-26-intel` pool and log the actual toolchain. Every existing test,
+universal Release build, and required status check remains enabled. Local
+runtime tests ran on arm64; the hosted configuration targets x86_64.
 
 ## Practical limits
 
