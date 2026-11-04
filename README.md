@@ -81,6 +81,10 @@ Or build and launch from the terminal:
 ./script/build_and_run.sh
 ```
 
+Use `./script/build_and_run.sh build` to compile and verify the development
+bundle without launching it. Both build scripts accept `--help` and reject
+unknown arguments before stopping a running development app.
+
 No Xcode IDE? Build and run with only the Command Line Tools (`xcode-select --install`) — no `.xcodeproj`, no `xcodebuild`. This compiles the Swift sources with `swiftc` and assembles the `.app` by hand:
 
 ```bash

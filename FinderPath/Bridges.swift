@@ -229,13 +229,11 @@ nonisolated enum FinderBridge {
     }
 
     private static func removingProcessLineTerminator(from output: String) -> String {
-        if output.hasSuffix("\r\n") {
-            return String(output.dropLast(2))
-        }
-        if output.hasSuffix("\n") {
-            return String(output.dropLast())
-        }
-        return output
+        // osascript adds one LF. A preceding CR belongs to the path, and
+        // Swift treats CRLF as one Character, so dropLast on Characters can
+        // also erase filename bytes. Remove only the final Unicode scalar.
+        guard output.unicodeScalars.last == "\n" else { return output }
+        return String(output.unicodeScalars.dropLast())
     }
 }
 

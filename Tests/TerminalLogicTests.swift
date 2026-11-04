@@ -176,8 +176,8 @@ struct FinderPathTerminalTests {
         // MARK: - Parser: modes
 
         parser = TerminalParser()
-        expect(parser.parse(Array("\u{1B}[?1049h".utf8)) == [.setMode(.alternateScreen, true)], "1049h enters alt screen")
-        expect(parser.parse(Array("\u{1B}[?1049l".utf8)) == [.setMode(.alternateScreen, false)], "1049l leaves alt screen")
+        expect(parser.parse(Array("\u{1B}[?1049h".utf8)) == [.saveCursor, .setMode(.alternateScreen, true)], "1049h saves the cursor and enters alt screen")
+        expect(parser.parse(Array("\u{1B}[?1049l".utf8)) == [.setMode(.alternateScreen, false), .restoreCursor], "1049l leaves alt screen and restores the cursor")
         expect(parser.parse(Array("\u{1B}[?2004h".utf8)) == [.setMode(.bracketedPaste, true)], "2004h enables bracketed paste")
         expect(parser.parse(Array("\u{1B}[?25l".utf8)) == [.setMode(.cursorVisible, false)], "25l hides cursor")
         expect(parser.parse(Array("\u{1B}[?1h".utf8)) == [.setMode(.applicationCursorKeys, true)], "DECCKM on")
@@ -292,6 +292,32 @@ struct FinderPathTerminalTests {
                 && decscScreen.cell(atRow: 0, column: 0).style.foreground == .ansi(1),
             "the primary screen's DECSC rendition survives an alternate-screen save"
         )
+
+        // 1049 combines alternate-screen switching with DECSC/DECRC. A TUI
+        // may leave a different style and charset active; neither may leak
+        // into the shell, and a cursor at the margin must retain pending wrap.
+        var alternateParser = TerminalParser()
+        var alternateScreen = TerminalScreen(rows: 3, columns: 4, scrollbackLimit: 10)
+        let alternateRoundTrip = "\u{1B}[31mabcd\u{1B}[?1049h\u{1B}[32m\u{1B}(0\u{1B}7\u{1B}[?1049lq\u{1B}[1mX"
+        for action in alternateParser.parse(Array(alternateRoundTrip.utf8)) { alternateScreen.apply(action) }
+        expect(alternateScreen.lineText(0) == "abcd", "1049 restores pending wrap without overwriting the shell's margin")
+        expect(alternateScreen.lineText(1).hasPrefix("qX"), "1049 restores the shell's ASCII charset and wraps the next print")
+        expect(alternateScreen.cell(atRow: 1, column: 0).style == red, "1049 restores the shell's SGR rendition")
+        expect(alternateScreen.cell(atRow: 1, column: 1).style == redBold, "SGR after 1049 builds on the restored rendition")
+
+        alternateParser = TerminalParser()
+        alternateScreen = TerminalScreen(rows: 3, columns: 8, scrollbackLimit: 10)
+        let repeatedAlternateMode = "\u{1B}[31mAB\u{1B}[?1049h\u{1B}[32mXY\u{1B}[?1049h\u{1B}[?1049lC\u{1B}[?1049lD"
+        for action in alternateParser.parse(Array(repeatedAlternateMode.utf8)) { alternateScreen.apply(action) }
+        expect(alternateScreen.lineText(0).hasPrefix("ABCD"), "repeated 1049 toggles neither overwrite the saved cursor nor restore it twice")
+        expect(alternateScreen.cell(atRow: 0, column: 3).style == red, "repeated 1049 toggles preserve the primary rendition")
+
+        alternateParser = TerminalParser()
+        alternateScreen = TerminalScreen(rows: 3, columns: 8, scrollbackLimit: 10)
+        let cursorModeRoundTrip = "\u{1B}[31m\u{1B})0\u{0E}\u{1B}[2;3H\u{1B}[?1048h\u{1B}[0m\u{0F}\u{1B}[1;1H\u{1B}[?1048lq"
+        for action in alternateParser.parse(Array(cursorModeRoundTrip.utf8)) { alternateScreen.apply(action) }
+        expect(alternateScreen.cell(atRow: 1, column: 2).character == "\u{2500}", "1048 restores cursor position and the G1 charset shift")
+        expect(alternateScreen.cell(atRow: 1, column: 2).style == red, "1048 restores the saved SGR rendition")
 
         // MARK: - Screen: printing, wrap, scrollback
 

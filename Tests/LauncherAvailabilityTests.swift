@@ -130,6 +130,16 @@ struct LauncherAvailabilityTests {
             for: "finderpath-missing-\(UUID().uuidString)", fallbackPaths: [executable.path]
         )
         expect(fallbackResult.resolvedPath == executable.path, "a bundled fallback participates in the same bounded probe")
+        let tailscaleFallback = await TailscaleBridge.executablePath(
+            command: "finderpath-missing-\(UUID().uuidString)",
+            fallbackPaths: [directory.path, notExecutable.path, executable.path]
+        )
+        expect(tailscaleFallback == executable.path, "Tailscale discovery skips directories and nonexecutable files before accepting its bundled executable")
+        let missingTailscaleFallback = await TailscaleBridge.executablePath(
+            command: "finderpath-missing-\(UUID().uuidString)",
+            fallbackPaths: [directory.path, notExecutable.path]
+        )
+        expect(missingTailscaleFallback == nil, "Tailscale never reports a searchable directory as its CLI")
         let shellResult = await AgentLauncher.checkAvailability(for: "sh")
         expect(shellResult.resolvedPath?.hasPrefix("/") == true, "PATH lookup returns an absolute executable for launch actions")
 
@@ -218,6 +228,21 @@ struct LauncherAvailabilityTests {
                 expect(
                     output == folder + "\n",
                     "\(shell) starts the agent in \(name.debugDescription), got \(output.debugDescription)"
+                )
+            }
+        }
+
+        // Built-in terminal launchers type just the resolved executable into
+        // the user's shell. Exercise that same portable argument encoding
+        // with names POSIX-only single quoting rewrites in fish or tcsh.
+        for name in ["agent!bang", "agent\\\\slash", "agent\\'quote", "agent'quote"] {
+            let path = launchRoot + "/" + name
+            try Data("#!/bin/sh\nprintf 'builtin-agent-ok\\n'\n".utf8).write(to: URL(fileURLWithPath: path))
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
+            for shell in loginShells {
+                expect(
+                    runTyped(ShellCommand.portableArgument(path), in: shell) == "builtin-agent-ok\n",
+                    "\(shell) starts the built-in agent with executable name \(name.debugDescription)"
                 )
             }
         }

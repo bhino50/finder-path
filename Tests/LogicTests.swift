@@ -50,6 +50,18 @@ struct FinderPathLogicTests {
         expect(!UpdateChecker.versionsAreEquivalent("1.9-rc.2", "1.9-rc.3"), "the complete prerelease suffix remains part of version verification")
         expect(UpdateChecker.parseManifest(Data(#"{"version":"1..9"}"#.utf8)) == nil, "a malformed manifest version is rejected")
         expect(UpdateChecker.parseManifest(Data(#"{"tag_name":"v1..9"}"#.utf8)) == nil, "a malformed GitHub release version is rejected")
+        for version in ["1.9.4-rc..1", "1.9.4+build+", "1.9.4-rc.1+build+extra", "1.9.4-rc.", "1.9.4+"] {
+            expect(
+                UpdateChecker.parseManifest(Data("{\"version\":\"\(version)\"}".utf8)) == nil,
+                "malformed prerelease/build version \(version) is rejected"
+            )
+        }
+        for version in ["1.9.4-rc.1+build.7", "1.9.4--preview+build-7"] {
+            expect(
+                UpdateChecker.parseManifest(Data("{\"version\":\"\(version)\"}".utf8)) != nil,
+                "valid prerelease/build version \(version) is accepted"
+            )
+        }
         expect(!UpdateChecker.isHTTPSWebURL(URL(string: "https://user:password@example.com/update.zip")!), "update URLs cannot carry embedded credentials")
         expect(!UpdateChecker.isHTTPSWebURL(URL(string: "http://example.com/update.zip")!), "update redirects cannot downgrade to HTTP")
 
@@ -1376,6 +1388,17 @@ struct FinderPathLogicTests {
             ).path == "/tmp/trailing-space ",
             "a legal trailing space in a folder name is preserved"
         )
+        for path in ["/tmp/trailing-return\r", "/tmp/trailing-crlf\r\n"] {
+            expect(
+                FinderBridge.interpretScriptResult(
+                    terminationStatus: 0,
+                    timedOut: false,
+                    stdout: "window\n\(path)\n",
+                    stderr: ""
+                ).path == path,
+                "removing the osascript LF preserves every filename scalar in \(path.debugDescription)"
+            )
+        }
 
         let stalledFinderResult = FinderBridge.interpretScriptResult(
                 terminationStatus: 15,
@@ -1395,6 +1418,20 @@ struct FinderPathLogicTests {
         // Beginning a new Finder refresh must synchronously retire the previous
         // path. An older asynchronous completion may never make it actionable.
         var refreshState = FinderPathRefreshState()
+        let displayStyleKey = FinderPathPreferences.pathDisplayStyleKey
+        let previousDisplayStyle = UserDefaults.standard.object(forKey: displayStyleKey)
+        for style in ["full", "home", "compact"] {
+            UserDefaults.standard.set(style, forKey: displayStyleKey)
+            expect(
+                FinderPathPreferences.displayPath(for: "").isEmpty,
+                "\(style) display preserves the loading placeholder instead of resolving the process directory"
+            )
+        }
+        if let previousDisplayStyle {
+            UserDefaults.standard.set(previousDisplayStyle, forKey: displayStyleKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: displayStyleKey)
+        }
         let firstRefresh = refreshState.begin()
         expect(refreshState.isRefreshing && refreshState.currentPath.isEmpty, "refresh begins in a loading state")
         expect(

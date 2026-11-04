@@ -256,24 +256,22 @@ nonisolated enum TailscaleBridge {
     )
 
     private static let statusCache = TailscaleStatusCache {
-        TailscaleBridge.fetchStatus()
+        await TailscaleBridge.fetchStatus()
     }
 
-    static func executablePath() -> String? {
-        if let resolved = AgentLauncher.availability(for: "tailscale", defaultExecutable: "tailscale").resolvedPath {
-            return resolved
-        }
-
-        for candidate in ["/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", appExecutablePath] {
-            if FileManager.default.isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-
-        return nil
+    /// Discovery must be bounded too: a PATH entry on a disconnected volume
+    /// can stall before the CLI's own process timeout ever starts. Reuse the
+    /// launcher's time-limited subprocess and regular-file validation.
+    static func executablePath(
+        command: String = "tailscale",
+        fallbackPaths: [String] = [appExecutablePath]
+    ) async -> String? {
+        await AgentLauncher.checkAvailability(
+            for: command,
+            defaultExecutable: "tailscale",
+            fallbackPaths: fallbackPaths
+        ).resolvedPath
     }
-
-    static var isInstalled: Bool { executablePath() != nil }
 
     // Async API for UI code. The blocking CLI work runs on a background
     // thread, and recent results are cached so the Connect to Server window
@@ -283,29 +281,25 @@ nonisolated enum TailscaleBridge {
     }
 
     static func up() async -> TailscaleCommandOutcome {
-        await Task.detached(priority: .userInitiated) {
-            runCommand(arguments: ["up"])
-        }.value
+        await runCommand(arguments: ["up"])
     }
 
     static func down() async -> TailscaleCommandOutcome {
-        await Task.detached(priority: .userInitiated) {
-            runCommand(arguments: ["down"])
-        }.value
+        await runCommand(arguments: ["down"])
     }
 
-    // Blocking status fetch. Spawns the tailscale CLI and waits for it to
-    // exit, so only call this off the main thread (the cache actor does).
-    fileprivate static func fetchStatus() -> TailscaleStatus {
-        guard let path = executablePath() else {
+    fileprivate static func fetchStatus() async -> TailscaleStatus {
+        guard let path = await executablePath() else {
             return .failed(.executableNotFound)
         }
 
-        let outcome = BoundedProcessRunner.run(
-            executable: path,
-            arguments: ["status", "--json"],
-            limits: statusProcessLimits
-        )
+        let outcome = await Task.detached(priority: .userInitiated) {
+            BoundedProcessRunner.run(
+                executable: path,
+                arguments: ["status", "--json"],
+                limits: statusProcessLimits
+            )
+        }.value
         return status(from: outcome, command: statusCommand)
     }
 
@@ -392,19 +386,22 @@ nonisolated enum TailscaleBridge {
         )
     }
 
-    // Runs a tailscale subcommand for its side effect and waits for it to
-    // exit, so only call this off the main thread (the async wrappers do).
-    private static func runCommand(arguments: [String]) -> TailscaleCommandOutcome {
-        guard let path = executablePath() else {
+    // Both executable discovery and the command run have bounded workers;
+    // neither performs potentially stalled filesystem work on the caller.
+    private static func runCommand(arguments: [String]) async -> TailscaleCommandOutcome {
+        guard let path = await executablePath() else {
             return .failure(.executableNotFound)
         }
 
         let command = "tailscale \(arguments.joined(separator: " "))"
-        return commandOutcome(from: BoundedProcessRunner.run(
-            executable: path,
-            arguments: arguments,
-            limits: commandProcessLimits
-        ), command: command)
+        let outcome = await Task.detached(priority: .userInitiated) {
+            BoundedProcessRunner.run(
+                executable: path,
+                arguments: arguments,
+                limits: commandProcessLimits
+            )
+        }.value
+        return commandOutcome(from: outcome, command: command)
     }
 
     static func commandOutcome(

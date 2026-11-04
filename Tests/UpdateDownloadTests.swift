@@ -68,6 +68,8 @@ private final class StubUpdateServer: URLProtocol {
             stream(bytes: route.dropFirst().first.flatMap { Int($0) } ?? 0, declaresLength: route.first == "sized")
         case "manifest":
             respond(status: 200, body: Data(#"{"version":"99.0"}"#.utf8))
+        case "malformed-version":
+            respond(status: 200, body: Data(#"{"version":"99.0-rc..1+build+extra"}"#.utf8))
         case "empty":
             respond(status: 200, body: Data())
         case "redirect":
@@ -222,6 +224,7 @@ struct UpdateDownloadTests {
             expect(false, "a valid manifest reports the available update")
         }
         expect(!StubDelivery.shared.stoppedEarly, "a manifest within the limit is not cancelled")
+        expect(failureMessage(checkManifest(at: "/malformed-version")).contains("Could not parse"), "malformed prerelease and metadata identifiers cannot offer an update")
         expect(failureMessage(checkManifest(at: "/redirect")).contains("unsafe location"), "a manifest redirect to HTTP is rejected")
         expect(failureMessage(checkManifest(at: "/missing")).contains("HTTP 404"), "a manifest HTTP error status is rejected")
         expect(failureMessage(checkManifest(at: "/empty")).contains("no data"), "an empty manifest body is rejected")

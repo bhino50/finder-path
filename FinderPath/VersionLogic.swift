@@ -322,12 +322,13 @@ nonisolated enum UpdateChecker {
 
         let suffix = String(cleaned.dropFirst(numericPrefix.count)).lowercased()
         if !suffix.isEmpty {
-            guard suffix.first == "-" || suffix.first == "+",
-                  suffix.dropFirst().first?.isLetter == true || suffix.dropFirst().first?.isNumber == true,
-                  suffix.utf8.allSatisfy({
-                      (48...57).contains($0) || (97...122).contains($0)
-                          || $0 == 45 || $0 == 46 || $0 == 43
-                  }) else { return nil }
+            // Validate each identifier rather than just the character set.
+            // Empty identifiers and repeated metadata separators otherwise
+            // turn malformed manifests into apparently valid update versions.
+            guard suffix.first == "-" || suffix.first == "+" else { return nil }
+            let sections = suffix.dropFirst().split(separator: "+", omittingEmptySubsequences: false)
+            guard sections.count <= (suffix.first == "-" ? 2 : 1),
+                  sections.allSatisfy(validVersionIdentifiers) else { return nil }
         }
         return ParsedVersion(
             components: components.map { component in
@@ -336,5 +337,13 @@ nonisolated enum UpdateChecker {
             },
             suffix: suffix
         )
+    }
+
+    private static func validVersionIdentifiers(_ section: Substring) -> Bool {
+        section.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { identifier in
+            !identifier.isEmpty && identifier.utf8.allSatisfy {
+                (48...57).contains($0) || (97...122).contains($0) || $0 == 45
+            }
+        }
     }
 }

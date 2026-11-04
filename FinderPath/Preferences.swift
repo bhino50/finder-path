@@ -278,6 +278,10 @@ enum FinderPathPreferences {
     }
 
     static func displayPath(for path: String) -> String {
+        // An empty value is the in-flight Finder query, not a relative path.
+        // Resolving it as a file URL in compact mode displays this process's
+        // working directory instead of the menu's fetching placeholder.
+        guard !path.isEmpty else { return path }
         guard !path.hasPrefix("Finder AppleScript error:") else { return path }
 
         switch pathDisplayStyle {

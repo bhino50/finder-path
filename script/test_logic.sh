@@ -149,3 +149,5 @@ done
 
 # Packaging failures and repeated versions must preserve previous artifacts.
 /bin/bash "$ROOT_DIR/script/test_packaging_safety.sh"
+
+/bin/bash "$ROOT_DIR/script/test_build_entrypoints.sh"

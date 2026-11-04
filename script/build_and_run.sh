@@ -13,6 +13,22 @@ APP_EXECUTABLE="$APP_PATH/Contents/MacOS/$APP_NAME"
 HOST_ARCH="$(uname -m)"
 MODE="${1:-run}"
 
+usage() {
+  echo "usage: $0 [run|build|--debug|--logs|--telemetry|--verify]"
+}
+
+# Validate before stopping a running app or rewriting its bundle. A typo (or
+# asking for help) must not terminate active development terminal sessions.
+if (( $# > 1 )); then
+  usage >&2
+  exit 2
+fi
+case "$MODE" in
+  run|build|--build|--debug|debug|--logs|logs|--telemetry|telemetry|--verify|verify) ;;
+  --help|-h) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
 matching_executable_pids() {
   local expected_executable="$1"
   local line trimmed pid executable
@@ -106,6 +122,9 @@ open_app() {
 }
 
 case "$MODE" in
+  build|--build)
+    echo "Built $APP_PATH."
+    ;;
   run)
     open_app
     ;;
@@ -125,9 +144,5 @@ case "$MODE" in
     sleep 2
     exact_executable_is_running "$APP_EXECUTABLE"
     echo "$APP_NAME development build is running from $APP_EXECUTABLE."
-    ;;
-  *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
-    exit 2
     ;;
 esac

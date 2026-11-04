@@ -437,9 +437,23 @@ struct TerminalParser {
             guard isPrivate else { break }
             let enabled = final == "h"
             for parameter in params {
+                // 1048 is DECSC/DECRC without a buffer switch. 1049 combines
+                // those operations with 1047; treating it as only a switch
+                // loses the shell's rendition, charsets, and pending wrap.
+                if parameter == 1048 {
+                    if enabled { saveCursor(into: &actions) } else { restoreCursor(into: &actions) }
+                    continue
+                }
                 guard let mode = Self.privateMode(parameter) else { continue }
+                let switchesScreen = mode == .alternateScreen && enabled != usingAlternateScreen
+                if parameter == 1049, enabled, switchesScreen {
+                    saveCursor(into: &actions)
+                }
                 if mode == .alternateScreen { switchSavedRendition(toAlternate: enabled) }
                 actions.append(.setMode(mode, enabled))
+                if parameter == 1049, !enabled, switchesScreen {
+                    restoreCursor(into: &actions)
+                }
             }
         default:
             break // DA, window ops, and other queries are consumed

@@ -675,7 +675,7 @@ final class StatusItemController: NSObject {
             let session = TerminalSessionStore.shared.newSession(
                 name: name,
                 workingDirectory: workingDirectory,
-                initialCommand: ShellCommand.argument(resolvedPath)
+                initialCommand: ShellCommand.portableArgument(resolvedPath)
             )
             DispatchQueue.main.async { [weak self, weak button] in
                 guard let button else { return }
